@@ -5,6 +5,11 @@ on:
     branches:
       - main
       - develop
+    paths:
+      - "*.go"
+      - "**/*.go"
+      - "go.mod"
+      - "go.sum"
   workflow_dispatch:
 
 permissions:
@@ -54,6 +59,7 @@ jobs:
           cache: true
 
       - name: Resolve Version From Changelog
+        if: github.ref == 'refs/heads/main'
         shell: pwsh
         run: |
           if (!(Test-Path "CHANGELOG.md")) {
@@ -93,6 +99,24 @@ jobs:
           "RELEASE_NAME=$releaseTag" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "ARTIFACT_FILE=${{ matrix.artifact_name }}" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
+      - name: Resolve Development Release
+        if: github.ref == 'refs/heads/develop'
+        shell: pwsh
+        run: |
+          $artifact = "${{ matrix.artifact_name }}"
+          if ($artifact.EndsWith(".exe")) {
+            $artifact = $artifact.Substring(0, $artifact.Length - 4) + "-dev.exe"
+          } else {
+            $artifact = "$artifact-dev"
+          }
+
+          "Latest development release" | Out-File -FilePath "release-notes.md" -Encoding utf8
+
+          "APP_VERSION=dev" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "RELEASE_TAG=dev-latest" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "RELEASE_NAME=dev-latest" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "ARTIFACT_FILE=$artifact" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
       - name: Test
         run: go test ./...
 
@@ -118,7 +142,7 @@ jobs:
           if-no-files-found: error
 
       - name: Publish To Release
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop')
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
@@ -127,10 +151,20 @@ jobs:
           $name = $env:RELEASE_NAME
           $asset = "dist/${{ env.ARTIFACT_FILE }}"
           $repo = "${{ github.repository }}"
+          $target = "${{ github.ref_name }}"
+
+          if ($tag -eq "dev-latest") {
+            git tag -f $tag "${{ github.sha }}"
+            git push origin "refs/tags/$tag" --force
+          }
 
           gh release view $tag --repo $repo *> $null
           if ($LASTEXITCODE -ne 0) {
-            gh release create $tag --repo $repo --target main --title $name --notes-file release-notes.md
+            if ($tag -eq "dev-latest") {
+              gh release create $tag --repo $repo --target $target --title $name --notes-file release-notes.md --prerelease
+            } else {
+              gh release create $tag --repo $repo --target $target --title $name --notes-file release-notes.md
+            }
             if ($LASTEXITCODE -ne 0) {
               gh release view $tag --repo $repo *> $null
               if ($LASTEXITCODE -ne 0) {

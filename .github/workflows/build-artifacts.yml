@@ -112,7 +112,7 @@ jobs:
 
           "Latest development release" | Out-File -FilePath "release-notes.md" -Encoding utf8
 
-          "APP_VERSION=dev" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "APP_VERSION=dev-latest" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "RELEASE_TAG=dev-latest" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "RELEASE_NAME=dev-latest" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "ARTIFACT_FILE=$artifact" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8

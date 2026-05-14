@@ -86,6 +86,12 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 	if cmd == "admin" {
 		return adminCommand(cfg, cmdArgs, stdout)
 	}
+	if cmd == "ssh" {
+		return sshCommand(cfg, cmdArgs, stdout, stderr)
+	}
+	if cmd == "web" {
+		return webCommand(context.Background(), cfg, cmdArgs, stdout)
+	}
 	if cmd == "create-gcloud-profile" {
 		return createGcloudProfileCommand(cmdArgs, stdin, stdout)
 	}
@@ -549,6 +555,8 @@ common commands:
   init [directory]
   origin gs://bucket/prefix.git
   origin s3://bucket/prefix.git
+  ssh setup [gs://bucket/prefix.git|s3://bucket/prefix.git]
+  web [--addr 127.0.0.1] [--port 8042] [--local]
   admin grant-read|grant-write|grant-admin IDENTITY
   create-gcloud-profile NAME
   fetch | pull | push | ls-remote
@@ -686,6 +694,40 @@ examples:
   bgit admin make-private
   bgit admin --bucket s3://my-bucket/repositories/app.git grant-read arn:aws:iam::123456789012:role/Developer
 `,
+		"ssh": `usage:
+  bgit ssh setup [--broker URL] [--region REGION] [--firestore-database NAME] [--firestore-location LOCATION] [--key PATH] [--no-agent] [gs://bucket/prefix.git|s3://bucket/prefix.git]
+  bgit ssh scaffold [--broker URL] [gs://bucket/prefix.git|s3://bucket/prefix.git]
+  bgit ssh repo add [--broker URL] [--key PATH] [repo]
+  bgit ssh keys list|add|remove|suspend [--broker URL] [--key PATH] [repo]
+
+Configure the current repository so normal git fetch/push uses bgit as the SSH
+transport command. The setup command also records public keys from ssh-agent or
+--key for a future broker-backed authorization flow. When --broker is omitted,
+setup looks for an existing bgit-broker endpoint in the selected cloud account
+and region. Setup also upserts the repository into the broker with discovered
+SSH identities under an admin user.
+
+examples:
+  bgit ssh setup gs://my-bucket/repositories/app.git
+  bgit ssh setup s3://my-bucket/repositories/app.git --profile aws-profile --key ~/.ssh/id_ed25519.pub
+  bgit ssh repo add --key ~/.ssh/id_ed25519.pub
+  bgit ssh keys add --user ada --role write --key ~/.ssh/ada.pub
+  bgit ssh keys list
+  bgit ssh scaffold
+`,
+		"web": `usage: bgit web [--addr ADDR] [--port PORT] [--local]
+
+Serve a small repository browser for the configured bucketgit repository.
+By default this reads the configured remote using the same read-only store path
+as bgit fetch and bgit ls-remote: anonymous public read first, then
+authenticated GCS/S3 credentials if needed. Use --local to serve the local .git
+object store instead.
+
+examples:
+  bgit web
+  bgit web --port 8042
+  bgit web --local
+`,
 		"create-gcloud-profile": `usage: bgit create-gcloud-profile [--yes] NAME
 
 Create a gcloud configuration, run gcloud auth login for that configuration,
@@ -708,9 +750,11 @@ examples:
   bgit pull
   bgit pull main
 `,
-		"push": `usage: bgit push [--tags] [--force] [--delete ref] [refspec...]
+		"push": `usage: bgit push [--tags] [--force] [--skip-broker] [--delete ref] [refspec...]
 
 Sync local Git objects and refs to the configured object-storage repository.
+When a broker is configured, bgit uses broker compare-and-swap ref updates.
+Use --skip-broker as an operator escape hatch for direct bucket ref writes.
 
 examples:
   bgit push
@@ -1081,10 +1125,11 @@ func gcloudProjectID(configuration string) (string, error) {
 }
 
 type pushOptions struct {
-	tags   bool
-	force  bool
-	delete bool
-	refs   []string
+	tags       bool
+	force      bool
+	delete     bool
+	skipBroker bool
+	refs       []string
 }
 
 func parsePushArgs(args []string) (pushOptions, error) {
@@ -1097,6 +1142,8 @@ func parsePushArgs(args []string) (pushOptions, error) {
 			opts.force = true
 		case "--delete", "-d":
 			opts.delete = true
+		case "--skip-broker":
+			opts.skipBroker = true
 		default:
 			if strings.HasPrefix(arg, "--force-with-lease") {
 				opts.force = true

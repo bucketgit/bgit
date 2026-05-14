@@ -3,10 +3,18 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"io/fs"
+	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -100,6 +108,16 @@ func TestParseGlobalFlagsAnywhere(t *testing.T) {
 	}
 	if strings.Join(rest, " ") != "clone gs://bucket/repo.git" {
 		t.Fatalf("rest = %#v", rest)
+	}
+}
+
+func TestParsePushArgsSkipBroker(t *testing.T) {
+	opts, err := parsePushArgs([]string{"--skip-broker", "--tags", "HEAD:refs/heads/main"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !opts.skipBroker || !opts.tags || len(opts.refs) != 1 || opts.refs[0] != "HEAD:refs/heads/main" {
+		t.Fatalf("opts = %#v", opts)
 	}
 }
 
@@ -674,6 +692,613 @@ func TestOriginCommandWritesS3Provider(t *testing.T) {
 	}
 	if cfg.origin != "s3://bucket-name/path/repo.git" {
 		t.Fatalf("origin = %q", cfg.origin)
+	}
+}
+
+func TestSSHSetupWritesLocalConfigAndGitRemote(t *testing.T) {
+	target := t.TempDir()
+	if _, err := runGit("", "init", target); err != nil {
+		t.Fatal(err)
+	}
+	keyPath := filepath.Join(t.TempDir(), "id_ed25519.pub")
+	if err := os.WriteFile(keyPath, []byte("ssh-ed25519 AAAATESTKEY ada@example.com\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	oldDir, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(oldDir)
+	if err := os.Chdir(target); err != nil {
+		t.Fatal(err)
+	}
+	var upsert brokerRepoRequest
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/repos/upsert" {
+			t.Fatalf("unexpected broker path %s", r.URL.Path)
+		}
+		if err := json.NewDecoder(r.Body).Decode(&upsert); err != nil {
+			t.Fatal(err)
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+	var stdout bytes.Buffer
+	err = sshCommand(config{auth: "gcloud", branch: defaultBranch}, []string{
+		"setup",
+		"gs://bucket-name/path/repo.git",
+		"--no-agent",
+		"--key", keyPath,
+		"--broker", server.URL,
+	}, &stdout, ioDiscard{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	remoteOut, err := runGit(target, "remote", "get-url", "origin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.TrimSpace(string(remoteOut)); got != "git@git.bucketgit.com:bucket-name/path/repo.git" {
+		t.Fatalf("remote origin = %q", got)
+	}
+	for key, want := range map[string]string{
+		"core.sshCommand":   "bgit ssh",
+		"bucketgit.origin":  "gs://bucket-name/path/repo.git",
+		"bucketgit.sshHost": "git.bucketgit.com",
+		"bucketgit.broker":  server.URL,
+		"bucketgit.sshkey1": "ssh-ed25519 AAAATESTKEY ada@example.com",
+	} {
+		out, err := runGit(target, "config", "--local", key)
+		if err != nil {
+			t.Fatalf("read %s: %v", key, err)
+		}
+		if got := strings.TrimSpace(string(out)); got != want {
+			t.Fatalf("%s = %q, want %q", key, got, want)
+		}
+	}
+	if !strings.Contains(stdout.String(), "configured SSH origin git@git.bucketgit.com:bucket-name/path/repo.git") {
+		t.Fatalf("stdout = %q", stdout.String())
+	}
+	if upsert.Repo.Origin != "gs://bucket-name/path/repo.git" || upsert.AdminUser != "admin" || upsert.Role != "admin" {
+		t.Fatalf("upsert = %#v", upsert)
+	}
+	if len(upsert.PublicKeys) != 1 || upsert.PublicKeys[0] != "ssh-ed25519 AAAATESTKEY ada@example.com" {
+		t.Fatalf("upsert keys = %#v", upsert.PublicKeys)
+	}
+}
+
+func TestSSHScaffoldInfersExistingOrigin(t *testing.T) {
+	target := t.TempDir()
+	if _, err := runGit("", "init", target); err != nil {
+		t.Fatal(err)
+	}
+	oldDir, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(oldDir)
+	if err := os.Chdir(target); err != nil {
+		t.Fatal(err)
+	}
+	if err := originCommand([]string{"s3://bucket-name/path/repo.git"}, ioDiscard{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := sshCommand(config{auth: "gcloud", branch: defaultBranch}, []string{"scaffold"}, ioDiscard{}, ioDiscard{}); err != nil {
+		t.Fatal(err)
+	}
+	remoteOut, err := runGit(target, "remote", "get-url", "origin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.TrimSpace(string(remoteOut)); got != "git@git.bucketgit.com:bucket-name/path/repo.git" {
+		t.Fatalf("remote origin = %q", got)
+	}
+	providerOut, err := runGit(target, "config", "--local", "bucketgit.provider")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.TrimSpace(string(providerOut)); got != "s3" {
+		t.Fatalf("provider = %q", got)
+	}
+}
+
+func TestSSHRepoAddAndKeysCommandsUseBroker(t *testing.T) {
+	target := t.TempDir()
+	if _, err := runGit("", "init", target); err != nil {
+		t.Fatal(err)
+	}
+	keyPath := filepath.Join(t.TempDir(), "id_ed25519.pub")
+	if err := os.WriteFile(keyPath, []byte("ssh-ed25519 AAAAADMIN admin@example.com\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var requests []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests = append(requests, r.URL.Path)
+		w.Header().Set("content-type", "application/json")
+		switch r.URL.Path {
+		case "/repos/upsert", "/keys/add", "/keys/remove", "/keys/suspend":
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"ok":true}`))
+		case "/keys/list":
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"keys":[{"user":"admin","role":"admin","public_key":"ssh-ed25519 AAAAADMIN admin@example.com"}]}`))
+		default:
+			t.Fatalf("unexpected broker path %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+	oldDir, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(oldDir)
+	if err := os.Chdir(target); err != nil {
+		t.Fatal(err)
+	}
+	if err := originCommand([]string{"gs://bucket-name/path/repo.git"}, ioDiscard{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runGit(target, "config", "--local", "bucketgit.broker", server.URL); err != nil {
+		t.Fatal(err)
+	}
+	if err := sshCommand(config{auth: "gcloud", branch: defaultBranch}, []string{"repo", "add", "--no-agent", "--key", keyPath}, ioDiscard{}, ioDiscard{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := sshCommand(config{auth: "gcloud", branch: defaultBranch}, []string{"keys", "add", "--no-agent", "--key", keyPath, "--user", "ada", "--role", "write"}, ioDiscard{}, ioDiscard{}); err != nil {
+		t.Fatal(err)
+	}
+	var stdout bytes.Buffer
+	if err := sshCommand(config{auth: "gcloud", branch: defaultBranch}, []string{"keys", "list"}, &stdout, ioDiscard{}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(stdout.String(), "admin\tadmin\tactive\tssh-ed25519 AAAAADMIN admin@example.com") {
+		t.Fatalf("keys list stdout = %q", stdout.String())
+	}
+	if err := sshCommand(config{auth: "gcloud", branch: defaultBranch}, []string{"keys", "suspend", "AAAAADMIN"}, ioDiscard{}, ioDiscard{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := sshCommand(config{auth: "gcloud", branch: defaultBranch}, []string{"keys", "remove", "AAAAADMIN"}, ioDiscard{}, ioDiscard{}); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"/repos/upsert", "/keys/add", "/keys/list", "/keys/suspend", "/keys/remove"}
+	if strings.Join(requests, ",") != strings.Join(want, ",") {
+		t.Fatalf("requests = %#v", requests)
+	}
+}
+
+func TestSSHTransportInvocationAdvertisesRefsBeforePackTransfer(t *testing.T) {
+	err := sshCommand(config{}, []string{"git-upload-pack"}, ioDiscard{}, ioDiscard{})
+	if err == nil || !strings.Contains(err.Error(), "missing repository path") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestAuthorizeSSHGitServiceUsesBrokerRoles(t *testing.T) {
+	target := t.TempDir()
+	if _, err := runGit("", "init", target); err != nil {
+		t.Fatal(err)
+	}
+	oldDir, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(oldDir)
+	if err := os.Chdir(target); err != nil {
+		t.Fatal(err)
+	}
+	if err := originCommand([]string{"gs://bucket-name/path/repo.git"}, ioDiscard{}); err != nil {
+		t.Fatal(err)
+	}
+	var operations []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/auth/check" {
+			t.Fatalf("unexpected broker path %s", r.URL.Path)
+		}
+		var req brokerAuthRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatal(err)
+		}
+		operations = append(operations, req.Operation)
+		w.Header().Set("content-type", "application/json")
+		allowed := req.Operation == "read"
+		_, _ = fmt.Fprintf(w, `{"allowed":%t,"user":"ada","role":"read"}`, allowed)
+	}))
+	defer server.Close()
+	if _, err := runGit(target, "config", "--local", "bucketgit.broker", server.URL); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config{provider: "gcs", bucket: "bucket-name", prefix: "path/repo.git", branch: "main", origin: "gs://bucket-name/path/repo.git"}
+	if err := authorizeSSHGitService(cfg, gitUploadPackService); err != nil {
+		t.Fatal(err)
+	}
+	if err := authorizeSSHGitService(cfg, gitReceivePackService); err == nil || !strings.Contains(err.Error(), "broker denied write access") {
+		t.Fatalf("write err = %v", err)
+	}
+	if strings.Join(operations, ",") != "read,write" {
+		t.Fatalf("operations = %#v", operations)
+	}
+}
+
+func TestConfigForSSHRepoDefaultsToGCSPath(t *testing.T) {
+	cfg, err := configForSSHRepo("bucket-name/path/repo.git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.provider != "gcs" || cfg.bucket != "bucket-name" || cfg.prefix != "path/repo.git" {
+		t.Fatalf("cfg = %#v", cfg)
+	}
+	if cfg.origin != "gs://bucket-name/path/repo.git" {
+		t.Fatalf("origin = %q", cfg.origin)
+	}
+}
+
+func TestConfigForSSHRepoInfersS3FromLocalConfig(t *testing.T) {
+	target := t.TempDir()
+	if _, err := runGit("", "init", target); err != nil {
+		t.Fatal(err)
+	}
+	oldDir, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(oldDir)
+	if err := os.Chdir(target); err != nil {
+		t.Fatal(err)
+	}
+	if err := originCommand([]string{"s3://bucket-name/path/repo.git"}, ioDiscard{}); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := configForSSHRepo("bucket-name/path/repo.git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.provider != "s3" || cfg.origin != "s3://bucket-name/path/repo.git" {
+		t.Fatalf("cfg = %#v", cfg)
+	}
+}
+
+func TestConfigForSSHRepoDecodesProviderPrefixedPath(t *testing.T) {
+	cfg, err := configForSSHRepo("s3/bucket-name/path/repo.git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.provider != "s3" || cfg.bucket != "bucket-name" || cfg.prefix != "path/repo.git" || cfg.origin != "s3://bucket-name/path/repo.git" {
+		t.Fatalf("cfg = %#v", cfg)
+	}
+	cfg, err = configForSSHRepo("gs/bucket-name/path/repo.git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.provider != "gcs" || cfg.origin != "gs://bucket-name/path/repo.git" {
+		t.Fatalf("cfg = %#v", cfg)
+	}
+}
+
+func TestWriteAdvertisedRefsFromNativeRepo(t *testing.T) {
+	bare := createBareFixture(t)
+	repo := newNativeGitRepoForStore(config{branch: "main"}, &localGitStore{root: bare})
+	refs, err := repo.refs(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	refs["HEAD"] = refs["refs/heads/main"]
+	var stdout bytes.Buffer
+	if err := writeAdvertisedRefs(&stdout, gitUploadPackService, refs, uploadPackCapabilities()); err != nil {
+		t.Fatal(err)
+	}
+	lines, err := pktLinesForTest(stdout.Bytes())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(lines) < 2 {
+		t.Fatalf("lines = %#v", lines)
+	}
+	first := string(lines[0].data)
+	for _, want := range []string{"HEAD", "symref=HEAD:refs/heads/main", "side-band-64k"} {
+		if !strings.Contains(first, want) {
+			t.Fatalf("first advertised ref missing %q in %q", want, first)
+		}
+	}
+}
+
+func TestDiscoverGCPBrokerURLUsesCloudRunFunctionsURI(t *testing.T) {
+	bin := t.TempDir()
+	writeFakeCLI(t, bin, "gcloud", []fakeCLIAction{
+		{match: "functions describe bgit-broker", stdout: "https://bgit-broker-functions.example.test"},
+	})
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	got, err := discoverGCPBrokerURL(config{provider: "gcs", gcloudConfiguration: "test-profile"}, sshSetupOptions{region: "europe-west1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "https://bgit-broker-functions.example.test" {
+		t.Fatalf("broker URL = %q", got)
+	}
+}
+
+func TestDiscoverGCPBrokerURLFallsBackToCloudRunServiceURL(t *testing.T) {
+	bin := t.TempDir()
+	writeFakeCLI(t, bin, "gcloud", []fakeCLIAction{
+		{match: "functions describe bgit-broker", exitCode: 1},
+		{match: "run services describe bgit-broker", stdout: "https://bgit-broker-run.example.test"},
+	})
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	got, err := discoverGCPBrokerURL(config{provider: "gcs"}, sshSetupOptions{region: "europe-west1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "https://bgit-broker-run.example.test" {
+		t.Fatalf("broker URL = %q", got)
+	}
+}
+
+func TestDiscoverAWSBrokerURLUsesCloudFormationOutput(t *testing.T) {
+	bin := t.TempDir()
+	writeFakeCLI(t, bin, "aws", []fakeCLIAction{
+		{match: "cloudformation describe-stacks", stdout: "https://bgit-broker-aws.example.test"},
+	})
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	got, err := discoverAWSBrokerURL(config{provider: "s3", gcloudConfiguration: "aws-profile"}, sshSetupOptions{region: "eu-west-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "https://bgit-broker-aws.example.test" {
+		t.Fatalf("broker URL = %q", got)
+	}
+}
+
+func TestDiscoverAWSBrokerURLFallsBackToSSMParameter(t *testing.T) {
+	bin := t.TempDir()
+	writeFakeCLI(t, bin, "aws", []fakeCLIAction{
+		{match: "cloudformation describe-stacks", exitCode: 1},
+		{match: "ssm get-parameter", stdout: "https://bgit-broker-ssm.example.test"},
+	})
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	got, err := discoverAWSBrokerURL(config{provider: "s3"}, sshSetupOptions{region: "eu-west-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "https://bgit-broker-ssm.example.test" {
+		t.Fatalf("broker URL = %q", got)
+	}
+}
+
+func TestProvisionGCPBrokerURLDeploysThenDiscoversFunction(t *testing.T) {
+	bin := t.TempDir()
+	marker := filepath.Join(t.TempDir(), "deployed")
+	writeFakeCLI(t, bin, "gcloud", []fakeCLIAction{
+		{match: "functions describe bgit-broker", stdout: "https://bgit-broker-provisioned.example.test", requireFile: marker, exitCode: 1},
+		{match: "services enable"},
+		{match: "firestore databases describe", exitCode: 1},
+		{match: "firestore databases create"},
+		{match: "functions deploy bgit-broker", touch: marker},
+	})
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	var stdout bytes.Buffer
+	got, err := provisionGCPBrokerURL(config{provider: "gcs"}, sshSetupOptions{region: "europe-west1"}, &stdout)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "https://bgit-broker-provisioned.example.test" {
+		t.Fatalf("broker URL = %q", got)
+	}
+	if !strings.Contains(stdout.String(), "deploying GCP Cloud Run function bgit-broker in europe-west1") {
+		t.Fatalf("stdout = %q", stdout.String())
+	}
+	if !strings.Contains(stdout.String(), "ensuring GCP broker APIs are enabled") ||
+		!strings.Contains(stdout.String(), "creating Firestore database bgit in europe-west1") {
+		t.Fatalf("stdout = %q", stdout.String())
+	}
+}
+
+func TestEnsureGCPBrokerFirestoreDatabaseSkipsExistingDatabase(t *testing.T) {
+	bin := t.TempDir()
+	writeFakeCLI(t, bin, "gcloud", []fakeCLIAction{
+		{match: "firestore databases describe --database=custom", stdout: "projects/demo/databases/custom"},
+		{match: "firestore databases create", exitCode: 9},
+	})
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	var stdout bytes.Buffer
+	err := ensureGCPBrokerFirestoreDatabase(config{provider: "gcs"}, sshSetupOptions{firestoreDatabase: "custom", region: "europe-west1"}, &stdout)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stdout.Len() != 0 {
+		t.Fatalf("stdout = %q", stdout.String())
+	}
+}
+
+func TestProvisionAWSBrokerURLDeploysThenDiscoversStackOutput(t *testing.T) {
+	bin := t.TempDir()
+	marker := filepath.Join(t.TempDir(), "deployed")
+	writeFakeCLI(t, bin, "aws", []fakeCLIAction{
+		{match: "cloudformation describe-stacks", stdout: "https://bgit-broker-provisioned-aws.example.test", requireFile: marker, exitCode: 1},
+		{match: "cloudformation deploy", touch: marker},
+	})
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	var stdout bytes.Buffer
+	got, err := provisionAWSBrokerURL(config{provider: "s3", gcloudConfiguration: "aws-profile"}, sshSetupOptions{region: "eu-west-1"}, &stdout)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "https://bgit-broker-provisioned-aws.example.test" {
+		t.Fatalf("broker URL = %q", got)
+	}
+	if !strings.Contains(stdout.String(), "deploying AWS CloudFormation stack bgit-broker in eu-west-1") {
+		t.Fatalf("stdout = %q", stdout.String())
+	}
+}
+
+type fakeCLIAction struct {
+	match       string
+	stdout      string
+	exitCode    int
+	touch       string
+	requireFile string
+}
+
+func writeFakeCLI(t *testing.T, dir, name string, actions []fakeCLIAction) {
+	t.Helper()
+	path := filepath.Join(dir, name)
+	if runtime.GOOS == "windows" {
+		path += ".bat"
+	}
+	var script strings.Builder
+	if runtime.GOOS == "windows" {
+		script.WriteString("@echo off\r\n")
+		script.WriteString("set ARGS=%*\r\n")
+		for _, action := range actions {
+			finalExitCode := fakeCLIFinalExitCode(action)
+			script.WriteString("echo %ARGS% | findstr /C:\"")
+			script.WriteString(escapeBatch(action.match))
+			script.WriteString("\" >nul\r\n")
+			script.WriteString("if not errorlevel 1 (\r\n")
+			if action.requireFile != "" {
+				script.WriteString("  if not exist \"")
+				script.WriteString(escapeBatch(action.requireFile))
+				script.WriteString("\" exit /b ")
+				script.WriteString(strconv.Itoa(firstNonZeroInt(action.exitCode, 1)))
+				script.WriteString("\r\n")
+			}
+			if action.touch != "" {
+				script.WriteString("  type nul > \"")
+				script.WriteString(escapeBatch(action.touch))
+				script.WriteString("\"\r\n")
+			}
+			if action.stdout != "" {
+				script.WriteString("  echo ")
+				script.WriteString(action.stdout)
+				script.WriteString("\r\n")
+			}
+			script.WriteString("  exit /b ")
+			script.WriteString(strconv.Itoa(finalExitCode))
+			script.WriteString("\r\n)\r\n")
+		}
+		script.WriteString("exit /b 1\r\n")
+	} else {
+		script.WriteString("#!/bin/sh\n")
+		script.WriteString("case \"$*\" in\n")
+		for _, action := range actions {
+			finalExitCode := fakeCLIFinalExitCode(action)
+			script.WriteString("  *\"")
+			script.WriteString(strings.ReplaceAll(action.match, `"`, `\"`))
+			script.WriteString("\"*) ")
+			if action.requireFile != "" {
+				script.WriteString("[ -f '")
+				script.WriteString(strings.ReplaceAll(action.requireFile, `'`, `'\''`))
+				script.WriteString("' ] || exit ")
+				script.WriteString(strconv.Itoa(firstNonZeroInt(action.exitCode, 1)))
+				script.WriteString(" ; ")
+			}
+			if action.touch != "" {
+				script.WriteString("touch '")
+				script.WriteString(strings.ReplaceAll(action.touch, `'`, `'\''`))
+				script.WriteString("' ; ")
+			}
+			if action.stdout != "" {
+				script.WriteString("echo ")
+				script.WriteString(action.stdout)
+				script.WriteString(" ; ")
+			}
+			script.WriteString("exit ")
+			script.WriteString(strconv.Itoa(finalExitCode))
+			script.WriteString(" ;;\n")
+		}
+		script.WriteString("  *) exit 1 ;;\n")
+		script.WriteString("esac\n")
+	}
+	if err := os.WriteFile(path, []byte(script.String()), 0o755); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func fakeCLIFinalExitCode(action fakeCLIAction) int {
+	if action.requireFile != "" && action.stdout != "" {
+		return 0
+	}
+	return action.exitCode
+}
+
+func firstNonZeroInt(values ...int) int {
+	for _, value := range values {
+		if value != 0 {
+			return value
+		}
+	}
+	return 0
+}
+
+func escapeBatch(value string) string {
+	value = strings.ReplaceAll(value, `\`, `\\`)
+	value = strings.ReplaceAll(value, `"`, `\"`)
+	return value
+}
+
+func TestAWSBrokerCloudFormationTemplateHasBrokerOutput(t *testing.T) {
+	template := awsBrokerCloudFormationTemplate()
+	for _, want := range []string{
+		"Type: AWS::DynamoDB::Table",
+		"Type: AWS::Lambda::Function",
+		"Type: AWS::Lambda::Url",
+		"dynamodb:GetItem",
+		"dynamodb:PutItem",
+		"BrokerUrl:",
+		"nodejs22.x",
+		"/auth/check",
+		"/objects/read",
+		"s3:GetObject",
+		"InvokedViaFunctionUrl",
+		"/refs/update",
+		"roleAllows",
+		"ConditionalCheckFailedException",
+	} {
+		if !strings.Contains(template, want) {
+			t.Fatalf("template missing %q:\n%s", want, template)
+		}
+	}
+}
+
+func TestGCPBrokerSourceUsesFirestoreAndSignatureHeaders(t *testing.T) {
+	dir := t.TempDir()
+	if err := writeGCPBrokerSource(dir); err != nil {
+		t.Fatal(err)
+	}
+	index, err := os.ReadFile(filepath.Join(dir, "index.js"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"@google-cloud/firestore",
+		"@google-cloud/storage",
+		"databaseId: process.env.FIRESTORE_DATABASE || 'bgit'",
+		"x-bgit-key",
+		"x-bgit-signature",
+		"admin SSH signature required",
+		"bgit_broker_repos",
+		"/auth/check",
+		"/objects/read",
+		"/refs/update",
+		"roleAllows",
+		"runTransaction",
+	} {
+		if !strings.Contains(string(index), want) {
+			t.Fatalf("GCP broker source missing %q:\n%s", want, string(index))
+		}
+	}
+}
+
+func TestBrokerSignatureMessageIsStable(t *testing.T) {
+	a := brokerSignatureMessage([]byte(`{"repo":"demo"}`))
+	b := brokerSignatureMessage([]byte(`{"repo":"demo"}`))
+	c := brokerSignatureMessage([]byte(`{"repo":"other"}`))
+	if !bytes.Equal(a, b) {
+		t.Fatalf("signature message is not stable")
+	}
+	if bytes.Equal(a, c) {
+		t.Fatalf("signature message should depend on payload")
+	}
+	if !strings.HasPrefix(string(a), "bgit-broker-v1\n") {
+		t.Fatalf("signature message = %q", string(a))
 	}
 }
 
@@ -2052,6 +2677,200 @@ func createBareFixture(t *testing.T) string {
 		t.Fatal(err)
 	}
 	return bare
+}
+
+func TestWebHandlerServesTreeBlobAndRaw(t *testing.T) {
+	bare := createBareFixture(t)
+	repo := newNativeGitRepoForStore(config{branch: "main", origin: "gs://bucket/repo.git"}, &localGitStore{root: bare})
+	handler := newWebHandler(repo, config{branch: "main", origin: "gs://bucket/repo.git"})
+
+	for _, tc := range []struct {
+		path string
+		want string
+	}{
+		{path: "/", want: "README.md"},
+		{path: "/", want: "Initial commit"},
+		{path: "/tree/docs", want: "guide.md"},
+		{path: "/blob/README.md", want: "# Demo"},
+		{path: "/raw/README.md", want: "# Demo\n"},
+	} {
+		req := httptest.NewRequest(http.MethodGet, tc.path, nil)
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s status = %d body=%s", tc.path, rec.Code, rec.Body.String())
+		}
+		if !strings.Contains(rec.Body.String(), tc.want) {
+			t.Fatalf("%s body does not contain %q:\n%s", tc.path, tc.want, rec.Body.String())
+		}
+	}
+}
+
+func TestWebHandlerRendersBranchSelector(t *testing.T) {
+	bare := createBareFixture(t)
+	worktree := t.TempDir()
+	if _, err := runGit("", "clone", bare, worktree); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runGit(worktree, "checkout", "-b", "feature/web-ui"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(worktree, "README.md"), []byte("# Feature\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runGit(worktree, "add", "README.md"); err != nil {
+		t.Fatal(err)
+	}
+	env := append(os.Environ(),
+		"GIT_AUTHOR_NAME=Ada",
+		"GIT_AUTHOR_EMAIL=ada@example.com",
+		"GIT_COMMITTER_NAME=Ada",
+		"GIT_COMMITTER_EMAIL=ada@example.com",
+	)
+	if _, err := runGitEnv(worktree, env, "commit", "-m", "Feature branch"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runGit(worktree, "push", bare, "HEAD:refs/heads/feature/web-ui"); err != nil {
+		t.Fatal(err)
+	}
+
+	repo := newNativeGitRepoForStore(config{branch: "main", origin: "gs://bucket/repo.git"}, &localGitStore{root: bare})
+	handler := newWebHandler(repo, config{branch: "main", origin: "gs://bucket/repo.git"})
+	req := httptest.NewRequest(http.MethodGet, "/?ref=refs/heads/feature/web-ui", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	for _, want := range []string{`data-ref-selector`, `refs/heads/main`, `refs/heads/feature/web-ui`, `# Feature`} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("body missing %q:\n%s", want, body)
+		}
+	}
+}
+
+func TestParseWebArgs(t *testing.T) {
+	opts, err := parseWebArgs([]string{"--local", "--addr", "0.0.0.0", "--port", "9000"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !opts.local || opts.addr != "0.0.0.0" || opts.port != 9000 {
+		t.Fatalf("opts = %#v", opts)
+	}
+	defaults, err := parseWebArgs(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if defaults.addr != defaultWebAddr || defaults.port != defaultWebPort || defaults.local {
+		t.Fatalf("defaults = %#v", defaults)
+	}
+}
+
+func TestListenWebIncrementsWhenPortIsBusy(t *testing.T) {
+	occupied, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer occupied.Close()
+	_, portText, err := net.SplitHostPort(occupied.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if port >= 65535 {
+		t.Skip("ephemeral port has no room to increment")
+	}
+	ln, err := listenWeb("127.0.0.1", port)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	if ln.Addr().String() == occupied.Addr().String() {
+		t.Fatalf("listenWeb reused occupied address %s", ln.Addr().String())
+	}
+	_, gotPortText, err := net.SplitHostPort(ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotPort, err := strconv.Atoi(gotPortText)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotPort != port+1 {
+		t.Fatalf("port = %d, want %d", gotPort, port+1)
+	}
+}
+
+func TestBrokerGitStoreReadsAndListsThroughBroker(t *testing.T) {
+	var paths []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.Path)
+		w.Header().Set("content-type", "application/json")
+		switch r.URL.Path {
+		case "/objects/read":
+			var req brokerObjectRequest
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Fatal(err)
+			}
+			if req.Repo.Bucket != "bucket" || req.Path != "objects/aa/bb" {
+				t.Fatalf("read req = %#v", req)
+			}
+			_, _ = fmt.Fprintf(w, `{"data":%q}`, base64.StdEncoding.EncodeToString([]byte("object data")))
+		case "/objects/list":
+			var req brokerObjectRequest
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Fatal(err)
+			}
+			if req.Repo.Prefix != "repos/demo.git" || req.Prefix != "refs/" {
+				t.Fatalf("list req = %#v", req)
+			}
+			_, _ = w.Write([]byte(`{"paths":["refs/heads/main"]}`))
+		default:
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	store := &brokerGitStore{brokerURL: server.URL, cfg: config{provider: "gcs", bucket: "bucket", prefix: "repos/demo.git", origin: "gs://bucket/repos/demo.git"}}
+	data, err := store.read(context.Background(), "objects/aa/bb")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "object data" {
+		t.Fatalf("data = %q", string(data))
+	}
+	listed, err := store.list(context.Background(), "refs/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(listed, ",") != "refs/heads/main" {
+		t.Fatalf("listed = %#v", listed)
+	}
+	if strings.Join(paths, ",") != "/objects/read,/objects/list" {
+		t.Fatalf("paths = %#v", paths)
+	}
+}
+
+func TestBrokerGitStoreMapsMissingObjectToNotExist(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("content-type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(`{"error":"No such object: bucket/repo.git/packed-refs"}`))
+	}))
+	defer server.Close()
+
+	store := &brokerGitStore{brokerURL: server.URL, cfg: config{provider: "gcs", bucket: "bucket", prefix: "repo.git"}}
+	_, err := store.read(context.Background(), "packed-refs")
+	if !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("err = %v", err)
+	}
+	if !isBrokerNotFoundError(errors.New(`broker /objects/read: {"error":"The specified key does not exist."}`)) {
+		t.Fatalf("AWS missing key error was not recognized")
+	}
 }
 
 func mustReadFile(t *testing.T, path string) []byte {

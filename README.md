@@ -57,6 +57,9 @@ go build -o bgit .
 - Configure an origin with `bgit origin` or `bgit remote add origin`.
 - Grant read, write, admin, public, or private bucket access with `bgit admin`.
 - Create and save gcloud profiles with `bgit create-gcloud-profile`.
+- Configure native Git fetch/push over SSH with `bgit ssh setup` and the
+  serverless broker.
+- Browse remote or local repositories with `bgit web`.
 - Create the target GCS or S3 bucket automatically when permissions allow it.
 - Run direct bucket inspection commands for scripts and automation.
 
@@ -223,6 +226,96 @@ bgit origin s3://my-bucket/repositories/demo.git
 bgit push
 ```
 
+## Web UI
+
+`bgit web` serves a small local repository browser on `127.0.0.1:8042`:
+
+```bash
+bgit web
+```
+
+By default it serves the configured remote repository using the same read path
+as `bgit fetch` and `bgit ls-remote`: anonymous public read first, then
+authenticated GCS/S3 retry when the repository is private. It also honors
+`bucketgit.profile` and `--profile`.
+
+If the checkout is configured with `bucketgit.broker`, `bgit web` can fall back
+to broker-mediated read access signed by the user's ssh-agent key. This lets a
+user who only has SSH broker access browse the repository without direct cloud
+credentials.
+
+The web UI includes a branch/tag selector, clone command copy buttons, file and
+raw blob views, commit author and committer metadata, and per-commit diffs.
+
+Use `--local` to browse the local `.git` object store instead:
+
+```bash
+bgit web --local
+bgit web --port 9000
+```
+
+## Git SSH Transport
+
+`bgit ssh setup` configures a checkout so normal Git clients use `bgit` as the
+SSH transport:
+
+```bash
+bgit ssh setup gs://my-bucket/repositories/demo.git
+bgit ssh setup s3://my-bucket/repositories/demo.git --profile work
+```
+
+This writes a Git remote like `git@git.bucketgit.com:bucket/prefix.git` and
+sets `core.sshCommand=bgit ssh`. Fresh native Git clones can use the same URL
+when `GIT_SSH_COMMAND` points at `bgit ssh`:
+
+```bash
+GIT_SSH_COMMAND="bgit ssh" git clone git@git.bucketgit.com:my-bucket/repositories/demo.git
+```
+
+SSH Git operations are authorized through the bgit broker. Fetch, clone, and
+`ls-remote` require an active key with `read`, `write`, or `admin`. Push
+requires `write` or `admin`. Suspended keys are rejected.
+
+When a broker is configured, both native `git push` through `bgit ssh` and
+`bgit push` use the broker for compare-and-swap ref updates before mirroring refs
+back to the bucket. This gives AWS and GCP the same concurrent-push behavior:
+one writer wins and stale writers are rejected instead of silently overwriting a
+ref.
+
+Direct `bgit` commands against `gs://` or `s3://` origins still use the selected
+cloud credentials. If the broker is unavailable and an operator needs to bypass
+broker coordination, use:
+
+```bash
+bgit push --skip-broker
+```
+
+When no broker is configured, `bgit push` writes refs directly to the bucket and
+accepts the usual last-writer-wins risk.
+
+For GCP broker bootstrap, `bgit ssh setup` enables the required APIs and uses a
+named Firestore database called `bgit`. If that database does not exist yet, the
+caller needs `datastore.databases.create`, for example via
+`roles/datastore.owner`. This permission is only needed while creating the
+database; later repo/key administration uses the deployed broker and SSH admin
+keys.
+
+Broker-mediated `bgit web` reads use the broker runtime's cloud permissions to
+read repository objects. The generated AWS broker role includes S3 read/list
+permissions. On GCP, grant the Cloud Run function service account storage
+read/list access if the repository bucket is outside the function's default
+project permissions.
+
+The broker tracks repositories and SSH keys:
+
+```bash
+bgit ssh repo add
+bgit ssh keys list
+bgit ssh keys add --user ada --role read --key ~/.ssh/ada.pub
+bgit ssh keys suspend KEY_OR_COMMENT
+bgit ssh keys remove KEY_OR_COMMENT
+```
+
 ## Repository URLs
 
 Repository URLs use the `gs://` or `s3://` scheme:
@@ -264,10 +357,13 @@ bgit clone s3://my-bucket/repositories/demo.git [directory]
 bgit init [directory]
 bgit origin gs://my-bucket/repositories/demo.git
 bgit origin s3://my-bucket/repositories/demo.git
+bgit ssh setup gs://my-bucket/repositories/demo.git
+bgit web
 
 bgit fetch
 bgit pull
 bgit push
+bgit push --skip-broker
 bgit push --tags
 bgit push --delete feature
 bgit ls-remote
@@ -399,9 +495,9 @@ bgit push --tags
 bgit ls-remote --tags
 ```
 
-## Direct GCS Mode
+## Direct Bucket Mode
 
-Most developers should use `clone`, `init`, `origin`, and `push`. Direct GCS
+Most developers should use `clone`, `init`, `origin`, and `push`. Direct bucket
 mode is available for scripts and one-off inspection without a checkout:
 
 ```bash
@@ -434,7 +530,8 @@ Unsupported: '<command>' is not supported by bgit
 
 Unsupported commands include `rebase`, `daemon`, `submodule`, `lfs`, `gc`,
 `fsck`, `repack`, `prune`, `worktree`, credential helpers, server helpers, and
-related maintenance commands.
+related maintenance commands. Native Git fetch and push are supported inside
+repositories configured with `bgit ssh setup`.
 
 ## Contributing
 

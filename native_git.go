@@ -16,6 +16,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 
 	"cloud.google.com/go/storage"
 	"google.golang.org/api/iterator"
@@ -52,6 +53,7 @@ type fallbackGitRemoteStore struct {
 type nativeGitRepo struct {
 	cfg         config
 	store       gitRemoteStore
+	mu          sync.Mutex
 	cache       map[string]gitObject
 	offsetCache map[string]gitObject
 	packs       []packIndex
@@ -98,13 +100,17 @@ type treeEntry struct {
 }
 
 type commitObject struct {
-	hash      string
-	tree      string
-	parents   []string
-	author    string
-	email     string
-	timestamp int64
-	subject   string
+	hash               string
+	tree               string
+	parents            []string
+	author             string
+	email              string
+	timestamp          int64
+	committer          string
+	committerEmail     string
+	committerTimestamp int64
+	subject            string
+	body               string
 }
 
 func (r *nativeGitRepo) listFiles(ctx context.Context, args []string, stdout io.Writer) error {
@@ -445,9 +451,29 @@ func (r *nativeGitRepo) pushWorktree(ctx context.Context, worktree string, opts 
 	if err := uploadLocalObjects(ctx, store, gitDir); err != nil {
 		return err
 	}
+	refs, err := r.refs(ctx)
+	if err != nil {
+		return err
+	}
+	brokerURL := ""
+	if !opts.skipBroker {
+		brokerURL = optionalBrokerURLForPush()
+	}
+	updateRef := func(ref, oldHash, newHash string) error {
+		if brokerURL != "" {
+			if err := brokerUpdateRef(brokerURL, r.cfg, ref, oldHash, newHash); err != nil {
+				return brokerPushError(err)
+			}
+		}
+		if newHash == zeroObjectID() {
+			return store.delete(ctx, ref)
+		}
+		return store.write(ctx, ref, []byte(newHash+"\n"))
+	}
 	if opts.delete {
 		for _, ref := range opts.refs {
-			if err := store.delete(ctx, normalizeDeleteRef(ref)); err != nil {
+			normalized := normalizeDeleteRef(ref)
+			if err := updateRef(normalized, firstNonEmpty(refs[normalized], zeroObjectID()), zeroObjectID()); err != nil {
 				return err
 			}
 		}
@@ -463,7 +489,8 @@ func (r *nativeGitRepo) pushWorktree(ctx context.Context, worktree string, opts 
 		if err != nil {
 			return err
 		}
-		if err := store.write(ctx, branchRef(r.cfg.branch), []byte(hash+"\n")); err != nil {
+		ref := branchRef(r.cfg.branch)
+		if err := updateRef(ref, firstNonEmpty(refs[ref], zeroObjectID()), hash); err != nil {
 			return err
 		}
 		updates = append(updates, fmt.Sprintf(" * [new branch]      %s -> %s", r.cfg.branch, r.cfg.branch))
@@ -478,7 +505,8 @@ func (r *nativeGitRepo) pushWorktree(ctx context.Context, worktree string, opts 
 			if err != nil {
 				return err
 			}
-			if err := store.write(ctx, normalizeDestinationRef(dst), []byte(hash+"\n")); err != nil {
+			ref := normalizeDestinationRef(dst)
+			if err := updateRef(ref, firstNonEmpty(refs[ref], zeroObjectID()), hash); err != nil {
 				return err
 			}
 			updates = append(updates, fmt.Sprintf(" * [new branch]      %s -> %s", shortRefName(src), shortRefName(normalizeDestinationRef(dst))))
@@ -490,7 +518,7 @@ func (r *nativeGitRepo) pushWorktree(ctx context.Context, worktree string, opts 
 			return err
 		}
 		for ref, hash := range tags {
-			if err := store.write(ctx, ref, []byte(hash+"\n")); err != nil {
+			if err := updateRef(ref, firstNonEmpty(refs[ref], zeroObjectID()), hash); err != nil {
 				return err
 			}
 			updates = append(updates, fmt.Sprintf(" * [new tag]         %s -> %s", shortRefName(ref), shortRefName(ref)))
@@ -705,6 +733,8 @@ func (r *nativeGitRepo) refs(ctx context.Context) (map[string]string, error) {
 
 func (r *nativeGitRepo) object(ctx context.Context, hash string) (gitObject, error) {
 	hash = strings.TrimSpace(hash)
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	if obj, ok := r.cache[hash]; ok {
 		return obj, nil
 	}
@@ -1075,8 +1105,11 @@ func parseCommit(hash string, data []byte) (commitObject, error) {
 			commit.parents = append(commit.parents, strings.TrimSpace(strings.TrimPrefix(line, "parent ")))
 		case strings.HasPrefix(line, "author "):
 			commit.author, commit.email, commit.timestamp = parseSignature(strings.TrimPrefix(line, "author "))
+		case strings.HasPrefix(line, "committer "):
+			commit.committer, commit.committerEmail, commit.committerTimestamp = parseSignature(strings.TrimPrefix(line, "committer "))
 		}
 	}
+	commit.body = strings.TrimRight(message, "\n")
 	for _, line := range strings.Split(message, "\n") {
 		if strings.TrimSpace(line) != "" {
 			commit.subject = strings.TrimSpace(line)

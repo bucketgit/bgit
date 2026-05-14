@@ -125,7 +125,10 @@ func isAddrInUse(err error) bool {
 	if errors.As(err, &opErr) {
 		err = opErr.Err
 	}
-	return strings.Contains(strings.ToLower(err.Error()), "address already in use")
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "address already in use") ||
+		strings.Contains(msg, "only one usage of each socket address") ||
+		strings.Contains(msg, "address is already in use")
 }
 
 func parseWebArgs(args []string) (webOptions, error) {

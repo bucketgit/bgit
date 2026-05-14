@@ -13,6 +13,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -1002,15 +1003,9 @@ func TestWriteAdvertisedRefsFromNativeRepo(t *testing.T) {
 
 func TestDiscoverGCPBrokerURLUsesCloudRunFunctionsURI(t *testing.T) {
 	bin := t.TempDir()
-	gcloud := filepath.Join(bin, "gcloud")
-	script := "#!/bin/sh\n" +
-		"case \"$*\" in\n" +
-		"  *\"functions describe bgit-broker\"*) echo https://bgit-broker-functions.example.test ; exit 0 ;;\n" +
-		"  *) exit 1 ;;\n" +
-		"esac\n"
-	if err := os.WriteFile(gcloud, []byte(script), 0o755); err != nil {
-		t.Fatal(err)
-	}
+	writeFakeCLI(t, bin, "gcloud", []fakeCLIAction{
+		{match: "functions describe bgit-broker", stdout: "https://bgit-broker-functions.example.test"},
+	})
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
 	got, err := discoverGCPBrokerURL(config{provider: "gcs", gcloudConfiguration: "test-profile"}, sshSetupOptions{region: "europe-west1"})
 	if err != nil {
@@ -1023,16 +1018,10 @@ func TestDiscoverGCPBrokerURLUsesCloudRunFunctionsURI(t *testing.T) {
 
 func TestDiscoverGCPBrokerURLFallsBackToCloudRunServiceURL(t *testing.T) {
 	bin := t.TempDir()
-	gcloud := filepath.Join(bin, "gcloud")
-	script := "#!/bin/sh\n" +
-		"case \"$*\" in\n" +
-		"  *\"functions describe bgit-broker\"*) exit 1 ;;\n" +
-		"  *\"run services describe bgit-broker\"*) echo https://bgit-broker-run.example.test ; exit 0 ;;\n" +
-		"  *) exit 1 ;;\n" +
-		"esac\n"
-	if err := os.WriteFile(gcloud, []byte(script), 0o755); err != nil {
-		t.Fatal(err)
-	}
+	writeFakeCLI(t, bin, "gcloud", []fakeCLIAction{
+		{match: "functions describe bgit-broker", exitCode: 1},
+		{match: "run services describe bgit-broker", stdout: "https://bgit-broker-run.example.test"},
+	})
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
 	got, err := discoverGCPBrokerURL(config{provider: "gcs"}, sshSetupOptions{region: "europe-west1"})
 	if err != nil {
@@ -1045,15 +1034,9 @@ func TestDiscoverGCPBrokerURLFallsBackToCloudRunServiceURL(t *testing.T) {
 
 func TestDiscoverAWSBrokerURLUsesCloudFormationOutput(t *testing.T) {
 	bin := t.TempDir()
-	aws := filepath.Join(bin, "aws")
-	script := "#!/bin/sh\n" +
-		"case \"$*\" in\n" +
-		"  *\"cloudformation describe-stacks\"*) echo https://bgit-broker-aws.example.test ; exit 0 ;;\n" +
-		"  *) exit 1 ;;\n" +
-		"esac\n"
-	if err := os.WriteFile(aws, []byte(script), 0o755); err != nil {
-		t.Fatal(err)
-	}
+	writeFakeCLI(t, bin, "aws", []fakeCLIAction{
+		{match: "cloudformation describe-stacks", stdout: "https://bgit-broker-aws.example.test"},
+	})
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
 	got, err := discoverAWSBrokerURL(config{provider: "s3", gcloudConfiguration: "aws-profile"}, sshSetupOptions{region: "eu-west-1"})
 	if err != nil {
@@ -1066,16 +1049,10 @@ func TestDiscoverAWSBrokerURLUsesCloudFormationOutput(t *testing.T) {
 
 func TestDiscoverAWSBrokerURLFallsBackToSSMParameter(t *testing.T) {
 	bin := t.TempDir()
-	aws := filepath.Join(bin, "aws")
-	script := "#!/bin/sh\n" +
-		"case \"$*\" in\n" +
-		"  *\"cloudformation describe-stacks\"*) exit 1 ;;\n" +
-		"  *\"ssm get-parameter\"*) echo https://bgit-broker-ssm.example.test ; exit 0 ;;\n" +
-		"  *) exit 1 ;;\n" +
-		"esac\n"
-	if err := os.WriteFile(aws, []byte(script), 0o755); err != nil {
-		t.Fatal(err)
-	}
+	writeFakeCLI(t, bin, "aws", []fakeCLIAction{
+		{match: "cloudformation describe-stacks", exitCode: 1},
+		{match: "ssm get-parameter", stdout: "https://bgit-broker-ssm.example.test"},
+	})
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
 	got, err := discoverAWSBrokerURL(config{provider: "s3"}, sshSetupOptions{region: "eu-west-1"})
 	if err != nil {
@@ -1089,19 +1066,13 @@ func TestDiscoverAWSBrokerURLFallsBackToSSMParameter(t *testing.T) {
 func TestProvisionGCPBrokerURLDeploysThenDiscoversFunction(t *testing.T) {
 	bin := t.TempDir()
 	marker := filepath.Join(t.TempDir(), "deployed")
-	gcloud := filepath.Join(bin, "gcloud")
-	script := "#!/bin/sh\n" +
-		"case \"$*\" in\n" +
-		"  *\"functions describe bgit-broker\"*) if [ -f '" + marker + "' ]; then echo https://bgit-broker-provisioned.example.test ; exit 0 ; fi ; exit 1 ;;\n" +
-		"  *\"services enable\"*) exit 0 ;;\n" +
-		"  *\"firestore databases describe\"*) exit 1 ;;\n" +
-		"  *\"firestore databases create\"*) exit 0 ;;\n" +
-		"  *\"functions deploy bgit-broker\"*) touch '" + marker + "' ; exit 0 ;;\n" +
-		"  *) exit 1 ;;\n" +
-		"esac\n"
-	if err := os.WriteFile(gcloud, []byte(script), 0o755); err != nil {
-		t.Fatal(err)
-	}
+	writeFakeCLI(t, bin, "gcloud", []fakeCLIAction{
+		{match: "functions describe bgit-broker", stdout: "https://bgit-broker-provisioned.example.test", requireFile: marker, exitCode: 1},
+		{match: "services enable"},
+		{match: "firestore databases describe", exitCode: 1},
+		{match: "firestore databases create"},
+		{match: "functions deploy bgit-broker", touch: marker},
+	})
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
 	var stdout bytes.Buffer
 	got, err := provisionGCPBrokerURL(config{provider: "gcs"}, sshSetupOptions{region: "europe-west1"}, &stdout)
@@ -1122,16 +1093,10 @@ func TestProvisionGCPBrokerURLDeploysThenDiscoversFunction(t *testing.T) {
 
 func TestEnsureGCPBrokerFirestoreDatabaseSkipsExistingDatabase(t *testing.T) {
 	bin := t.TempDir()
-	gcloud := filepath.Join(bin, "gcloud")
-	script := "#!/bin/sh\n" +
-		"case \"$*\" in\n" +
-		"  *\"firestore databases describe --database=custom\"*) echo projects/demo/databases/custom ; exit 0 ;;\n" +
-		"  *\"firestore databases create\"*) exit 9 ;;\n" +
-		"  *) exit 1 ;;\n" +
-		"esac\n"
-	if err := os.WriteFile(gcloud, []byte(script), 0o755); err != nil {
-		t.Fatal(err)
-	}
+	writeFakeCLI(t, bin, "gcloud", []fakeCLIAction{
+		{match: "firestore databases describe --database=custom", stdout: "projects/demo/databases/custom"},
+		{match: "firestore databases create", exitCode: 9},
+	})
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
 	var stdout bytes.Buffer
 	err := ensureGCPBrokerFirestoreDatabase(config{provider: "gcs"}, sshSetupOptions{firestoreDatabase: "custom", region: "europe-west1"}, &stdout)
@@ -1146,16 +1111,10 @@ func TestEnsureGCPBrokerFirestoreDatabaseSkipsExistingDatabase(t *testing.T) {
 func TestProvisionAWSBrokerURLDeploysThenDiscoversStackOutput(t *testing.T) {
 	bin := t.TempDir()
 	marker := filepath.Join(t.TempDir(), "deployed")
-	aws := filepath.Join(bin, "aws")
-	script := "#!/bin/sh\n" +
-		"case \"$*\" in\n" +
-		"  *\"cloudformation describe-stacks\"*) if [ -f '" + marker + "' ]; then echo https://bgit-broker-provisioned-aws.example.test ; exit 0 ; fi ; exit 1 ;;\n" +
-		"  *\"cloudformation deploy\"*) touch '" + marker + "' ; exit 0 ;;\n" +
-		"  *) exit 1 ;;\n" +
-		"esac\n"
-	if err := os.WriteFile(aws, []byte(script), 0o755); err != nil {
-		t.Fatal(err)
-	}
+	writeFakeCLI(t, bin, "aws", []fakeCLIAction{
+		{match: "cloudformation describe-stacks", stdout: "https://bgit-broker-provisioned-aws.example.test", requireFile: marker, exitCode: 1},
+		{match: "cloudformation deploy", touch: marker},
+	})
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
 	var stdout bytes.Buffer
 	got, err := provisionAWSBrokerURL(config{provider: "s3", gcloudConfiguration: "aws-profile"}, sshSetupOptions{region: "eu-west-1"}, &stdout)
@@ -1168,6 +1127,111 @@ func TestProvisionAWSBrokerURLDeploysThenDiscoversStackOutput(t *testing.T) {
 	if !strings.Contains(stdout.String(), "deploying AWS CloudFormation stack bgit-broker in eu-west-1") {
 		t.Fatalf("stdout = %q", stdout.String())
 	}
+}
+
+type fakeCLIAction struct {
+	match       string
+	stdout      string
+	exitCode    int
+	touch       string
+	requireFile string
+}
+
+func writeFakeCLI(t *testing.T, dir, name string, actions []fakeCLIAction) {
+	t.Helper()
+	path := filepath.Join(dir, name)
+	if runtime.GOOS == "windows" {
+		path += ".bat"
+	}
+	var script strings.Builder
+	if runtime.GOOS == "windows" {
+		script.WriteString("@echo off\r\n")
+		script.WriteString("set ARGS=%*\r\n")
+		for _, action := range actions {
+			finalExitCode := fakeCLIFinalExitCode(action)
+			script.WriteString("echo %ARGS% | findstr /C:\"")
+			script.WriteString(escapeBatch(action.match))
+			script.WriteString("\" >nul\r\n")
+			script.WriteString("if not errorlevel 1 (\r\n")
+			if action.requireFile != "" {
+				script.WriteString("  if not exist \"")
+				script.WriteString(escapeBatch(action.requireFile))
+				script.WriteString("\" exit /b ")
+				script.WriteString(strconv.Itoa(firstNonZeroInt(action.exitCode, 1)))
+				script.WriteString("\r\n")
+			}
+			if action.touch != "" {
+				script.WriteString("  type nul > \"")
+				script.WriteString(escapeBatch(action.touch))
+				script.WriteString("\"\r\n")
+			}
+			if action.stdout != "" {
+				script.WriteString("  echo ")
+				script.WriteString(action.stdout)
+				script.WriteString("\r\n")
+			}
+			script.WriteString("  exit /b ")
+			script.WriteString(strconv.Itoa(finalExitCode))
+			script.WriteString("\r\n)\r\n")
+		}
+		script.WriteString("exit /b 1\r\n")
+	} else {
+		script.WriteString("#!/bin/sh\n")
+		script.WriteString("case \"$*\" in\n")
+		for _, action := range actions {
+			finalExitCode := fakeCLIFinalExitCode(action)
+			script.WriteString("  *\"")
+			script.WriteString(strings.ReplaceAll(action.match, `"`, `\"`))
+			script.WriteString("\"*) ")
+			if action.requireFile != "" {
+				script.WriteString("[ -f '")
+				script.WriteString(strings.ReplaceAll(action.requireFile, `'`, `'\''`))
+				script.WriteString("' ] || exit ")
+				script.WriteString(strconv.Itoa(firstNonZeroInt(action.exitCode, 1)))
+				script.WriteString(" ; ")
+			}
+			if action.touch != "" {
+				script.WriteString("touch '")
+				script.WriteString(strings.ReplaceAll(action.touch, `'`, `'\''`))
+				script.WriteString("' ; ")
+			}
+			if action.stdout != "" {
+				script.WriteString("echo ")
+				script.WriteString(action.stdout)
+				script.WriteString(" ; ")
+			}
+			script.WriteString("exit ")
+			script.WriteString(strconv.Itoa(finalExitCode))
+			script.WriteString(" ;;\n")
+		}
+		script.WriteString("  *) exit 1 ;;\n")
+		script.WriteString("esac\n")
+	}
+	if err := os.WriteFile(path, []byte(script.String()), 0o755); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func fakeCLIFinalExitCode(action fakeCLIAction) int {
+	if action.requireFile != "" && action.stdout != "" {
+		return 0
+	}
+	return action.exitCode
+}
+
+func firstNonZeroInt(values ...int) int {
+	for _, value := range values {
+		if value != 0 {
+			return value
+		}
+	}
+	return 0
+}
+
+func escapeBatch(value string) string {
+	value = strings.ReplaceAll(value, `\`, `\\`)
+	value = strings.ReplaceAll(value, `"`, `\"`)
+	return value
 }
 
 func TestAWSBrokerCloudFormationTemplateHasBrokerOutput(t *testing.T) {

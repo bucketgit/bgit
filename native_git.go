@@ -284,6 +284,9 @@ func (r *nativeGitRepo) initWorktree(ctx context.Context, args []string, stdout 
 	if err := setGitOrigin(absTarget, originForConfig(cfg)); err != nil {
 		return err
 	}
+	if err := setGitBranchTracking(absTarget, cfg.branch, "origin"); err != nil {
+		return err
+	}
 	cloneRepo := *r
 	cloneRepo.cfg = cfg
 	if err := cloneRepo.fetchIntoWorktree(ctx, absTarget, true, io.Discard); err != nil {
@@ -337,30 +340,39 @@ func (r *nativeGitRepo) fetchIntoWorktree(ctx context.Context, worktree string, 
 		names = append(names, name)
 	}
 	sort.Strings(names)
+	var updates []string
 	for _, name := range names {
 		hash := refs[name]
 		switch {
 		case strings.HasPrefix(name, "refs/heads/"):
 			localRef := filepath.Join(gitDir, filepath.FromSlash("refs/remotes/bucketgit/"+strings.TrimPrefix(name, "refs/heads/")))
+			oldHash := readRefFile(localRef)
 			if err := writeRefFile(localRef, hash); err != nil {
 				return err
+			}
+			short := strings.TrimPrefix(name, "refs/heads/")
+			switch {
+			case oldHash == "":
+				updates = append(updates, fmt.Sprintf(" * [new branch]      %s     -> bucketgit/%s", short, short))
+			case oldHash != hash:
+				updates = append(updates, fmt.Sprintf("   %s..%s  %s     -> bucketgit/%s", shortHash(oldHash), shortHash(hash), short, short))
 			}
 		case tags && strings.HasPrefix(name, "refs/tags/"):
 			localRef := filepath.Join(gitDir, filepath.FromSlash(name))
+			oldHash := readRefFile(localRef)
 			if err := writeRefFile(localRef, hash); err != nil {
 				return err
 			}
+			if oldHash == "" {
+				short := strings.TrimPrefix(name, "refs/tags/")
+				updates = append(updates, fmt.Sprintf(" * [new tag]         %s     -> %s", short, short))
+			}
 		}
 	}
-	fmt.Fprintf(stdout, "From %s\n", originForConfig(r.cfg))
-	for _, name := range names {
-		switch {
-		case strings.HasPrefix(name, "refs/heads/"):
-			short := strings.TrimPrefix(name, "refs/heads/")
-			fmt.Fprintf(stdout, " * [new branch]      %s     -> bucketgit/%s\n", short, short)
-		case tags && strings.HasPrefix(name, "refs/tags/"):
-			short := strings.TrimPrefix(name, "refs/tags/")
-			fmt.Fprintf(stdout, " * [new tag]         %s     -> %s\n", short, short)
+	if len(updates) > 0 {
+		fmt.Fprintf(stdout, "From %s\n", originForConfig(r.cfg))
+		for _, update := range updates {
+			fmt.Fprintln(stdout, update)
 		}
 	}
 	return nil
@@ -388,7 +400,7 @@ func (r *nativeGitRepo) pull(ctx context.Context, args []string, stdout io.Write
 	if *rebase {
 		return unsupportedCommand("rebase")
 	}
-	if err := r.fetchIntoWorktree(ctx, worktree, true, io.Discard); err != nil {
+	if err := r.fetchIntoWorktree(ctx, worktree, true, stdout); err != nil {
 		return err
 	}
 	localRepo, err := openLocalRepository(worktree)
@@ -427,6 +439,18 @@ func (r *nativeGitRepo) pull(ctx context.Context, args []string, stdout io.Write
 	return nil
 }
 
+func readRefFile(path string) string {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	hash := strings.TrimSpace(string(data))
+	if !isHexHash(hash) {
+		return ""
+	}
+	return hash
+}
+
 func (r *nativeGitRepo) push(ctx context.Context, args []string, stdout io.Writer) error {
 	opts, err := parsePushArgs(args)
 	if err != nil {
@@ -445,6 +469,10 @@ func (r *nativeGitRepo) pushWorktree(ctx context.Context, worktree string, opts 
 		return errors.New("push requires a writable GCS store")
 	}
 	gitDir, err := localGitDir(worktree)
+	if err != nil {
+		return err
+	}
+	localRepo, err := openLocalRepository(worktree)
 	if err != nil {
 		return err
 	}
@@ -476,6 +504,14 @@ func (r *nativeGitRepo) pushWorktree(ctx context.Context, worktree string, opts 
 			if err := updateRef(normalized, firstNonEmpty(refs[normalized], zeroObjectID()), zeroObjectID()); err != nil {
 				return err
 			}
+			if err := updateLocalRemoteTrackingRef(gitDir, normalized, zeroObjectID()); err != nil {
+				return err
+			}
+			if strings.HasPrefix(normalized, "refs/heads/") {
+				if err := unsetGitBranchTracking(worktree, strings.TrimPrefix(normalized, "refs/heads/")); err != nil {
+					return err
+				}
+			}
 		}
 		fmt.Fprintf(stdout, "To %s\n", originForConfig(r.cfg))
 		for _, ref := range opts.refs {
@@ -489,11 +525,21 @@ func (r *nativeGitRepo) pushWorktree(ctx context.Context, worktree string, opts 
 		if err != nil {
 			return err
 		}
-		ref := branchRef(r.cfg.branch)
-		if err := updateRef(ref, firstNonEmpty(refs[ref], zeroObjectID()), hash); err != nil {
-			return err
+		branch := firstNonEmpty(localRepo.currentBranch(), r.cfg.branch, defaultBranch)
+		ref := branchRef(branch)
+		oldHash := pushOldHash(gitDir, refs, ref)
+		if oldHash != hash {
+			if err := updateRef(ref, oldHash, hash); err != nil {
+				return err
+			}
+			if err := updateLocalRemoteTrackingRef(gitDir, ref, hash); err != nil {
+				return err
+			}
+			if err := setGitBranchTrackingIfOrigin(worktree, branch); err != nil {
+				return err
+			}
+			updates = append(updates, pushUpdateLine(oldHash, hash, branch, branch))
 		}
-		updates = append(updates, fmt.Sprintf(" * [new branch]      %s -> %s", r.cfg.branch, r.cfg.branch))
 	} else {
 		for _, refspec := range opts.refs {
 			src, dst, ok := strings.Cut(refspec, ":")
@@ -506,10 +552,22 @@ func (r *nativeGitRepo) pushWorktree(ctx context.Context, worktree string, opts 
 				return err
 			}
 			ref := normalizeDestinationRef(dst)
-			if err := updateRef(ref, firstNonEmpty(refs[ref], zeroObjectID()), hash); err != nil {
+			oldHash := pushOldHash(gitDir, refs, ref)
+			if oldHash == hash {
+				continue
+			}
+			if err := updateRef(ref, oldHash, hash); err != nil {
 				return err
 			}
-			updates = append(updates, fmt.Sprintf(" * [new branch]      %s -> %s", shortRefName(src), shortRefName(normalizeDestinationRef(dst))))
+			if err := updateLocalRemoteTrackingRef(gitDir, ref, hash); err != nil {
+				return err
+			}
+			if strings.HasPrefix(ref, "refs/heads/") {
+				if err := setGitBranchTrackingIfOrigin(worktree, strings.TrimPrefix(ref, "refs/heads/")); err != nil {
+					return err
+				}
+			}
+			updates = append(updates, pushUpdateLine(oldHash, hash, shortRefName(src), shortRefName(normalizeDestinationRef(dst))))
 		}
 	}
 	if opts.tags {
@@ -518,17 +576,76 @@ func (r *nativeGitRepo) pushWorktree(ctx context.Context, worktree string, opts 
 			return err
 		}
 		for ref, hash := range tags {
-			if err := updateRef(ref, firstNonEmpty(refs[ref], zeroObjectID()), hash); err != nil {
+			oldHash := firstNonEmpty(refs[ref], zeroObjectID())
+			if oldHash == hash {
+				continue
+			}
+			if err := updateRef(ref, oldHash, hash); err != nil {
 				return err
 			}
-			updates = append(updates, fmt.Sprintf(" * [new tag]         %s -> %s", shortRefName(ref), shortRefName(ref)))
+			if oldHash == zeroObjectID() {
+				updates = append(updates, fmt.Sprintf(" * [new tag]         %s -> %s", shortRefName(ref), shortRefName(ref)))
+			} else {
+				updates = append(updates, fmt.Sprintf("   %s..%s  %s -> %s", shortHash(oldHash), shortHash(hash), shortRefName(ref), shortRefName(ref)))
+			}
 		}
+	}
+	if len(updates) == 0 {
+		fmt.Fprintln(stdout, "Everything up-to-date")
+		return nil
 	}
 	fmt.Fprintf(stdout, "To %s\n", originForConfig(r.cfg))
 	for _, line := range updates {
 		fmt.Fprintln(stdout, line)
 	}
 	return nil
+}
+
+func pushOldHash(gitDir string, refs map[string]string, ref string) string {
+	if hash := refs[ref]; hash != "" {
+		return hash
+	}
+	if hash := localRemoteTrackingHash(gitDir, ref); hash != "" {
+		return hash
+	}
+	return zeroObjectID()
+}
+
+func pushUpdateLine(oldHash, newHash, src, dst string) string {
+	if oldHash == zeroObjectID() {
+		return fmt.Sprintf(" * [new branch]      %s -> %s", src, dst)
+	}
+	return fmt.Sprintf("   %s..%s  %s -> %s", shortHash(oldHash), shortHash(newHash), src, dst)
+}
+
+func localRemoteTrackingHash(gitDir, ref string) string {
+	if !strings.HasPrefix(ref, "refs/heads/") {
+		return ""
+	}
+	path := filepath.Join(gitDir, filepath.FromSlash("refs/remotes/bucketgit/"+strings.TrimPrefix(ref, "refs/heads/")))
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	hash := strings.TrimSpace(string(data))
+	if !isHexHash(hash) {
+		return ""
+	}
+	return hash
+}
+
+func updateLocalRemoteTrackingRef(gitDir, ref, hash string) error {
+	if !strings.HasPrefix(ref, "refs/heads/") {
+		return nil
+	}
+	path := filepath.Join(gitDir, filepath.FromSlash("refs/remotes/bucketgit/"+strings.TrimPrefix(ref, "refs/heads/")))
+	if hash == zeroObjectID() {
+		if err := os.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return err
+		}
+		return nil
+	}
+	return writeRefFile(path, hash)
 }
 
 func (r *nativeGitRepo) putFile(ctx context.Context, args []string, stdin io.Reader, stdout io.Writer) error {

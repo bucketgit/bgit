@@ -99,6 +99,91 @@ func parseConfigArgs(args []string) (configOptions, error) {
 	return opts, nil
 }
 
+func configArgsAreGlobal(args []string) bool {
+	for _, arg := range args {
+		if arg == "--global" {
+			return true
+		}
+	}
+	return false
+}
+
+func globalConfigCommand(args []string, stdout io.Writer) error {
+	opts, err := parseGlobalConfigArgs(args)
+	if err != nil {
+		return err
+	}
+	path, err := defaultGlobalConfigPath()
+	if err != nil {
+		return err
+	}
+	cfg, err := readGlobalConfig(path)
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		cfg = globalConfig{Version: globalConfigVersion}
+	}
+	if opts.list {
+		if cfg.Identity.Name != "" {
+			fmt.Fprintf(stdout, "user.name=%s\n", cfg.Identity.Name)
+		}
+		if cfg.Identity.Email != "" {
+			fmt.Fprintf(stdout, "user.email=%s\n", cfg.Identity.Email)
+		}
+		return nil
+	}
+	if opts.unset {
+		switch opts.key {
+		case "user.name":
+			cfg.Identity.Name = ""
+		case "user.email":
+			cfg.Identity.Email = ""
+		default:
+			return fmt.Errorf("unsupported global config key %s", opts.key)
+		}
+		return writeGlobalConfig(path, cfg)
+	}
+	if opts.value == nil {
+		switch opts.key {
+		case "user.name":
+			if cfg.Identity.Name != "" {
+				fmt.Fprintln(stdout, cfg.Identity.Name)
+			}
+		case "user.email":
+			if cfg.Identity.Email != "" {
+				fmt.Fprintln(stdout, cfg.Identity.Email)
+			}
+		default:
+			return fmt.Errorf("unsupported global config key %s", opts.key)
+		}
+		return nil
+	}
+	switch opts.key {
+	case "user.name":
+		cfg.Identity.Name = *opts.value
+	case "user.email":
+		if !identityEmailPattern.MatchString(*opts.value) {
+			return fmt.Errorf("email address %q looks invalid", *opts.value)
+		}
+		cfg.Identity.Email = *opts.value
+	default:
+		return fmt.Errorf("unsupported global config key %s", opts.key)
+	}
+	return writeGlobalConfig(path, cfg)
+}
+
+func parseGlobalConfigArgs(args []string) (configOptions, error) {
+	var filtered []string
+	for _, arg := range args {
+		if arg == "--global" {
+			continue
+		}
+		filtered = append(filtered, arg)
+	}
+	return parseConfigArgs(filtered)
+}
+
 func readLocalConfigFile(path string) (localConfigFile, error) {
 	cfg := localConfigFile{sections: map[string]map[string]string{}}
 	data, err := os.ReadFile(path)

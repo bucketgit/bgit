@@ -1,9 +1,12 @@
 package main
 
 import (
+	"archive/zip"
 	"bytes"
 	"context"
+	"embed"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -14,17 +17,27 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	pathpkg "path"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 )
 
+//go:embed www/*
+var webAssets embed.FS
+
 const (
-	defaultWebAddr = "127.0.0.1"
-	defaultWebPort = 8042
+	defaultWebAddr      = "127.0.0.1"
+	defaultWebPort      = 8042
+	webPageTemplatePath = "www/page.html"
+	webCSSPath          = "www/app.css"
+	webJSPath           = "www/app.js"
+	webLogoPath         = "www/bgit-mark.png"
 )
 
 type webOptions struct {
@@ -34,9 +47,12 @@ type webOptions struct {
 }
 
 type webServer struct {
-	repo  *nativeGitRepo
-	cfg   config
-	title string
+	repo        *nativeGitRepo
+	apiRepo     *nativeGitRepo
+	cfg         config
+	title       string
+	events      *webEventHub
+	localGitDir string
 }
 
 type brokerGitStore struct {
@@ -60,6 +76,12 @@ type webTreeFile struct {
 	hash string
 }
 
+type webFileIndexEntry struct {
+	Path string `json:"path"`
+	URL  string `json:"url"`
+	Kind string `json:"kind"`
+}
+
 type webChangedFile struct {
 	path      string
 	oldHash   string
@@ -67,6 +89,7 @@ type webChangedFile struct {
 	additions int
 	deletions int
 	diff      []webDiffLine
+	visual    []webVisualDiffRow
 	binary    bool
 }
 
@@ -81,18 +104,70 @@ type webDiffLine struct {
 	text string
 }
 
+type webAPIRef struct {
+	Name     string `json:"name"`
+	FullName string `json:"full_name"`
+	Kind     string `json:"kind"`
+}
+
+type webAPICommit struct {
+	Hash      string   `json:"hash"`
+	ShortHash string   `json:"short_hash"`
+	Subject   string   `json:"subject"`
+	Body      string   `json:"body,omitempty"`
+	Author    string   `json:"author"`
+	Email     string   `json:"email"`
+	Timestamp int64    `json:"timestamp"`
+	Parents   []string `json:"parents,omitempty"`
+	Tree      string   `json:"tree,omitempty"`
+}
+
+type webAPITreeEntry struct {
+	Name string `json:"name"`
+	Path string `json:"path"`
+	Kind string `json:"kind"`
+	Hash string `json:"hash"`
+	URL  string `json:"url"`
+}
+
+type webAPIState struct {
+	Branch          string         `json:"branch"`
+	LocalHead       string         `json:"local_head,omitempty"`
+	RemoteHead      string         `json:"remote_head,omitempty"`
+	Ahead           int            `json:"ahead"`
+	Behind          int            `json:"behind"`
+	Dirty           bool           `json:"dirty"`
+	DirtyFiles      []string       `json:"dirty_files"`
+	StagedFiles     []string       `json:"staged_files"`
+	UnstagedFiles   []string       `json:"unstaged_files"`
+	UntrackedFiles  []string       `json:"untracked_files"`
+	UnpushedFiles   []string       `json:"unpushed_files"`
+	UnpulledFiles   []string       `json:"unpulled_files"`
+	UnpushedCommits []webAPICommit `json:"unpushed_commits"`
+	UnpulledCommits []webAPICommit `json:"unpulled_commits"`
+	FetchError      string         `json:"fetch_error,omitempty"`
+}
+
+type webPullRequestCache struct {
+	UpdatedAt int64               `json:"updated_at"`
+	PRs       []brokerPullRequest `json:"prs"`
+}
+
 func webCommand(ctx context.Context, cfg config, args []string, stdout io.Writer) error {
 	opts, err := parseWebArgs(args)
 	if err != nil {
 		return err
 	}
-	repo, closeStore, cfg, err := openWebRepository(ctx, cfg, opts.local)
+	repo, apiRepo, closeStore, cfg, err := openWebRepository(ctx, cfg, opts.local)
 	if err != nil {
 		return err
 	}
 	defer closeStore()
 
-	handler := newWebHandler(repo, cfg)
+	handler := newWebHandlerWithAPI(repo, apiRepo, cfg)
+	liveCtx, cancelLive := context.WithCancel(ctx)
+	defer cancelLive()
+	handler.startLiveMonitors(liveCtx)
 	ln, err := listenWeb(opts.addr, opts.port)
 	if err != nil {
 		return err
@@ -153,11 +228,11 @@ func parseWebArgs(args []string) (webOptions, error) {
 	return opts, nil
 }
 
-func openWebRepository(ctx context.Context, cfg config, local bool) (*nativeGitRepo, func(), config, error) {
+func openWebRepository(ctx context.Context, cfg config, local bool) (*nativeGitRepo, *nativeGitRepo, func(), config, error) {
 	if local {
 		localRepo, err := openLocalRepository(".")
 		if err != nil {
-			return nil, nil, cfg, err
+			return nil, nil, nil, cfg, err
 		}
 		if localCfg, err := readLocalConfig(localRepo.worktree); err == nil {
 			cfg = mergeConfig(cfg, localCfg)
@@ -165,43 +240,44 @@ func openWebRepository(ctx context.Context, cfg config, local bool) (*nativeGitR
 		if branch := localRepo.currentBranch(); branch != "" {
 			cfg.branch = branch
 		}
-		return newNativeGitRepoForStore(cfg, localRepo.store), func() {}, cfg, nil
+		repo := newNativeGitRepoForStore(cfg, localRepo.store)
+		return repo, repo, func() {}, cfg, nil
 	}
 
-	if cfg.bucket == "" {
+	var seedRepo *nativeGitRepo
+	if localRepo, err := openLocalRepository("."); err == nil {
+		if localCfg, err := readLocalConfig(localRepo.worktree); err == nil {
+			cfg = mergeConfig(cfg, localCfg)
+		}
+		if branch := localRepo.currentBranch(); branch != "" {
+			cfg.branch = branch
+		}
+		seedRepo = newNativeGitRepoForStore(cfg, localRepo.store)
+	}
+	if cfg.bucket == "" && cfg.brokerURL == "" {
 		localCfg, err := readLocalConfig(".")
 		if err == nil {
 			cfg = mergeConfig(cfg, localCfg)
 		}
 	}
-	if cfg.bucket == "" {
-		return nil, nil, cfg, errors.New("--bucket is required outside a bucketgit checkout")
+	if cfg.bucket == "" && cfg.brokerURL == "" {
+		return nil, nil, nil, cfg, errors.New("--bucket is required outside a bucketgit checkout")
 	}
-	brokerURL := webBrokerURL()
 	store, closeStore, err := newRemoteStore(ctx, cfg, true)
 	if err != nil {
-		if brokerURL == "" {
-			return nil, nil, cfg, fmt.Errorf("create remote store: %w", err)
-		}
-		return openNativeGitRepo(&brokerGitStore{brokerURL: brokerURL, cfg: cfg}, cfg), func() {}, cfg, nil
+		return nil, nil, nil, cfg, fmt.Errorf("create remote store: %w", err)
 	}
-	if brokerURL != "" {
-		store = &fallbackGitRemoteStore{
-			primary:  store,
-			fallback: &brokerGitStore{brokerURL: brokerURL, cfg: cfg},
-		}
+	remoteRepo := openNativeGitRepo(store, cfg)
+	if seedRepo == nil {
+		seedRepo = remoteRepo
 	}
-	return openNativeGitRepo(store, cfg), closeStore, cfg, nil
-}
-
-func webBrokerURL() string {
-	if out, err := runGit(".", "config", "--get", "bucketgit.broker"); err == nil {
-		return strings.TrimSpace(string(out))
-	}
-	return ""
+	return seedRepo, remoteRepo, closeStore, cfg, nil
 }
 
 func (s *brokerGitStore) read(ctx context.Context, objectPath string) ([]byte, error) {
+	if data, ok, err := s.readWithCapability(ctx, objectPath); ok || err != nil {
+		return data, err
+	}
 	var resp brokerObjectResponse
 	err := brokerPostContext(ctx, s.brokerURL, "/objects/read", brokerObjectRequest{
 		Repo: repoForBroker(s.cfg),
@@ -244,11 +320,28 @@ func isBrokerNotFoundError(err error) bool {
 		strings.Contains(message, "not found")
 }
 
-func newWebHandler(repo *nativeGitRepo, cfg config) http.Handler {
-	return &webServer{repo: repo, cfg: cfg, title: webRepoTitle(cfg)}
+func newWebHandler(repo *nativeGitRepo, cfg config) *webServer {
+	return newWebHandlerWithAPI(repo, repo, cfg)
+}
+
+func newWebHandlerWithAPI(repo, apiRepo *nativeGitRepo, cfg config) *webServer {
+	if apiRepo == nil {
+		apiRepo = repo
+	}
+	localGitDir := ""
+	if repo != nil {
+		if store, ok := repo.store.(*localGitStore); ok {
+			localGitDir = store.root
+		}
+	}
+	return &webServer{repo: repo, apiRepo: apiRepo, cfg: cfg, title: webRepoTitle(cfg), events: newWebEventHub(), localGitDir: localGitDir}
 }
 
 func webRepoTitle(cfg config) string {
+	logicalRepo := strings.Trim(cfg.logicalRepo, "/")
+	if logicalRepo != "" {
+		return logicalRepo
+	}
 	if cfg.origin != "" {
 		return cfg.origin
 	}
@@ -259,28 +352,131 @@ func webRepoTitle(cfg config) string {
 }
 
 func (s *webServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet && r.Method != http.MethodHead {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
 	ctx := r.Context()
 	route := strings.TrimPrefix(r.URL.Path, "/")
+	srv := s.serverForRequest(r, strings.HasPrefix(route, "api/"))
 	switch {
+	case r.Method != http.MethodGet && r.Method != http.MethodHead && !strings.HasPrefix(route, "api/actions/"):
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	case route == "assets/bgit-mark.png":
+		s.handleWebAsset(w, webLogoPath)
+	case route == "events":
+		s.handleEvents(w, r)
+	case route == "api/state":
+		s.handleAPIState(ctx, w, r)
+	case route == "api/actions/commit":
+		s.handleAPIActionCommit(ctx, w, r)
+	case route == "api/actions/stage":
+		s.handleAPIActionStage(ctx, w, r)
+	case route == "api/actions/unstage":
+		s.handleAPIActionUnstage(ctx, w, r)
+	case route == "api/actions/discard":
+		s.handleAPIActionDiscard(ctx, w, r)
+	case route == "api/actions/uncommit":
+		s.handleAPIActionUncommit(ctx, w, r)
+	case route == "api/actions/push":
+		s.handleAPIActionPush(ctx, w, r)
+	case route == "api/actions/pull":
+		s.handleAPIActionPull(ctx, w, r)
+	case route == "api/actions/pr":
+		s.handleAPIActionPullRequest(ctx, w, r)
+	case route == "api/diff":
+		s.handleAPIDiff(ctx, w, r)
+	case route == "api/refs":
+		srv.handleAPIRefs(ctx, w, r)
+	case route == "api/tree":
+		srv.handleAPITree(ctx, w, r)
+	case route == "api/commits":
+		srv.handleAPICommits(ctx, w, r)
+	case route == "api/prs":
+		s.handleAPIPullRequests(ctx, w, r)
+	case route == "api/blob":
+		srv.handleAPIBlob(ctx, w, r)
+	case strings.HasPrefix(route, "api/commit/"):
+		srv.handleAPICommit(ctx, w, r, strings.TrimPrefix(route, "api/commit/"))
 	case r.URL.Path == "/":
-		s.handleTree(ctx, w, r, "")
+		srv.handleTree(ctx, w, r, "")
 	case route == "commits":
-		s.handleCommits(ctx, w, r)
+		srv.handleCommits(ctx, w, r)
+	case route == "prs":
+		s.handlePullRequests(ctx, w, r)
+	case strings.HasPrefix(route, "prs/"):
+		s.handlePullRequest(ctx, w, r, strings.TrimPrefix(route, "prs/"))
+	case route == "archive.zip":
+		srv.handleArchiveZip(ctx, w, r)
 	case strings.HasPrefix(route, "commit/"):
-		s.handleCommit(ctx, w, r, strings.TrimPrefix(route, "commit/"))
+		srv.handleCommit(ctx, w, r, strings.TrimPrefix(route, "commit/"))
 	case strings.HasPrefix(route, "tree/"):
-		s.handleTree(ctx, w, r, strings.TrimPrefix(route, "tree/"))
+		srv.handleTree(ctx, w, r, strings.TrimPrefix(route, "tree/"))
 	case strings.HasPrefix(route, "blob/"):
-		s.handleBlob(ctx, w, r, strings.TrimPrefix(route, "blob/"), false)
+		srv.handleBlob(ctx, w, r, strings.TrimPrefix(route, "blob/"), false)
 	case strings.HasPrefix(route, "raw/"):
-		s.handleBlob(ctx, w, r, strings.TrimPrefix(route, "raw/"), true)
+		srv.handleBlob(ctx, w, r, strings.TrimPrefix(route, "raw/"), true)
 	default:
 		http.NotFound(w, r)
 	}
+}
+
+func (s *webServer) handleWebAsset(w http.ResponseWriter, path string) {
+	data, err := webAssetBytes(path)
+	if err != nil {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+	if typ := mime.TypeByExtension(filepath.Ext(path)); typ != "" {
+		w.Header().Set("Content-Type", typ)
+	}
+	w.Header().Set("Cache-Control", "public, max-age=86400")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(data)
+}
+
+func (s *webServer) handleEvents(w http.ResponseWriter, r *http.Request) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	client := s.events.subscribe()
+	defer s.events.unsubscribe(client)
+	fmt.Fprint(w, "event: ready\ndata: {}\n\n")
+	flusher.Flush()
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		case event := <-client:
+			fmt.Fprint(w, event)
+			flusher.Flush()
+		}
+	}
+}
+
+func (s *webServer) startLiveMonitors(ctx context.Context) {
+	if s.events == nil {
+		return
+	}
+	if repo, err := openLocalRepository("."); err == nil {
+		go monitorWebPath(ctx, repo.gitDir, "git", s.events)
+	}
+	if dir := webAssetDir(); dir != "" {
+		go monitorWebPath(ctx, dir, "assets", s.events)
+	}
+}
+
+func (s *webServer) serverForRequest(r *http.Request, api bool) *webServer {
+	if s.apiRepo == nil || s.apiRepo == s.repo {
+		return s
+	}
+	if api || r.URL.Query().Get("_remote") == "1" {
+		next := *s
+		next.repo = s.apiRepo
+		return &next
+	}
+	return s
 }
 
 func (s *webServer) headCommit(ctx context.Context, r *http.Request) (string, commitObject, string, error) {
@@ -299,6 +495,875 @@ func (s *webServer) headCommit(ctx context.Context, r *http.Request) (string, co
 	return hash, commit, ref, nil
 }
 
+func (s *webServer) handleAPIRefs(ctx context.Context, w http.ResponseWriter, r *http.Request) {
+	options, err := s.refOptions(ctx)
+	if err != nil {
+		s.renderJSONError(w, http.StatusInternalServerError, err)
+		return
+	}
+	refs := make([]webAPIRef, 0, len(options))
+	for _, option := range options {
+		refs = append(refs, webAPIRef{Name: option.name, FullName: option.fullName, Kind: option.kind})
+	}
+	s.renderJSON(w, map[string]any{
+		"refs":        refs,
+		"default_ref": branchRef(firstNonEmpty(s.cfg.branch, defaultBranch)),
+	})
+}
+
+func (s *webServer) handleAPITree(ctx context.Context, w http.ResponseWriter, r *http.Request) {
+	_, commit, ref, err := s.headCommit(ctx, r)
+	if err != nil {
+		s.renderJSONError(w, http.StatusNotFound, err)
+		return
+	}
+	repoPath := cleanWebPath(r.URL.Query().Get("path"))
+	treeHash := commit.tree
+	if repoPath != "" && repoPath != "commits" && repoPath != "prs" {
+		hash, err := s.repo.findPath(ctx, commit.tree, repoPath)
+		if err != nil {
+			s.renderJSONError(w, http.StatusNotFound, err)
+			return
+		}
+		obj, err := s.repo.object(ctx, hash)
+		if err != nil {
+			s.renderJSONError(w, http.StatusInternalServerError, err)
+			return
+		}
+		if obj.typ == gitObjectBlob {
+			s.renderJSONError(w, http.StatusBadRequest, errors.New("path is a blob"))
+			return
+		}
+		treeHash = hash
+	}
+	entries, err := s.repo.treeEntries(ctx, treeHash)
+	if err != nil {
+		s.renderJSONError(w, http.StatusInternalServerError, err)
+		return
+	}
+	sort.SliceStable(entries, func(i, j int) bool {
+		if entries[i].typ != entries[j].typ {
+			return entries[i].typ == gitObjectTree
+		}
+		return entries[i].name < entries[j].name
+	})
+	apiEntries := make([]webAPITreeEntry, 0, len(entries))
+	for _, entry := range entries {
+		kind := "file"
+		route := "blob"
+		if entry.typ == gitObjectTree {
+			kind = "dir"
+			route = "tree"
+		}
+		targetPath := pathpkg.Join(repoPath, entry.name)
+		apiEntries = append(apiEntries, webAPITreeEntry{
+			Name: entry.name,
+			Path: targetPath,
+			Kind: kind,
+			Hash: entry.hash,
+			URL:  webURL(route, targetPath, ref),
+		})
+	}
+	commits, _ := s.repo.walkCommits(ctx, commit.hash, 10, 0, repoPath)
+	s.renderJSON(w, map[string]any{
+		"ref":            ref,
+		"path":           repoPath,
+		"commit":         webAPICommitFromCommit(commit),
+		"entries":        apiEntries,
+		"recent_commits": webAPICommitsFromCommits(commits),
+	})
+}
+
+func (s *webServer) handleAPICommits(ctx context.Context, w http.ResponseWriter, r *http.Request) {
+	_, commit, ref, err := s.headCommit(ctx, r)
+	if err != nil {
+		s.renderJSONError(w, http.StatusNotFound, err)
+		return
+	}
+	repoPath := cleanWebPath(r.URL.Query().Get("path"))
+	commits, err := s.repo.walkCommits(ctx, commit.hash, 100, 0, repoPath)
+	if err != nil {
+		s.renderJSONError(w, http.StatusInternalServerError, err)
+		return
+	}
+	s.renderJSON(w, map[string]any{"ref": ref, "path": repoPath, "head": webAPICommitFromCommit(commit), "commits": webAPICommitsFromCommits(commits)})
+}
+
+func (s *webServer) handleAPIPullRequests(ctx context.Context, w http.ResponseWriter, r *http.Request) {
+	refresh := r.URL.Query().Get("refresh") == "1"
+	prs := []brokerPullRequest{}
+	source := "cache"
+	stale := false
+	if !refresh {
+		if cached, err := s.readPullRequestCache(); err == nil {
+			s.renderJSON(w, map[string]any{
+				"prs":    webAPIPullRequests(cached.PRs),
+				"source": source,
+				"stale":  true,
+			})
+			return
+		}
+	}
+	refreshed, err := s.refreshPullRequestCache(ctx)
+	if err != nil {
+		cached, cacheErr := s.readPullRequestCache()
+		if cacheErr != nil {
+			s.renderJSONError(w, http.StatusForbidden, err)
+			return
+		}
+		prs = cached.PRs
+		stale = true
+	} else {
+		prs = refreshed
+		source = "broker"
+	}
+	s.renderJSON(w, map[string]any{
+		"prs":    webAPIPullRequests(prs),
+		"source": source,
+		"stale":  stale,
+	})
+}
+
+func (s *webServer) handleAPICommit(ctx context.Context, w http.ResponseWriter, r *http.Request, hash string) {
+	hash = strings.TrimSpace(strings.Trim(hash, "/"))
+	if hash == "" {
+		s.renderJSONError(w, http.StatusNotFound, fs.ErrNotExist)
+		return
+	}
+	commitHash, err := s.repo.resolveRevision(ctx, hash)
+	if err != nil {
+		commitHash = hash
+	}
+	commit, err := s.repo.commit(ctx, commitHash)
+	if err != nil {
+		s.renderJSONError(w, http.StatusNotFound, err)
+		return
+	}
+	files, additions, deletions, err := s.changedFiles(ctx, commit)
+	if err != nil {
+		s.renderJSONError(w, http.StatusInternalServerError, err)
+		return
+	}
+	s.renderJSON(w, map[string]any{
+		"commit":    webAPICommitFromCommit(commit),
+		"files":     webAPIChangedFiles(files),
+		"additions": additions,
+		"deletions": deletions,
+	})
+}
+
+func (s *webServer) handleAPIBlob(ctx context.Context, w http.ResponseWriter, r *http.Request) {
+	_, commit, ref, err := s.headCommit(ctx, r)
+	if err != nil {
+		s.renderJSONError(w, http.StatusNotFound, err)
+		return
+	}
+	repoPath := cleanWebPath(r.URL.Query().Get("path"))
+	if repoPath == "" {
+		s.renderJSONError(w, http.StatusNotFound, fs.ErrNotExist)
+		return
+	}
+	hash, err := s.repo.findPath(ctx, commit.tree, repoPath)
+	if err != nil {
+		s.renderJSONError(w, http.StatusNotFound, err)
+		return
+	}
+	obj, err := s.repo.object(ctx, hash)
+	if err != nil {
+		s.renderJSONError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if obj.typ == gitObjectTree {
+		s.renderJSONError(w, http.StatusBadRequest, errors.New("path is a tree"))
+		return
+	}
+	content := ""
+	encoding := "base64"
+	if isTextBlob(obj.data) {
+		content = string(obj.data)
+		encoding = "utf-8"
+	} else {
+		content = base64.StdEncoding.EncodeToString(obj.data)
+	}
+	s.renderJSON(w, map[string]any{
+		"ref":      ref,
+		"path":     repoPath,
+		"commit":   webAPICommitFromCommit(commit),
+		"hash":     hash,
+		"size":     len(obj.data),
+		"text":     isTextBlob(obj.data),
+		"encoding": encoding,
+		"content":  content,
+		"raw_url":  webURL("raw", repoPath, ref),
+	})
+}
+
+func (s *webServer) handleAPIState(ctx context.Context, w http.ResponseWriter, r *http.Request) {
+	state, err := s.webRepositoryState(ctx, true, r.URL.Query().Get("ref"))
+	if err != nil {
+		s.renderJSONError(w, http.StatusInternalServerError, err)
+		return
+	}
+	s.renderJSON(w, state)
+}
+
+func (s *webServer) handleAPIDiff(ctx context.Context, w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if commit := strings.TrimSpace(r.URL.Query().Get("commit")); commit != "" {
+		diff, err := localCommitDiff(commit)
+		if err != nil {
+			s.renderJSONError(w, http.StatusBadRequest, err)
+			return
+		}
+		s.renderJSON(w, map[string]any{"commit": commit, "diff": diff})
+		return
+	}
+	if prID := strings.TrimSpace(r.URL.Query().Get("pr")); prID != "" {
+		id, err := strconv.Atoi(prID)
+		if err != nil || id <= 0 {
+			s.renderJSONError(w, http.StatusBadRequest, errors.New("invalid pull request id"))
+			return
+		}
+		diff, err := s.pullRequestUnifiedDiff(ctx, id)
+		if err != nil {
+			s.renderJSONError(w, http.StatusBadRequest, err)
+			return
+		}
+		s.renderJSON(w, map[string]any{"pr": id, "diff": diff})
+		return
+	}
+	repoPath := cleanWebPath(r.URL.Query().Get("path"))
+	if repoPath == "" || repoPath == "." {
+		s.renderJSONError(w, http.StatusBadRequest, errors.New("diff requires a path"))
+		return
+	}
+	mode := strings.TrimSpace(r.URL.Query().Get("mode"))
+	if mode == "" {
+		mode = "worktree"
+	}
+	diff, err := localFileDiff(repoPath, mode)
+	if err != nil {
+		s.renderJSONError(w, http.StatusBadRequest, err)
+		return
+	}
+	s.renderJSON(w, map[string]any{
+		"path": repoPath,
+		"mode": mode,
+		"diff": diff,
+	})
+	_ = ctx
+}
+
+func (s *webServer) handleAPIActionCommit(ctx context.Context, w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		Message string `json:"message"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		s.renderJSONError(w, http.StatusBadRequest, err)
+		return
+	}
+	req.Message = strings.TrimSpace(req.Message)
+	if req.Message == "" {
+		s.renderJSONError(w, http.StatusBadRequest, errors.New("commit message is required"))
+		return
+	}
+	repo, err := openLocalRepository(".")
+	if err != nil {
+		s.renderJSONError(w, http.StatusBadRequest, err)
+		return
+	}
+	var out bytes.Buffer
+	if err := repo.commit([]string{"-m", req.Message}, &out); err != nil {
+		s.renderJSONError(w, http.StatusBadRequest, err)
+		return
+	}
+	state, err := s.webRepositoryState(ctx, false, "")
+	if err != nil {
+		s.renderJSONError(w, http.StatusInternalServerError, err)
+		return
+	}
+	s.renderJSON(w, map[string]any{"ok": true, "output": strings.TrimSpace(out.String()), "state": state})
+}
+
+func (s *webServer) handleAPIActionStage(ctx context.Context, w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		Path string `json:"path"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		s.renderJSONError(w, http.StatusBadRequest, err)
+		return
+	}
+	repoPath := cleanWebPath(req.Path)
+	if repoPath == "" || repoPath == "." {
+		s.renderJSONError(w, http.StatusBadRequest, errors.New("stage requires a path"))
+		return
+	}
+	repo, err := openLocalRepository(".")
+	if err != nil {
+		s.renderJSONError(w, http.StatusBadRequest, err)
+		return
+	}
+	repoPath = canonicalWorktreePath(repo, repoPath)
+	if err := repo.add([]string{repoPath}); err != nil {
+		s.renderJSONError(w, http.StatusBadRequest, err)
+		return
+	}
+	state, err := s.webRepositoryState(ctx, false, "")
+	if err != nil {
+		s.renderJSONError(w, http.StatusInternalServerError, err)
+		return
+	}
+	s.renderJSON(w, map[string]any{"ok": true, "state": state})
+}
+
+func (s *webServer) handleAPIActionUnstage(ctx context.Context, w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		Path string `json:"path"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		s.renderJSONError(w, http.StatusBadRequest, err)
+		return
+	}
+	repoPath := cleanWebPath(req.Path)
+	if repoPath == "" || repoPath == "." {
+		s.renderJSONError(w, http.StatusBadRequest, errors.New("unstage requires a path"))
+		return
+	}
+	repo, err := openLocalRepository(".")
+	if err != nil {
+		s.renderJSONError(w, http.StatusBadRequest, err)
+		return
+	}
+	if err := repo.reset([]string{"--", repoPath}); err != nil {
+		s.renderJSONError(w, http.StatusBadRequest, err)
+		return
+	}
+	state, err := s.webRepositoryState(ctx, false, "")
+	if err != nil {
+		s.renderJSONError(w, http.StatusInternalServerError, err)
+		return
+	}
+	s.renderJSON(w, map[string]any{"ok": true, "state": state})
+}
+
+func (s *webServer) handleAPIActionDiscard(ctx context.Context, w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		Path string `json:"path"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		s.renderJSONError(w, http.StatusBadRequest, err)
+		return
+	}
+	repoPath := cleanWebPath(req.Path)
+	if repoPath == "" || repoPath == "." {
+		s.renderJSONError(w, http.StatusBadRequest, errors.New("checkout requires a path"))
+		return
+	}
+	repo, err := openLocalRepository(".")
+	if err != nil {
+		s.renderJSONError(w, http.StatusBadRequest, err)
+		return
+	}
+	repoPath = canonicalWorktreePath(repo, repoPath)
+	state, err := s.webRepositoryState(ctx, false, "")
+	if err != nil {
+		s.renderJSONError(w, http.StatusInternalServerError, err)
+		return
+	}
+	source := firstNonEmpty(state.RemoteHead, state.LocalHead, "HEAD")
+	if err := repo.checkoutPaths(source, []string{repoPath}); err != nil {
+		s.renderJSONError(w, http.StatusBadRequest, err)
+		return
+	}
+	state, err = s.webRepositoryState(ctx, false, "")
+	if err != nil {
+		s.renderJSONError(w, http.StatusInternalServerError, err)
+		return
+	}
+	s.renderJSON(w, map[string]any{"ok": true, "state": state})
+}
+
+func (s *webServer) handleAPIActionUncommit(ctx context.Context, w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	state, err := s.webRepositoryState(ctx, false, "")
+	if err != nil {
+		s.renderJSONError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if state.RemoteHead == "" || state.Ahead == 0 {
+		s.renderJSONError(w, http.StatusBadRequest, errors.New("no unpushed commits to uncommit"))
+		return
+	}
+	repo, err := openLocalRepository(".")
+	if err != nil {
+		s.renderJSONError(w, http.StatusBadRequest, err)
+		return
+	}
+	if err := repo.reset([]string{"--soft", state.RemoteHead}); err != nil {
+		s.renderJSONError(w, http.StatusBadRequest, err)
+		return
+	}
+	state, err = s.webRepositoryState(ctx, false, "")
+	if err != nil {
+		s.renderJSONError(w, http.StatusInternalServerError, err)
+		return
+	}
+	s.renderJSON(w, map[string]any{"ok": true, "state": state})
+}
+
+func canonicalWorktreePath(repo *localRepository, repoPath string) string {
+	files, err := repo.allWorktreeFiles()
+	if err != nil {
+		return repoPath
+	}
+	for _, file := range files {
+		if file == repoPath {
+			return file
+		}
+	}
+	for _, file := range files {
+		if strings.EqualFold(file, repoPath) {
+			return file
+		}
+	}
+	return repoPath
+}
+
+func (s *webServer) handleAPIActionPush(ctx context.Context, w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var out bytes.Buffer
+	if err := run([]string{"push"}, strings.NewReader("n\n"), &out, &out); err != nil {
+		s.renderJSONError(w, http.StatusBadRequest, err)
+		return
+	}
+	state, err := s.webRepositoryState(ctx, true, "")
+	if err != nil {
+		s.renderJSONError(w, http.StatusInternalServerError, err)
+		return
+	}
+	s.renderJSON(w, map[string]any{"ok": true, "output": strings.TrimSpace(out.String()), "state": state})
+}
+
+func (s *webServer) handleAPIActionPull(ctx context.Context, w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var out bytes.Buffer
+	if err := run([]string{"pull"}, strings.NewReader(""), &out, &out); err != nil {
+		s.renderJSONError(w, http.StatusBadRequest, err)
+		return
+	}
+	state, err := s.webRepositoryState(ctx, true, "")
+	if err != nil {
+		s.renderJSONError(w, http.StatusInternalServerError, err)
+		return
+	}
+	s.renderJSON(w, map[string]any{"ok": true, "output": strings.TrimSpace(out.String()), "state": state})
+}
+
+func (s *webServer) handleAPIActionPullRequest(ctx context.Context, w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if strings.TrimSpace(s.cfg.brokerURL) == "" {
+		s.renderJSONError(w, http.StatusBadRequest, errors.New("pull request actions require a broker-backed repository"))
+		return
+	}
+	var req struct {
+		ID           int    `json:"id"`
+		Action       string `json:"action"`
+		Comment      string `json:"comment"`
+		DeleteBranch bool   `json:"delete_branch"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		s.renderJSONError(w, http.StatusBadRequest, err)
+		return
+	}
+	if req.ID <= 0 {
+		s.renderJSONError(w, http.StatusBadRequest, errors.New("pull request id is required"))
+		return
+	}
+	var resp struct {
+		PR brokerPullRequest `json:"pr"`
+	}
+	brokerReq := brokerPullRequestRequest{
+		Repo:         repoForBroker(s.cfg),
+		ID:           req.ID,
+		Comment:      strings.TrimSpace(req.Comment),
+		DeleteBranch: req.DeleteBranch,
+	}
+	endpoint := ""
+	switch strings.TrimSpace(req.Action) {
+	case "comment":
+		if brokerReq.Comment == "" {
+			s.renderJSONError(w, http.StatusBadRequest, errors.New("comment is required"))
+			return
+		}
+		endpoint = "/prs/comment"
+	case "approve":
+		endpoint = "/prs/review"
+		brokerReq.Review = "approved"
+	case "reject":
+		endpoint = "/prs/review"
+		brokerReq.Review = "changes_requested"
+	case "merge":
+		endpoint = "/prs/merge"
+		brokerReq.Merge = true
+	case "close":
+		endpoint = "/prs/close"
+	default:
+		s.renderJSONError(w, http.StatusBadRequest, fmt.Errorf("unsupported pull request action %q", req.Action))
+		return
+	}
+	if err := brokerPostContext(ctx, s.cfg.brokerURL, endpoint, brokerReq, &resp); err != nil {
+		s.renderJSONError(w, http.StatusBadRequest, err)
+		return
+	}
+	prs := s.upsertPullRequestCache(resp.PR)
+	s.renderJSON(w, map[string]any{"ok": true, "pr": resp.PR, "prs": webAPIPullRequests(prs)})
+}
+
+func (s *webServer) webRepositoryState(ctx context.Context, refreshRemote bool, selectedRef string) (webAPIState, error) {
+	localRepo, err := openLocalRepository(".")
+	if err != nil {
+		return webAPIState{}, err
+	}
+	currentBranch := localRepo.currentBranch()
+	ref := normalizeWebRef(selectedRef)
+	if ref == "" {
+		ref = branchRef(firstNonEmpty(currentBranch, s.cfg.branch, defaultBranch))
+	}
+	branch := shortRefName(ref)
+	state := webAPIState{Branch: branch}
+	isBranchRef := strings.HasPrefix(ref, "refs/heads/")
+	if refreshRemote && isBranchRef && (s.cfg.brokerURL != "" || s.cfg.bucket != "" || s.cfg.origin != "") {
+		if err := s.fetchWebRemoteTracking(ctx, ref); err != nil {
+			state.FetchError = err.Error()
+		}
+	}
+	if head, err := localRepo.resolveRevision(ref); err == nil {
+		state.LocalHead = head
+	}
+	if isBranchRef {
+		remoteRef := "refs/remotes/bucketgit/" + shortBranchName(ref)
+		if remoteHead, err := localRepo.resolveRevision(remoteRef); err == nil {
+			state.RemoteHead = remoteHead
+		} else if remoteHead, err := localRepo.resolveRevision("refs/remotes/origin/" + shortBranchName(ref)); err == nil {
+			state.RemoteHead = remoteHead
+		}
+	}
+
+	if currentBranch != "" && ref == branchRef(currentBranch) {
+		status := localWorkingTreeStatus()
+		state.StagedFiles = status.staged
+		state.UnstagedFiles = status.unstaged
+		state.UntrackedFiles = status.untracked
+		state.DirtyFiles = append(state.DirtyFiles, state.StagedFiles...)
+		state.DirtyFiles = append(state.DirtyFiles, state.UnstagedFiles...)
+		state.DirtyFiles = append(state.DirtyFiles, state.UntrackedFiles...)
+		state.DirtyFiles = uniqueSortedStrings(state.DirtyFiles)
+		state.StagedFiles = uniqueSortedStrings(state.StagedFiles)
+		state.UnstagedFiles = uniqueSortedStrings(state.UnstagedFiles)
+		state.UntrackedFiles = uniqueSortedStrings(state.UntrackedFiles)
+		sort.Strings(state.DirtyFiles)
+		state.Dirty = len(state.DirtyFiles) > 0
+	}
+	state.UnpushedFiles = localChangedFilesBetween(localRepo, state.RemoteHead, state.LocalHead)
+	state.UnpulledFiles = localChangedFilesBetween(localRepo, state.LocalHead, state.RemoteHead)
+
+	if state.LocalHead != "" {
+		commits, err := localCommitRange(localRepo, state.RemoteHead, state.LocalHead, 25)
+		if err != nil {
+			return state, err
+		}
+		state.UnpushedCommits = webAPICommitsFromCommits(commits)
+		state.Ahead = len(commits)
+	}
+	if state.RemoteHead != "" {
+		commits, err := localCommitRange(localRepo, state.LocalHead, state.RemoteHead, 25)
+		if err != nil {
+			return state, err
+		}
+		state.UnpulledCommits = webAPICommitsFromCommits(commits)
+		state.Behind = len(commits)
+	}
+	return state, nil
+}
+
+func (s *webServer) fetchWebRemoteTracking(ctx context.Context, branch string) error {
+	worktree, err := requireWorktree(".")
+	if err != nil {
+		return err
+	}
+	localCfg, err := readLocalConfig(worktree)
+	if err != nil {
+		return err
+	}
+	cfg := mergeConfig(localCfg, s.cfg)
+	cfg.branch = firstNonEmpty(branch, cfg.branch, defaultBranch)
+	store, closeStore, err := newRemoteStore(ctx, cfg, true)
+	if err != nil {
+		return err
+	}
+	defer closeStore()
+	repo := openNativeGitRepo(store, cfg)
+	return repo.fetchIntoWorktree(ctx, worktree, true, io.Discard)
+}
+
+type webWorkingTreeStatus struct {
+	staged    []string
+	unstaged  []string
+	untracked []string
+}
+
+func localWorkingTreeStatus() webWorkingTreeStatus {
+	out, err := runGit(".", "status", "--porcelain", "--untracked-files=all")
+	if err != nil {
+		return webWorkingTreeStatus{}
+	}
+	var status webWorkingTreeStatus
+	for _, line := range strings.Split(strings.TrimRight(string(out), "\r\n"), "\n") {
+		if len(line) < 4 {
+			continue
+		}
+		indexStatus := line[0]
+		worktreeStatus := line[1]
+		path := strings.TrimSpace(line[3:])
+		if before, after, ok := strings.Cut(path, " -> "); ok && before != "" {
+			path = strings.TrimSpace(after)
+		}
+		path = strings.Trim(path, `"`)
+		if path == "" {
+			continue
+		}
+		if indexStatus == '?' && worktreeStatus == '?' {
+			status.untracked = append(status.untracked, path)
+			continue
+		}
+		if indexStatus != ' ' && indexStatus != '?' {
+			status.staged = append(status.staged, path)
+		}
+		if worktreeStatus != ' ' && worktreeStatus != '?' {
+			status.unstaged = append(status.unstaged, path)
+		}
+	}
+	return status
+}
+
+func localFileDiff(repoPath, mode string) (string, error) {
+	repo, err := openLocalRepository(".")
+	if err != nil {
+		return "", err
+	}
+	repoPath = canonicalWorktreePath(repo, repoPath)
+	switch mode {
+	case "staged", "cached":
+		out, err := runGit(".", "diff", "--cached", "--", repoPath)
+		if err != nil {
+			return "", err
+		}
+		return string(out), nil
+	case "worktree", "unstaged", "":
+		out, err := runGit(".", "diff", "--", repoPath)
+		if err != nil {
+			return "", err
+		}
+		if len(out) > 0 {
+			return string(out), nil
+		}
+		status := localWorkingTreeStatus()
+		for _, path := range status.untracked {
+			if path == repoPath {
+				return localUntrackedFileDiff(repoPath)
+			}
+		}
+		return "", nil
+	default:
+		return "", fmt.Errorf("unsupported diff mode %q", mode)
+	}
+}
+
+func localUntrackedFileDiff(repoPath string) (string, error) {
+	data, err := os.ReadFile(repoPath)
+	if err != nil {
+		return "", err
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "diff --git a/%s b/%s\n", repoPath, repoPath)
+	fmt.Fprintln(&b, "new file mode 100644")
+	fmt.Fprintln(&b, "index 0000000..0000000 100644")
+	fmt.Fprintln(&b, "--- /dev/null")
+	fmt.Fprintf(&b, "+++ b/%s\n", repoPath)
+	if !isTextBlob(data) {
+		fmt.Fprintln(&b, "Binary file changed")
+		return b.String(), nil
+	}
+	for _, line := range splitLines(string(data)) {
+		b.WriteString("+")
+		b.WriteString(line)
+		b.WriteString("\n")
+	}
+	return b.String(), nil
+}
+
+func localCommitDiff(hash string) (string, error) {
+	repo, err := openLocalRepository(".")
+	if err != nil {
+		return "", err
+	}
+	hash, err = repo.resolveRevision(hash)
+	if err != nil {
+		return "", err
+	}
+	commit, err := repo.commitObject(hash)
+	if err != nil {
+		return "", err
+	}
+	if len(commit.parents) == 0 {
+		out, err := runGit(".", "show", "--format=", "--patch", hash)
+		if err != nil {
+			return "", err
+		}
+		return string(out), nil
+	}
+	out, err := runGit(".", "diff", commit.parents[0], hash)
+	if err != nil {
+		return "", err
+	}
+	return string(out), nil
+}
+
+func uniqueSortedStrings(values []string) []string {
+	seen := map[string]struct{}{}
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value != "" {
+			seen[value] = struct{}{}
+		}
+	}
+	files := make([]string, 0, len(seen))
+	for value := range seen {
+		files = append(files, value)
+	}
+	sort.Strings(files)
+	return files
+}
+
+func localCommitRange(repo *localRepository, base, head string, limit int) ([]commitObject, error) {
+	if head == "" || head == base {
+		return nil, nil
+	}
+	excluded := map[string]struct{}{}
+	if base != "" {
+		if err := markCommitAncestors(repo, base, excluded); err != nil {
+			return nil, err
+		}
+	}
+	seen := map[string]struct{}{}
+	var commits []commitObject
+	stack := []string{head}
+	for len(stack) > 0 {
+		hash := stack[0]
+		stack = stack[1:]
+		if _, ok := seen[hash]; ok {
+			continue
+		}
+		seen[hash] = struct{}{}
+		if _, ok := excluded[hash]; ok {
+			continue
+		}
+		commit, err := repo.commitObject(hash)
+		if err != nil {
+			return nil, err
+		}
+		commits = append(commits, commit)
+		stack = append(stack, commit.parents...)
+	}
+	sort.SliceStable(commits, func(i, j int) bool {
+		return commits[i].timestamp > commits[j].timestamp
+	})
+	if limit > 0 && len(commits) > limit {
+		commits = commits[:limit]
+	}
+	return commits, nil
+}
+
+func markCommitAncestors(repo *localRepository, head string, out map[string]struct{}) error {
+	stack := []string{head}
+	for len(stack) > 0 {
+		hash := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		if _, ok := out[hash]; ok {
+			continue
+		}
+		out[hash] = struct{}{}
+		commit, err := repo.commitObject(hash)
+		if err != nil {
+			return err
+		}
+		stack = append(stack, commit.parents...)
+	}
+	return nil
+}
+
+func localChangedFilesBetween(repo *localRepository, base, head string) []string {
+	if base == "" || head == "" || base == head {
+		return nil
+	}
+	before, err := repo.treeFilesForCommit(base)
+	if err != nil {
+		return nil
+	}
+	after, err := repo.treeFilesForCommit(head)
+	if err != nil {
+		return nil
+	}
+	seen := map[string]struct{}{}
+	for path, afterFile := range after {
+		if beforeFile, ok := before[path]; !ok || beforeFile.hash != afterFile.hash || beforeFile.mode != afterFile.mode {
+			seen[path] = struct{}{}
+		}
+	}
+	for path := range before {
+		if _, ok := after[path]; !ok {
+			seen[path] = struct{}{}
+		}
+	}
+	files := make([]string, 0, len(seen))
+	for path := range seen {
+		files = append(files, path)
+	}
+	sort.Strings(files)
+	return files
+}
+
 func (s *webServer) handleTree(ctx context.Context, w http.ResponseWriter, r *http.Request, repoPath string) {
 	_, commit, ref, err := s.headCommit(ctx, r)
 	if err != nil {
@@ -307,7 +1372,7 @@ func (s *webServer) handleTree(ctx context.Context, w http.ResponseWriter, r *ht
 	}
 	repoPath = cleanWebPath(repoPath)
 	treeHash := commit.tree
-	if repoPath != "" {
+	if repoPath != "" && repoPath != "commits" && repoPath != "prs" {
 		hash, err := s.repo.findPath(ctx, commit.tree, repoPath)
 		if err != nil {
 			s.renderError(w, http.StatusNotFound, err)
@@ -335,21 +1400,22 @@ func (s *webServer) handleTree(ctx context.Context, w http.ResponseWriter, r *ht
 		}
 		return entries[i].name < entries[j].name
 	})
-	commits, _ := s.repo.walkCommits(ctx, commit.hash, 10, 0, repoPath)
+	repoCommits, _ := s.repo.walkCommits(ctx, commit.hash, 200, 0, "")
 	readme := s.readmeHTML(ctx, commit.tree)
 
 	var body strings.Builder
-	body.WriteString(`<main class="layout">`)
+	body.WriteString(`<main class="layout" data-bgit-head="` + html.EscapeString(commit.hash) + `" data-bgit-source="seed">`)
 	body.WriteString(s.headerHTML(ref, repoPath))
-	body.WriteString(s.clonePanelHTML())
-	body.WriteString(`<section class="panel"><div class="commit-strip"><div><a class="commit-subject" href="` + html.EscapeString(webCommitURL(commit.hash, ref)) + `">` + html.EscapeString(firstNonEmpty(commit.subject, shortHash(commit.hash))) + `</a><div class="muted">` + html.EscapeString(commit.author) + ` committed ` + html.EscapeString(relativeTime(commit.timestamp)) + `</div></div><code>` + html.EscapeString(shortHash(commit.hash)) + `</code></div></section>`)
-	body.WriteString(`<section class="panel"><div class="panel-title">Files</div><table class="files">`)
-	if repoPath != "" {
+	body.WriteString(s.repoToolbarHTML(ref, true))
+	body.WriteString(s.fileIndexHTML(ctx, commit.tree, ref))
+	body.WriteString(`<div class="repo-content"><div class="repo-primary">`)
+	body.WriteString(`<section class="panel files-panel"><div class="commit-strip"><span class="commit-author">` + html.EscapeString(commit.author) + `</span><a class="commit-subject" href="` + html.EscapeString(webCommitURL(commit.hash, ref)) + `">` + html.EscapeString(displayCommitSubject(commit)) + `</a><code>` + html.EscapeString(shortHash(commit.hash)) + `</code><span class="commit-when">` + html.EscapeString(relativeTime(commit.timestamp)) + `</span></div><table class="files" data-file-list>`)
+	if repoPath != "" && repoPath != "commits" && repoPath != "prs" {
 		parent := pathpkg.Dir(repoPath)
 		if parent == "." {
 			parent = ""
 		}
-		body.WriteString(`<tr><td class="kind">dir</td><td><a href="` + html.EscapeString(webURL("tree", parent, ref)) + `">..</a></td><td></td></tr>`)
+		body.WriteString(`<tr data-file-row data-file-name=".." data-file-path=".."><td class="kind">dir</td><td><a href="` + html.EscapeString(webURL("tree", parent, ref)) + `">..</a></td><td></td></tr>`)
 	}
 	for _, entry := range entries {
 		targetPath := pathpkg.Join(repoPath, entry.name)
@@ -361,15 +1427,17 @@ func (s *webServer) handleTree(ctx context.Context, w http.ResponseWriter, r *ht
 			route = "tree"
 			name += "/"
 		}
-		body.WriteString(`<tr><td class="kind">` + kind + `</td><td><a href="` + html.EscapeString(webURL(route, targetPath, ref)) + `">` + html.EscapeString(name) + `</a></td><td class="hash">` + html.EscapeString(shortHash(entry.hash)) + `</td></tr>`)
+		body.WriteString(`<tr data-file-row data-file-name="` + html.EscapeString(strings.ToLower(name)) + `" data-file-path="` + html.EscapeString(targetPath) + `"><td class="kind">` + kind + `</td><td><a href="` + html.EscapeString(webURL(route, targetPath, ref)) + `">` + html.EscapeString(name) + `</a><span class="state-actions" data-file-state></span></td><td class="hash">` + html.EscapeString(shortHash(entry.hash)) + `</td></tr>`)
 	}
 	body.WriteString(`</table></section>`)
+	body.WriteString(`<section class="panel readme-panel"><div class="panel-title">README</div><article class="readme">`)
 	if readme != "" && repoPath == "" {
-		body.WriteString(`<section class="panel readme-panel"><div class="panel-title">README</div><article class="readme">` + readme + `</article></section>`)
+		body.WriteString(readme)
 	}
-	body.WriteString(`<section class="panel"><div class="panel-title">Recent commits</div>`)
-	body.WriteString(commitListHTML(commits, ref, true))
-	body.WriteString(`</section></main>`)
+	body.WriteString(`</article></section>`)
+	body.WriteString(`</div>`)
+	body.WriteString(s.repoSidePanelHTML(contributorsFromCommits(repoCommits)))
+	body.WriteString(`</div></main>`)
 	s.renderPage(w, webPageTitle(s.title, repoPath), body.String())
 }
 
@@ -385,12 +1453,305 @@ func (s *webServer) handleCommits(ctx context.Context, w http.ResponseWriter, r 
 		return
 	}
 	var body strings.Builder
-	body.WriteString(`<main class="layout">`)
+	body.WriteString(`<main class="layout" data-bgit-head="` + html.EscapeString(commit.hash) + `" data-bgit-source="seed">`)
 	body.WriteString(s.headerHTML(ref, "commits"))
-	body.WriteString(`<section class="panel"><div class="panel-title">Commits</div>`)
+	body.WriteString(`<div class="repo-content repo-content-single"><div class="repo-primary"><section class="panel"><div class="panel-title">Commits</div>`)
 	body.WriteString(commitListHTML(commits, ref, false))
-	body.WriteString(`</section></main>`)
+	body.WriteString(`</section></div></div></main>`)
 	s.renderPage(w, webPageTitle(s.title, "commits"), body.String())
+}
+
+func (s *webServer) handlePullRequests(ctx context.Context, w http.ResponseWriter, r *http.Request) {
+	prs := []brokerPullRequest{}
+	source := "cache"
+	stale := false
+	if cached, err := s.readPullRequestCache(); err == nil {
+		prs = cached.PRs
+		stale = true
+	} else if refreshed, err := s.refreshPullRequestCache(ctx); err == nil {
+		prs = refreshed
+		source = "broker"
+	}
+	ref := branchRef(firstNonEmpty(s.cfg.branch, defaultBranch))
+	var body strings.Builder
+	body.WriteString(`<main class="layout" data-bgit-source="seed">`)
+	body.WriteString(s.headerHTML(ref, "prs"))
+	body.WriteString(`<div class="repo-content repo-content-single"><div class="repo-primary"><section class="panel"><div class="panel-title">Pull requests</div><div data-pr-list data-pr-source="` + html.EscapeString(source) + `"` + boolDataAttr("stale", stale) + `>`)
+	body.WriteString(pullRequestListHTML(prs))
+	body.WriteString(`</div></section></div></div></main>`)
+	s.renderPage(w, webPageTitle(s.title, "pull requests"), body.String())
+}
+
+func (s *webServer) handlePullRequest(ctx context.Context, w http.ResponseWriter, r *http.Request, value string) {
+	parts := strings.Split(strings.Trim(value, "/"), "/")
+	if len(parts) == 0 || strings.TrimSpace(parts[0]) == "" {
+		s.renderError(w, http.StatusNotFound, fs.ErrNotExist)
+		return
+	}
+	id, err := strconv.Atoi(parts[0])
+	if err != nil || id <= 0 {
+		s.renderError(w, http.StatusNotFound, fs.ErrNotExist)
+		return
+	}
+	tab := "conversation"
+	if len(parts) > 1 && strings.TrimSpace(parts[1]) != "" {
+		tab = strings.TrimSpace(parts[1])
+	}
+	pr, err := s.pullRequestByID(ctx, id)
+	if err != nil {
+		s.renderError(w, http.StatusNotFound, err)
+		return
+	}
+	ref := branchRef(firstNonEmpty(s.cfg.branch, defaultBranch))
+	var body strings.Builder
+	body.WriteString(`<main class="layout" data-bgit-source="seed">`)
+	body.WriteString(s.headerHTML(ref, "prs"))
+	body.WriteString(`<div class="repo-content repo-content-single"><div class="repo-primary">`)
+	body.WriteString(prHeaderHTML(pr, tab))
+	switch tab {
+	case "files", "files-changed", "diff":
+		body.WriteString(s.pullRequestFilesHTML(ctx, pr))
+	case "commits":
+		body.WriteString(s.pullRequestCommitsHTML(ctx, pr))
+	default:
+		body.WriteString(pullRequestConversationHTML(pr))
+	}
+	body.WriteString(`</div></div></main>`)
+	s.renderPage(w, webPageTitle(s.title, fmt.Sprintf("PR #%d", pr.ID)), body.String())
+}
+
+func (s *webServer) pullRequestByID(ctx context.Context, id int) (brokerPullRequest, error) {
+	if cached, err := s.readPullRequestCache(); err == nil {
+		for _, pr := range cached.PRs {
+			if pr.ID == id {
+				return pr, nil
+			}
+		}
+	}
+	if refreshed, err := s.refreshPullRequestCache(ctx); err == nil {
+		for _, pr := range refreshed {
+			if pr.ID == id {
+				return pr, nil
+			}
+		}
+	}
+	return brokerPullRequest{}, errors.New("pull request not found")
+}
+
+func (s *webServer) pullRequestFilesHTML(ctx context.Context, pr brokerPullRequest) string {
+	repo := s
+	targetRef := firstNonEmpty(pr.Target, branchRef(defaultBranch))
+	sourceRef := firstNonEmpty(pr.Source, pr.Head)
+	targetHash, targetErr := repo.resolvePullRequestRevision(ctx, targetRef, "")
+	sourceHash, sourceErr := repo.resolvePullRequestRevision(ctx, sourceRef, pr.Head)
+	if (targetErr != nil || sourceErr != nil) && s.apiRepo != nil && s.apiRepo != s.repo {
+		remote := *s
+		remote.repo = s.apiRepo
+		repo = &remote
+		targetHash, targetErr = repo.resolvePullRequestRevision(ctx, targetRef, "")
+		sourceHash, sourceErr = repo.resolvePullRequestRevision(ctx, sourceRef, pr.Head)
+	}
+	if targetErr != nil || sourceErr != nil {
+		return `<section class="panel"><div class="empty">Pull request refs are not available locally yet. Fetch the source and target branches, then refresh this page.</div></section>`
+	}
+	targetCommit, err := repo.repo.commit(ctx, targetHash)
+	if err != nil {
+		return `<section class="panel"><div class="empty">` + html.EscapeString(err.Error()) + `</div></section>`
+	}
+	sourceCommit, err := repo.repo.commit(ctx, sourceHash)
+	if err != nil {
+		return `<section class="panel"><div class="empty">` + html.EscapeString(err.Error()) + `</div></section>`
+	}
+	files, additions, deletions, err := repo.changedFilesBetweenTrees(ctx, targetCommit.tree, sourceCommit.tree)
+	if err != nil {
+		return `<section class="panel"><div class="empty">` + html.EscapeString(err.Error()) + `</div></section>`
+	}
+	return diffFilesPanelHTML(files, additions, deletions)
+}
+
+func (s *webServer) pullRequestUnifiedDiff(ctx context.Context, id int) (string, error) {
+	pr, err := s.pullRequestByID(ctx, id)
+	if err != nil {
+		return "", err
+	}
+	repo := s
+	targetRef := firstNonEmpty(pr.Target, branchRef(defaultBranch))
+	sourceRef := firstNonEmpty(pr.Source, pr.Head)
+	targetHash, targetErr := repo.resolvePullRequestRevision(ctx, targetRef, "")
+	sourceHash, sourceErr := repo.resolvePullRequestRevision(ctx, sourceRef, pr.Head)
+	if (targetErr != nil || sourceErr != nil) && s.apiRepo != nil && s.apiRepo != s.repo {
+		remote := *s
+		remote.repo = s.apiRepo
+		repo = &remote
+		targetHash, targetErr = repo.resolvePullRequestRevision(ctx, targetRef, "")
+		sourceHash, sourceErr = repo.resolvePullRequestRevision(ctx, sourceRef, pr.Head)
+	}
+	if targetErr != nil || sourceErr != nil {
+		return "", errors.New("pull request refs are not available")
+	}
+	targetCommit, err := repo.repo.commit(ctx, targetHash)
+	if err != nil {
+		return "", err
+	}
+	sourceCommit, err := repo.repo.commit(ctx, sourceHash)
+	if err != nil {
+		return "", err
+	}
+	files, _, _, err := repo.changedFilesBetweenTrees(ctx, targetCommit.tree, sourceCommit.tree)
+	if err != nil {
+		return "", err
+	}
+	return changedFilesUnifiedDiff(files), nil
+}
+
+func changedFilesUnifiedDiff(files []webChangedFile) string {
+	var b strings.Builder
+	for _, file := range files {
+		fmt.Fprintf(&b, "diff --git a/%s b/%s\n", file.path, file.path)
+		leftShort := "0000000"
+		rightShort := "0000000"
+		if file.oldHash != "" {
+			leftShort = shortHash(file.oldHash)
+		}
+		if file.newHash != "" {
+			rightShort = shortHash(file.newHash)
+		}
+		fmt.Fprintf(&b, "index %s..%s 100644\n", leftShort, rightShort)
+		if file.oldHash == "" {
+			fmt.Fprintln(&b, "new file mode 100644")
+			fmt.Fprintln(&b, "--- /dev/null")
+			fmt.Fprintf(&b, "+++ b/%s\n", file.path)
+		} else if file.newHash == "" {
+			fmt.Fprintln(&b, "deleted file mode 100644")
+			fmt.Fprintf(&b, "--- a/%s\n", file.path)
+			fmt.Fprintln(&b, "+++ /dev/null")
+		} else {
+			fmt.Fprintf(&b, "--- a/%s\n", file.path)
+			fmt.Fprintf(&b, "+++ b/%s\n", file.path)
+		}
+		if file.binary {
+			fmt.Fprintln(&b, "Binary file changed")
+			continue
+		}
+		for _, line := range file.diff {
+			fmt.Fprintln(&b, line.text)
+		}
+	}
+	return b.String()
+}
+
+func (s *webServer) pullRequestCommitsHTML(ctx context.Context, pr brokerPullRequest) string {
+	repo := s
+	targetRef := firstNonEmpty(pr.Target, branchRef(defaultBranch))
+	sourceRef := firstNonEmpty(pr.Source, pr.Head)
+	targetHash, targetErr := repo.resolvePullRequestRevision(ctx, targetRef, "")
+	sourceHash, sourceErr := repo.resolvePullRequestRevision(ctx, sourceRef, pr.Head)
+	if (targetErr != nil || sourceErr != nil) && s.apiRepo != nil && s.apiRepo != s.repo {
+		remote := *s
+		remote.repo = s.apiRepo
+		repo = &remote
+		targetHash, targetErr = repo.resolvePullRequestRevision(ctx, targetRef, "")
+		sourceHash, sourceErr = repo.resolvePullRequestRevision(ctx, sourceRef, pr.Head)
+	}
+	if sourceErr != nil {
+		return `<section class="panel"><div class="empty">Pull request source branch is not available.</div></section>`
+	}
+	commits, err := repo.commitRange(ctx, targetHash, sourceHash, 50)
+	if err != nil {
+		return `<section class="panel"><div class="empty">` + html.EscapeString(err.Error()) + `</div></section>`
+	}
+	return `<section class="panel"><div class="panel-title">Commits</div>` + commitListHTML(commits, firstNonEmpty(pr.Source, pr.Head), false) + `</section>`
+}
+
+func (s *webServer) resolvePullRequestRevision(ctx context.Context, ref, fallbackHash string) (string, error) {
+	ref = strings.TrimSpace(ref)
+	var candidates []string
+	if ref != "" {
+		candidates = append(candidates, ref)
+		short := shortRefName(ref)
+		if short != "" && short != ref {
+			candidates = append(candidates,
+				short,
+				"refs/remotes/bucketgit/"+short,
+				"refs/remotes/origin/"+short,
+			)
+		}
+	}
+	if fallbackHash != "" {
+		candidates = append(candidates, fallbackHash)
+	}
+	seen := map[string]struct{}{}
+	for _, candidate := range candidates {
+		candidate = strings.TrimSpace(candidate)
+		if candidate == "" {
+			continue
+		}
+		if _, ok := seen[candidate]; ok {
+			continue
+		}
+		seen[candidate] = struct{}{}
+		if hash, err := s.repo.resolveRevision(ctx, candidate); err == nil {
+			return hash, nil
+		}
+	}
+	return "", fs.ErrNotExist
+}
+
+func (s *webServer) commitRange(ctx context.Context, base, head string, limit int) ([]commitObject, error) {
+	if head == "" || head == base {
+		return nil, nil
+	}
+	excluded := map[string]struct{}{}
+	if base != "" {
+		if err := s.markCommitAncestors(ctx, base, excluded); err != nil {
+			return nil, err
+		}
+	}
+	seen := map[string]struct{}{}
+	var commits []commitObject
+	stack := []string{head}
+	for len(stack) > 0 {
+		hash := stack[0]
+		stack = stack[1:]
+		if _, ok := seen[hash]; ok {
+			continue
+		}
+		seen[hash] = struct{}{}
+		if _, ok := excluded[hash]; ok {
+			continue
+		}
+		commit, err := s.repo.commit(ctx, hash)
+		if err != nil {
+			return nil, err
+		}
+		commits = append(commits, commit)
+		stack = append(stack, commit.parents...)
+	}
+	sort.SliceStable(commits, func(i, j int) bool {
+		return commits[i].timestamp > commits[j].timestamp
+	})
+	if limit > 0 && len(commits) > limit {
+		commits = commits[:limit]
+	}
+	return commits, nil
+}
+
+func (s *webServer) markCommitAncestors(ctx context.Context, head string, out map[string]struct{}) error {
+	stack := []string{head}
+	for len(stack) > 0 {
+		hash := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		if _, ok := out[hash]; ok {
+			continue
+		}
+		out[hash] = struct{}{}
+		commit, err := s.repo.commit(ctx, hash)
+		if err != nil {
+			return err
+		}
+		stack = append(stack, commit.parents...)
+	}
+	return nil
 }
 
 func (s *webServer) handleCommit(ctx context.Context, w http.ResponseWriter, r *http.Request, hash string) {
@@ -415,7 +1776,7 @@ func (s *webServer) handleCommit(ctx context.Context, w http.ResponseWriter, r *
 		return
 	}
 	var body strings.Builder
-	body.WriteString(`<main class="layout">`)
+	body.WriteString(`<main class="layout" data-bgit-head="` + html.EscapeString(commit.hash) + `" data-bgit-source="seed">`)
 	body.WriteString(s.headerHTML(firstNonEmpty(ref, commit.hash), "commit/"+shortHash(commit.hash)))
 	body.WriteString(`<section class="panel commit-detail">`)
 	body.WriteString(`<h2>` + html.EscapeString(firstNonEmpty(commit.subject, shortHash(commit.hash))) + `</h2>`)
@@ -435,15 +1796,7 @@ func (s *webServer) handleCommit(ctx context.Context, w http.ResponseWriter, r *
 		body.WriteString(`<div><span>Parents</span>` + strings.Join(parentLinks, " ") + `</div>`)
 	}
 	body.WriteString(`</div></section>`)
-	body.WriteString(`<section class="panel"><div class="diff-summary"><strong>` + strconv.Itoa(len(files)) + ` changed file` + pluralSuffix(len(files)) + `</strong><span class="additions">+` + strconv.Itoa(additions) + `</span><span class="deletions">-` + strconv.Itoa(deletions) + `</span></div>`)
-	body.WriteString(`<table class="files changed-files">`)
-	for _, file := range files {
-		body.WriteString(`<tr><td><a href="#diff-` + html.EscapeString(anchorID(file.path)) + `">` + html.EscapeString(file.path) + `</a></td><td class="diff-stat"><span class="additions">+` + strconv.Itoa(file.additions) + `</span> <span class="deletions">-` + strconv.Itoa(file.deletions) + `</span></td></tr>`)
-	}
-	body.WriteString(`</table></section>`)
-	for _, file := range files {
-		body.WriteString(diffFileHTML(file))
-	}
+	body.WriteString(diffFilesPanelHTML(files, additions, deletions))
 	body.WriteString(`</main>`)
 	s.renderPage(w, webPageTitle(s.title, shortHash(commit.hash)), body.String())
 }
@@ -483,7 +1836,7 @@ func (s *webServer) handleBlob(ctx context.Context, w http.ResponseWriter, r *ht
 		return
 	}
 	var body strings.Builder
-	body.WriteString(`<main class="layout">`)
+	body.WriteString(`<main class="layout" data-bgit-head="` + html.EscapeString(commit.hash) + `" data-bgit-source="seed">`)
 	body.WriteString(s.headerHTML(ref, repoPath))
 	body.WriteString(`<section class="panel"><div class="blob-toolbar"><div><div class="panel-title">` + html.EscapeString(repoPath) + `</div><div class="muted">` + strconv.Itoa(len(obj.data)) + ` bytes</div></div><div class="actions"><button class="copy-button" data-copy-target="raw-url">Copy raw URL</button><a class="button-link" href="` + html.EscapeString(webURL("raw", repoPath, ref)) + `">Raw</a></div></div>`)
 	body.WriteString(`<input id="raw-url" class="sr-only" value="` + html.EscapeString(webURL("raw", repoPath, ref)) + `">`)
@@ -494,6 +1847,78 @@ func (s *webServer) handleBlob(ctx context.Context, w http.ResponseWriter, r *ht
 	}
 	body.WriteString(`</section></main>`)
 	s.renderPage(w, webPageTitle(s.title, repoPath), body.String())
+}
+
+func (s *webServer) handleArchiveZip(ctx context.Context, w http.ResponseWriter, r *http.Request) {
+	_, commit, ref, err := s.headCommit(ctx, r)
+	if err != nil {
+		s.renderError(w, http.StatusNotFound, err)
+		return
+	}
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+	rootName := archiveRootName(s.title, ref)
+	if err := s.writeZipTree(ctx, zw, commit.tree, rootName); err != nil {
+		_ = zw.Close()
+		s.renderError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if err := zw.Close(); err != nil {
+		s.renderError(w, http.StatusInternalServerError, err)
+		return
+	}
+	filename := anchorID(rootName)
+	if filename == "" {
+		filename = "bucketgit"
+	}
+	w.Header().Set("Content-Type", "application/zip")
+	w.Header().Set("Content-Disposition", `attachment; filename="`+filename+`.zip"`)
+	w.Header().Set("Content-Length", strconv.Itoa(buf.Len()))
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(buf.Bytes())
+}
+
+func (s *webServer) writeZipTree(ctx context.Context, zw *zip.Writer, treeHash, prefix string) error {
+	entries, err := s.repo.treeEntries(ctx, treeHash)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		target := pathpkg.Join(prefix, entry.name)
+		if entry.typ == gitObjectTree {
+			if _, err := zw.Create(target + "/"); err != nil {
+				return err
+			}
+			if err := s.writeZipTree(ctx, zw, entry.hash, target); err != nil {
+				return err
+			}
+			continue
+		}
+		obj, err := s.repo.object(ctx, entry.hash)
+		if err != nil {
+			return err
+		}
+		writer, err := zw.Create(target)
+		if err != nil {
+			return err
+		}
+		if _, err := writer.Write(obj.data); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func archiveRootName(title, ref string) string {
+	name := strings.Trim(strings.TrimSuffix(pathpkg.Base(strings.Trim(title, "/")), ".git"), ".")
+	if name == "" || name == "." {
+		name = "bucketgit"
+	}
+	refName := displayRef(ref)
+	if refName == "" {
+		return name
+	}
+	return name + "-" + refName
 }
 
 func (s *webServer) readmeHTML(ctx context.Context, treeHash string) string {
@@ -518,28 +1943,191 @@ func (s *webServer) readmeHTML(ctx context.Context, treeHash string) string {
 
 func (s *webServer) headerHTML(ref, repoPath string) string {
 	var b strings.Builder
-	b.WriteString(`<header class="repo-header"><div class="repo-topline"><div><div class="repo-kicker">bucketgit repository</div><h1>` + html.EscapeString(s.title) + `</h1></div>`)
-	b.WriteString(s.refSelectorHTML(ref))
-	b.WriteString(`</div>`)
-	b.WriteString(`<nav class="tabs"><a href="` + html.EscapeString(webURL("tree", "", ref)) + `">Code</a><a href="` + html.EscapeString("/commits?ref="+urlQueryEscape(ref)) + `">Commits</a></nav>`)
-	if repoPath != "" {
-		b.WriteString(`<div class="crumbs">`)
-		b.WriteString(`<a href="` + html.EscapeString(webURL("tree", "", ref)) + `">root</a>`)
-		current := ""
-		for _, part := range strings.Split(repoPath, "/") {
-			if part == "" {
-				continue
-			}
-			current = pathpkg.Join(current, part)
-			b.WriteString(` / <a href="` + html.EscapeString(webURL("tree", current, ref)) + `">` + html.EscapeString(part) + `</a>`)
-		}
-		b.WriteString(`</div>`)
+	b.WriteString(themeToggleHTML())
+	b.WriteString(`<header class="repo-header">`)
+	codeActive := ` class="active"`
+	commitsActive := ""
+	prsActive := ""
+	if repoPath == "commits" {
+		codeActive = ""
+		commitsActive = ` class="active"`
+	} else if repoPath == "prs" {
+		codeActive = ""
+		prsActive = ` class="active"`
 	}
+	b.WriteString(`<div class="tabs-row"><nav class="tabs"><a` + codeActive + ` href="` + html.EscapeString(webURL("tree", "", ref)) + `">Code</a><a` + commitsActive + ` href="` + html.EscapeString("/commits?ref="+urlQueryEscape(ref)) + `">Commits</a>`)
+	if s.pullRequestsAvailable() {
+		hidden := ""
+		count := 0
+		if cached, err := s.readPullRequestCache(); err == nil && len(cached.PRs) > 0 {
+			count = len(cached.PRs)
+		} else {
+			hidden = ` hidden`
+		}
+		b.WriteString(`<a` + prsActive + ` href="/prs" data-pr-tab` + hidden + `>Pull requests (<span data-pr-tab-count>` + strconv.Itoa(count) + `</span>)</a>`)
+	}
+	b.WriteString(`</nav>`)
+	codeActions := ""
+	if codeActive != "" {
+		codeActions = ` data-code-actions="true"`
+	}
+	b.WriteString(`<div class="repo-action-control"` + codeActions + `><button class="repo-action-button pull" type="button" data-web-action="pull" data-repo-pull hidden>PULL</button><button class="repo-action-button uncommit" type="button" data-web-action="uncommit" data-repo-uncommit hidden>UNCOMMIT</button><button class="repo-action-button push" type="button" data-web-action="push" data-repo-push hidden>PUSH</button><button class="repo-action-button commit" type="button" data-web-action="commit" data-repo-commit hidden>COMMIT</button></div>`)
+	if location := s.repoLocationBadge(); location != "" {
+		b.WriteString(`<div class="repo-controls"><div class="repo-header-location">` + html.EscapeString(location) + `</div></div>`)
+	}
+	b.WriteString(`</div>`)
 	b.WriteString(`</header>`)
 	return b.String()
 }
 
+func (s *webServer) repoToolbarHTML(ref string, includeSearch bool) string {
+	branchCount, tagCount := s.refCounts(context.Background())
+	var b strings.Builder
+	b.WriteString(`<div class="repo-toolbar">`)
+	b.WriteString(`<div class="repo-toolbar-left">`)
+	b.WriteString(s.refSelectorHTML(ref))
+	b.WriteString(`<a class="ref-count" href="#branches" data-focus-ref-selector>` + strconv.Itoa(branchCount) + ` Branch`)
+	if branchCount != 1 {
+		b.WriteString(`es`)
+	}
+	b.WriteString(`</a>`)
+	b.WriteString(`<a class="ref-count" href="#tags" data-focus-ref-selector>` + strconv.Itoa(tagCount) + ` Tag`)
+	if tagCount != 1 {
+		b.WriteString(`s`)
+	}
+	b.WriteString(`</a>`)
+	b.WriteString(`</div><div class="repo-toolbar-right">`)
+	b.WriteString(remoteSyncHTML())
+	if includeSearch {
+		b.WriteString(`<div class="file-search"><label><span class="sr-only">Go to file</span><input type="search" data-file-search autocomplete="off" placeholder="Go to file" aria-expanded="false" aria-controls="file-search-results"></label><div class="file-search-results" id="file-search-results" data-file-search-results hidden></div></div>`)
+	}
+	b.WriteString(s.codeDropdownHTML(ref))
+	b.WriteString(`</div></div>`)
+	return b.String()
+}
+
+type webContributor struct {
+	Name string
+}
+
+func (s *webServer) repoSidePanelHTML(contributors []webContributor) string {
+	repoName := strings.TrimSuffix(strings.Trim(s.title, "/"), ".git")
+	if repoName == "" {
+		repoName = "this"
+	}
+	var b strings.Builder
+	b.WriteString(`<aside class="repo-side-panel"><section class="side-panel-section repo-identity"><h2>Repository</h2><div class="repo-identity-name">` + html.EscapeString(s.title) + `</div></section><section class="side-panel-section"><h2>About</h2><p>Welcome to the BucketGit ` + html.EscapeString(repoName) + ` repository. BucketGit stores Git repositories directly in cloud buckets, with brokered access, pull requests, branch protection and a lightweight web view for browsing code.</p><p>BucketGit was created by <a href="https://drvink.com/" target="_blank" rel="noopener noreferrer">Dennis Vink</a>.</p><div class="side-links"><a class="icon-link" href="https://github.com/bucketgit/bgit" target="_blank" rel="noopener noreferrer" aria-label="BucketGit on GitHub">` + gitHubIconHTML() + `<span>GitHub</span></a><a class="icon-link" href="https://www.linkedin.com/in/drvink/" target="_blank" rel="noopener noreferrer" aria-label="Dennis Vink on LinkedIn">` + linkedInIconHTML() + `<span>LinkedIn</span></a></div></section><section class="side-panel-section contributors-line"><h2>Contributors <span class="count-badge">` + strconv.Itoa(len(contributors)) + `</span></h2>`)
+	if len(contributors) > 0 {
+		b.WriteString(`<ol class="contributors-list">`)
+		for _, contributor := range contributors {
+			b.WriteString(`<li><span>` + html.EscapeString(contributor.Name) + `</span></li>`)
+		}
+		b.WriteString(`</ol>`)
+	}
+	b.WriteString(`</section></aside>`)
+	return b.String()
+}
+
+func linkedInIconHTML() string {
+	return `<svg aria-hidden="true" focusable="false" viewBox="0 0 24 24"><path d="M20.45 20.45h-3.56v-5.57c0-1.33-.02-3.04-1.85-3.04-1.86 0-2.14 1.45-2.14 2.95v5.66H9.34V9h3.42v1.56h.05c.48-.9 1.64-1.85 3.37-1.85 3.6 0 4.27 2.37 4.27 5.46v6.28ZM5.32 7.43a2.06 2.06 0 1 1 0-4.12 2.06 2.06 0 0 1 0 4.12Zm1.78 13.02H3.54V9H7.1v11.45ZM22.22 0H1.77C.79 0 0 .77 0 1.72v20.56C0 23.23.79 24 1.77 24h20.45c.98 0 1.78-.77 1.78-1.72V1.72C24 .77 23.2 0 22.22 0Z"></path></svg>`
+}
+
+func gitHubIconHTML() string {
+	return `<svg aria-hidden="true" focusable="false" viewBox="0 0 24 24"><path d="M12 .3a12 12 0 0 0-3.79 23.39c.6.11.82-.26.82-.58v-2.04c-3.34.73-4.04-1.61-4.04-1.61-.55-1.39-1.34-1.76-1.34-1.76-1.09-.75.08-.73.08-.73 1.2.08 1.84 1.24 1.84 1.24 1.07 1.83 2.81 1.3 3.5.99.11-.78.42-1.3.76-1.6-2.67-.3-5.47-1.33-5.47-5.93 0-1.31.47-2.38 1.24-3.22-.12-.3-.54-1.52.12-3.18 0 0 1.01-.32 3.3 1.23a11.45 11.45 0 0 1 6 0c2.29-1.55 3.3-1.23 3.3-1.23.66 1.66.24 2.88.12 3.18.77.84 1.24 1.91 1.24 3.22 0 4.61-2.81 5.63-5.49 5.93.43.37.81 1.1.81 2.22v3.29c0 .32.22.7.83.58A12 12 0 0 0 12 .3Z"></path></svg>`
+}
+
+func diffIconSVGHTML() string {
+	return `<svg viewBox="0 0 24 24" fill="none" aria-hidden="true" focusable="false"><path opacity="0.1" d="M9 6C9 7.65685 7.65685 9 6 9C4.34315 9 3 7.65685 3 6C3 4.34315 4.34315 3 6 3C7.65685 3 9 4.34315 9 6Z" fill="currentColor"/><path opacity="0.1" d="M21 18C21 19.6569 19.6569 21 18 21C16.3431 21 15 19.6569 15 18C15 16.3431 16.3431 15 18 15C19.6569 15 21 16.3431 21 18Z" fill="currentColor"/><path d="M9 6C9 7.65685 7.65685 9 6 9C4.34315 9 3 7.65685 3 6C3 4.34315 4.34315 3 6 3C7.65685 3 9 4.34315 9 6Z" stroke="currentColor" stroke-width="2"/><path d="M21 18C21 19.6569 19.6569 21 18 21C16.3431 21 15 19.6569 15 18C15 16.3431 16.3431 15 18 15C19.6569 15 21 16.3431 21 18Z" stroke="currentColor" stroke-width="2"/><path d="M15 3L12.0605 5.93945C12.0271 5.97289 12.0271 6.02711 12.0605 6.06055L15 9" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><path d="M9 21L11.9473 18.0527C11.9764 18.0236 11.9764 17.9764 11.9473 17.9473L9 15" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><path d="M12 6C14.8284 6 16.2426 6 17.1213 6.87868C18 7.75736 18 9.17157 18 12V15" stroke="currentColor" stroke-width="2"/><path d="M12 18C9.17157 18 7.75736 18 6.87868 17.1213C6 16.2426 6 14.8284 6 12L6 9" stroke="currentColor" stroke-width="2"/></svg>`
+}
+
+func contributorsFromCommits(commits []commitObject) []webContributor {
+	indexes := map[string]int{}
+	contributors := []webContributor{}
+	for _, commit := range commits {
+		key := strings.TrimSpace(strings.ToLower(commit.email))
+		if key == "" {
+			key = strings.TrimSpace(strings.ToLower(commit.author))
+		}
+		if key == "" {
+			continue
+		}
+		if _, ok := indexes[key]; ok {
+			continue
+		}
+		name := strings.TrimSpace(commit.author)
+		if name == "" {
+			name = strings.TrimSpace(commit.email)
+		}
+		indexes[key] = len(contributors)
+		contributors = append(contributors, webContributor{Name: name})
+	}
+	return contributors
+}
+
+func (s *webServer) fileIndexHTML(ctx context.Context, treeHash, ref string) string {
+	files := map[string]webTreeFile{}
+	if err := s.collectTreeFiles(ctx, treeHash, "", files); err != nil {
+		return ""
+	}
+	dirs := map[string]struct{}{}
+	paths := make([]string, 0, len(files))
+	for path := range files {
+		paths = append(paths, path)
+		for dir := pathpkg.Dir(path); dir != "." && dir != ""; dir = pathpkg.Dir(dir) {
+			dirs[dir] = struct{}{}
+		}
+	}
+	sort.Strings(paths)
+	dirPaths := make([]string, 0, len(dirs))
+	for dir := range dirs {
+		dirPaths = append(dirPaths, dir)
+	}
+	sort.Strings(dirPaths)
+	index := make([]webFileIndexEntry, 0, len(paths)+len(dirPaths))
+	for _, dir := range dirPaths {
+		index = append(index, webFileIndexEntry{Path: dir, URL: webURL("tree", dir, ref), Kind: "dir"})
+	}
+	for _, path := range paths {
+		index = append(index, webFileIndexEntry{Path: path, URL: webURL("blob", path, ref), Kind: "file"})
+	}
+	data, err := json.Marshal(index)
+	if err != nil {
+		return ""
+	}
+	return `<script type="application/json" id="bgit-file-index">` + string(data) + `</script>`
+}
+
+func themeToggleHTML() string {
+	return `<button class="theme-toggle" type="button" data-theme-toggle aria-label="Toggle dark or light theme" title="Toggle theme. Long press for auto."><svg class="theme-symbol" aria-hidden="true" viewBox="0 0 80 80" focusable="false"><circle cx="40" cy="40" r="17"/><path d="M40 0l5.8 19.7H34.2L40 0zM40 80l-5.8-19.7h11.6L40 80zM0 40l19.7-5.8v11.6L0 40zM80 40l-19.7 5.8V34.2L80 40zM11.7 11.7l18 9.8-8.2 8.2-9.8-18zM68.3 68.3l-18-9.8 8.2-8.2 9.8 18zM68.3 11.7l-9.8 18-8.2-8.2 18-9.8zM11.7 68.3l9.8-18 8.2 8.2-18 9.8z"/></svg><span class="theme-auto" aria-hidden="true">A</span></button>`
+}
+
+func remoteSyncHTML() string {
+	return `<div class="remote-sync" data-remote-sync><button class="remote-refresh is-spinning" type="button" data-remote-refresh disabled aria-label="Refresh remote status" title="Refresh remote status"><svg aria-hidden="true" viewBox="0 0 65 65" focusable="false"><path d="m32.5 4.999c-5.405 0-10.444 1.577-14.699 4.282l-5.75-5.75v16.11h16.11l-6.395-6.395c3.18-1.787 6.834-2.82 10.734-2.82 12.171 0 22.073 9.902 22.073 22.074 0 2.899-0.577 5.664-1.599 8.202l4.738 2.762c1.47-3.363 2.288-7.068 2.288-10.964 0-15.164-12.337-27.501-27.5-27.501z"/><path d="m43.227 51.746c-3.179 1.786-6.826 2.827-10.726 2.827-12.171 0-22.073-9.902-22.073-22.073 0-2.739 0.524-5.35 1.439-7.771l-4.731-2.851c-1.375 3.271-2.136 6.858-2.136 10.622 0 15.164 12.336 27.5 27.5 27.5 5.406 0 10.434-1.584 14.691-4.289l5.758 5.759v-16.112h-16.111l6.389 6.388z"/></svg></button><span class="remote-badge is-syncing" data-remote-sync-badge>Synchronising</span></div>`
+}
+
+func boolDataAttr(name string, value bool) string {
+	if !value {
+		return ""
+	}
+	return ` data-` + name + `="true"`
+}
+
+func (s *webServer) repoLocationBadge() string {
+	brokerURL := strings.TrimSpace(s.cfg.brokerURL)
+	logicalRepo := strings.Trim(s.cfg.logicalRepo, "/")
+	if brokerURL == "" || logicalRepo == "" {
+		return ""
+	}
+	if parsed, err := url.Parse(brokerURL); err == nil && parsed.Host != "" {
+		return parsed.Host + "/" + logicalRepo
+	}
+	return strings.TrimPrefix(strings.TrimPrefix(strings.TrimRight(brokerURL, "/"), "https://"), "http://") + "/" + logicalRepo
+}
+
 func (s *webServer) refSelectorHTML(ref string) string {
+	if s.repo == nil {
+		return `<div class="ref-pill">` + html.EscapeString(displayRef(ref)) + `</div>`
+	}
 	options, err := s.refOptions(context.Background())
 	if err != nil || len(options) == 0 {
 		return `<div class="ref-pill">` + html.EscapeString(displayRef(ref)) + `</div>`
@@ -603,45 +2191,450 @@ func (s *webServer) refOptions(ctx context.Context) ([]webRefOption, error) {
 	return options, nil
 }
 
+func (s *webServer) refCounts(ctx context.Context) (int, int) {
+	options, err := s.refOptions(ctx)
+	if err != nil {
+		return 0, 0
+	}
+	branches := 0
+	tags := 0
+	for _, option := range options {
+		switch option.kind {
+		case "Branches":
+			branches++
+		case "Tags":
+			tags++
+		}
+	}
+	return branches, tags
+}
+
+func (s *webServer) codeDropdownHTML(ref string) string {
+	widget := s.cloneWidgetHTML(ref)
+	if widget == "" {
+		return ""
+	}
+	return `<div class="code-menu"><button class="code-menu-button" type="button" data-code-menu-toggle aria-expanded="false"><span aria-hidden="true">&lt;&gt;</span> Code <span aria-hidden="true">▾</span></button><div class="code-menu-popover" data-code-menu hidden>` + widget + `</div></div>`
+}
+
 func (s *webServer) clonePanelHTML() string {
+	widget := s.cloneWidgetHTML("")
+	if widget == "" {
+		return ""
+	}
+	return `<section class="clone-panel">` + widget + `</section>`
+}
+
+func (s *webServer) cloneWidgetHTML(ref string) string {
 	origin := firstNonEmpty(s.cfg.origin, originForConfig(s.cfg))
 	sshURL := ""
-	if s.cfg.bucket != "" && s.cfg.prefix != "" {
+	logicalRepo := strings.Trim(s.cfg.logicalRepo, "/")
+	if logicalRepo != "" {
+		sshURL = fmt.Sprintf("git@%s:%s", defaultSSHHost, logicalRepo)
+	} else if s.cfg.bucket != "" && s.cfg.prefix != "" {
 		sshURL = sshRemoteURL(s.cfg)
 	}
-	var b strings.Builder
-	b.WriteString(`<section class="clone-panel"><div><div class="panel-title">Clone</div><div class="muted">Use the bucket URL with bgit, or SSH after running bgit ssh setup.</div></div><div class="clone-grid">`)
-	if origin != "" {
-		b.WriteString(cloneRowHTML("bgit", "bgit clone "+origin))
-		b.WriteString(cloneRowHTML("origin", origin))
+	options := []cloneOption{}
+	if s.cfg.brokerURL != "" && logicalRepo != "" {
+		options = append(options, cloneOption{Label: "BGIT", Value: "bgit clone " + brokerCloneCommandURL(s.cfg.brokerURL, logicalRepo)})
+	} else if origin != "" {
+		options = append(options, cloneOption{Label: "BGIT", Value: "bgit clone " + origin})
 	}
 	if sshURL != "" {
-		b.WriteString(cloneRowHTML("ssh", sshURL))
+		options = append(options, cloneOption{Label: "SSH", Value: sshURL})
 	}
-	b.WriteString(`</div></section>`)
+	if origin != "" && origin != sshURL {
+		options = append(options, cloneOption{Label: "Origin", Value: origin})
+	}
+	if len(options) == 0 {
+		return ""
+	}
+	return cloneWidgetHTML(options, ref)
+}
+
+type cloneOption struct {
+	Label string
+	Value string
+}
+
+func cloneWidgetHTML(options []cloneOption, ref string) string {
+	var b strings.Builder
+	b.WriteString(`<div class="clone-widget"><div class="clone-head"><div class="panel-title">Clone</div>`)
+	if len(options) > 1 {
+		b.WriteString(`<div class="clone-tabs" role="tablist">`)
+		for i, option := range options {
+			active := ""
+			selected := "false"
+			if i == 0 {
+				active = ` class="active"`
+				selected = "true"
+			}
+			id := anchorID("clone-" + option.Label)
+			b.WriteString(`<button type="button"` + active + ` data-clone-tab="` + html.EscapeString(id) + `" aria-selected="` + selected + `">` + html.EscapeString(option.Label) + `</button>`)
+		}
+		b.WriteString(`</div>`)
+	}
+	b.WriteString(`</div><div class="clone-panes">`)
+	for i, option := range options {
+		id := anchorID("clone-" + option.Label)
+		copyID := "copy-" + anchorID(option.Label+"-"+option.Value)
+		hidden := ""
+		if i != 0 {
+			hidden = ` hidden`
+		}
+		b.WriteString(`<div class="clone-pane" data-clone-pane="` + html.EscapeString(id) + `"` + hidden + `><code id="` + html.EscapeString(copyID) + `">` + html.EscapeString(option.Value) + `</code><button class="copy-button copy-icon-button" data-copy-icon data-copy-target="` + html.EscapeString(copyID) + `" aria-label="Copy clone command" title="Copy clone command"><span aria-hidden="true">📋</span></button></div>`)
+	}
+	b.WriteString(`</div>`)
+	if ref != "" {
+		b.WriteString(`<div class="clone-download"><a href="` + html.EscapeString("/archive.zip?ref="+urlQueryEscape(ref)) + `">Download ZIP</a></div>`)
+	}
+	b.WriteString(`</div>`)
 	return b.String()
 }
 
-func cloneRowHTML(label, value string) string {
-	id := "copy-" + anchorID(label+"-"+value)
-	return `<div class="clone-row"><span>` + html.EscapeString(label) + `</span><code id="` + html.EscapeString(id) + `">` + html.EscapeString(value) + `</code><button class="copy-button" data-copy-target="` + html.EscapeString(id) + `">Copy</button></div>`
+func brokerCloneCommandURL(brokerURL, logicalRepo string) string {
+	return strings.TrimRight(strings.TrimSpace(brokerURL), "/") + "/" + strings.Trim(strings.TrimSpace(logicalRepo), "/")
 }
 
 func (s *webServer) renderPage(w http.ResponseWriter, title, body string) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	fmt.Fprint(w, `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>`)
-	fmt.Fprint(w, html.EscapeString(title))
-	fmt.Fprint(w, `</title><style>`)
-	fmt.Fprint(w, webCSS)
-	fmt.Fprint(w, `</style></head><body>`)
-	fmt.Fprint(w, body)
-	fmt.Fprint(w, webJS)
-	fmt.Fprint(w, `</body></html>`)
+	page := webAssetString(webPageTemplatePath)
+	source := "seed"
+	if s.apiRepo == nil || s.apiRepo == s.repo {
+		source = "remote"
+	}
+	page = strings.ReplaceAll(page, "{{TITLE}}", html.EscapeString(title))
+	page = strings.ReplaceAll(page, "{{CSS}}", webAssetString(webCSSPath))
+	page = strings.ReplaceAll(page, "{{SOURCE}}", source)
+	page = strings.ReplaceAll(page, "{{BODY}}", body)
+	page = strings.ReplaceAll(page, "{{JS}}", webAssetString(webJSPath))
+	fmt.Fprint(w, page)
 }
 
 func (s *webServer) renderError(w http.ResponseWriter, status int, err error) {
 	w.WriteHeader(status)
 	s.renderPage(w, fmt.Sprintf("%d", status), `<main class="layout"><section><div class="empty">`+html.EscapeString(err.Error())+`</div></section></main>`)
+}
+
+func (s *webServer) renderJSON(w http.ResponseWriter, value any) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	if err := json.NewEncoder(w).Encode(value); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+	}
+}
+
+func (s *webServer) renderJSONError(w http.ResponseWriter, status int, err error) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(status)
+	if encodeErr := json.NewEncoder(w).Encode(map[string]string{"error": err.Error()}); encodeErr != nil {
+		http.Error(w, encodeErr.Error(), http.StatusInternalServerError)
+	}
+}
+
+func webAPICommitFromCommit(commit commitObject) webAPICommit {
+	return webAPICommit{
+		Hash:      commit.hash,
+		ShortHash: shortHash(commit.hash),
+		Subject:   firstNonEmpty(commit.subject, shortHash(commit.hash)),
+		Body:      commit.body,
+		Author:    commit.author,
+		Email:     commit.email,
+		Timestamp: commit.timestamp,
+		Parents:   commit.parents,
+		Tree:      commit.tree,
+	}
+}
+
+func webAPICommitsFromCommits(commits []commitObject) []webAPICommit {
+	out := make([]webAPICommit, 0, len(commits))
+	for _, commit := range commits {
+		out = append(out, webAPICommitFromCommit(commit))
+	}
+	return out
+}
+
+func webAPIChangedFiles(files []webChangedFile) []map[string]any {
+	out := make([]map[string]any, 0, len(files))
+	for _, file := range files {
+		lines := make([]map[string]string, 0, len(file.diff))
+		for _, line := range file.diff {
+			lines = append(lines, map[string]string{"kind": line.kind, "text": line.text})
+		}
+		out = append(out, map[string]any{
+			"path":      file.path,
+			"old_hash":  file.oldHash,
+			"new_hash":  file.newHash,
+			"additions": file.additions,
+			"deletions": file.deletions,
+			"binary":    file.binary,
+			"diff":      lines,
+		})
+	}
+	return out
+}
+
+func (s *webServer) pullRequestsAvailable() bool {
+	if strings.TrimSpace(s.cfg.brokerURL) != "" && strings.TrimSpace(s.cfg.logicalRepo) != "" {
+		return true
+	}
+	if cached, err := s.readPullRequestCache(); err == nil && len(cached.PRs) > 0 {
+		return true
+	}
+	return false
+}
+
+func (s *webServer) pullRequestCachePath() string {
+	if s.localGitDir == "" {
+		return ""
+	}
+	return filepath.Join(s.localGitDir, "bucketgit", "cache", "prs.json")
+}
+
+func (s *webServer) readPullRequestCache() (webPullRequestCache, error) {
+	path := s.pullRequestCachePath()
+	if path == "" {
+		return webPullRequestCache{}, fs.ErrNotExist
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return webPullRequestCache{}, err
+	}
+	var cache webPullRequestCache
+	if err := json.Unmarshal(data, &cache); err != nil {
+		return webPullRequestCache{}, err
+	}
+	if cache.PRs == nil {
+		cache.PRs = []brokerPullRequest{}
+	}
+	return cache, nil
+}
+
+func (s *webServer) writePullRequestCache(prs []brokerPullRequest) error {
+	path := s.pullRequestCachePath()
+	if path == "" {
+		return nil
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	data, err := json.MarshalIndent(webPullRequestCache{UpdatedAt: time.Now().Unix(), PRs: prs}, "", "  ")
+	if err != nil {
+		return err
+	}
+	data = append(data, '\n')
+	if existing, err := os.ReadFile(path); err == nil && bytes.Equal(existing, data) {
+		return nil
+	}
+	return os.WriteFile(path, data, 0o644)
+}
+
+func (s *webServer) upsertPullRequestCache(pr brokerPullRequest) []brokerPullRequest {
+	if pr.ID <= 0 {
+		if cached, err := s.readPullRequestCache(); err == nil {
+			return cached.PRs
+		}
+		return nil
+	}
+	cache, err := s.readPullRequestCache()
+	if err != nil {
+		cache.PRs = []brokerPullRequest{}
+	}
+	found := false
+	for i := range cache.PRs {
+		if cache.PRs[i].ID == pr.ID {
+			cache.PRs[i] = pr
+			found = true
+			break
+		}
+	}
+	if !found {
+		cache.PRs = append(cache.PRs, pr)
+	}
+	sort.SliceStable(cache.PRs, func(i, j int) bool {
+		return cache.PRs[i].ID > cache.PRs[j].ID
+	})
+	_ = s.writePullRequestCache(cache.PRs)
+	return cache.PRs
+}
+
+func (s *webServer) refreshPullRequestCache(ctx context.Context) ([]brokerPullRequest, error) {
+	if strings.TrimSpace(s.cfg.brokerURL) == "" || strings.TrimSpace(s.cfg.logicalRepo) == "" {
+		return nil, errors.New("broker pull requests unavailable")
+	}
+	known := map[string]string{}
+	cached, cacheErr := s.readPullRequestCache()
+	if cacheErr == nil {
+		for _, pr := range cached.PRs {
+			if pr.ID > 0 && strings.TrimSpace(pr.Version) != "" {
+				known[strconv.Itoa(pr.ID)] = pr.Version
+			}
+		}
+	}
+	var resp struct {
+		PRs     []brokerPullRequest `json:"prs"`
+		Deleted []int               `json:"deleted"`
+	}
+	if err := brokerPostContext(ctx, s.cfg.brokerURL, "/prs/sync", brokerPullRequestRequest{Repo: repoForBroker(s.cfg), Known: known}, &resp); err != nil {
+		if !strings.Contains(err.Error(), "unknown broker endpoint") {
+			return nil, err
+		}
+		if listErr := brokerPostContext(ctx, s.cfg.brokerURL, "/prs/list", brokerPullRequestRequest{Repo: repoForBroker(s.cfg)}, &resp); listErr != nil {
+			return nil, err
+		}
+	}
+	if resp.PRs == nil {
+		resp.PRs = []brokerPullRequest{}
+	}
+	prs := mergePullRequestCache(cached.PRs, resp.PRs, resp.Deleted)
+	_ = s.writePullRequestCache(prs)
+	return prs, nil
+}
+
+func mergePullRequestCache(cached, changed []brokerPullRequest, deleted []int) []brokerPullRequest {
+	byID := map[int]brokerPullRequest{}
+	for _, pr := range cached {
+		if pr.ID > 0 {
+			byID[pr.ID] = pr
+		}
+	}
+	for _, id := range deleted {
+		delete(byID, id)
+	}
+	for _, pr := range changed {
+		if pr.ID > 0 {
+			byID[pr.ID] = pr
+		}
+	}
+	prs := make([]brokerPullRequest, 0, len(byID))
+	for _, pr := range byID {
+		prs = append(prs, pr)
+	}
+	sort.SliceStable(prs, func(i, j int) bool {
+		return prs[i].ID > prs[j].ID
+	})
+	return prs
+}
+
+func webAPIPullRequests(prs []brokerPullRequest) []map[string]any {
+	out := make([]map[string]any, 0, len(prs))
+	for _, pr := range prs {
+		out = append(out, map[string]any{
+			"id":        pr.ID,
+			"title":     pr.Title,
+			"body":      pr.Body,
+			"source":    pr.Source,
+			"target":    pr.Target,
+			"status":    pr.Status,
+			"author":    pr.Author,
+			"approvals": pr.Approvals,
+			"checks":    pr.Checks,
+			"head":      pr.Head,
+		})
+	}
+	return out
+}
+
+func pullRequestListHTML(prs []brokerPullRequest) string {
+	if len(prs) == 0 {
+		return `<div class="empty">No pull requests found.</div>`
+	}
+	var b strings.Builder
+	b.WriteString(`<ul class="pr-list">`)
+	for _, pr := range prs {
+		status := firstNonEmpty(pr.Status, "open")
+		title := firstNonEmpty(pr.Title, "Untitled pull request")
+		b.WriteString(`<li class="pr-item"><div class="pr-main"><div><a class="pr-title" href="/prs/` + strconv.Itoa(pr.ID) + `"><span class="pr-id">#` + strconv.Itoa(pr.ID) + `</span> <strong>` + html.EscapeString(title) + `</strong></a></div><div class="muted">` + html.EscapeString(shortRefName(pr.Source)) + ` → ` + html.EscapeString(shortRefName(pr.Target)) + `</div></div><div class="pr-meta"><span class="pr-status">` + html.EscapeString(status) + `</span>`)
+		if pr.Approvals > 0 {
+			b.WriteString(`<span class="pr-approvals">` + strconv.Itoa(pr.Approvals) + ` approval`)
+			if pr.Approvals != 1 {
+				b.WriteString(`s`)
+			}
+			b.WriteString(`</span>`)
+		}
+		b.WriteString(`</div></li>`)
+	}
+	b.WriteString(`</ul>`)
+	return b.String()
+}
+
+func prHeaderHTML(pr brokerPullRequest, active string) string {
+	status := firstNonEmpty(pr.Status, "open")
+	title := firstNonEmpty(pr.Title, "Untitled pull request")
+	filesActive := ""
+	conversationActive := ` class="active"`
+	commitsActive := ""
+	if active == "files" || active == "files-changed" || active == "diff" {
+		conversationActive = ""
+		filesActive = ` class="active"`
+	} else if active == "commits" {
+		conversationActive = ""
+		commitsActive = ` class="active"`
+	}
+	id := strconv.Itoa(pr.ID)
+	var b strings.Builder
+	b.WriteString(`<section class="panel pr-detail-header">`)
+	b.WriteString(`<div class="pr-detail-title"><span class="pr-status">` + html.EscapeString(status) + `</span><h2>#` + id + ` ` + html.EscapeString(title) + `</h2></div>`)
+	b.WriteString(`<div class="muted">` + html.EscapeString(shortRefName(pr.Source)) + ` → ` + html.EscapeString(shortRefName(pr.Target)))
+	if pr.Author != "" {
+		b.WriteString(` by ` + html.EscapeString(pr.Author))
+	}
+	b.WriteString(`</div>`)
+	b.WriteString(`<div class="pr-nav-row"><nav class="pr-subtabs"><a` + conversationActive + ` href="/prs/` + id + `">Conversation</a><a` + filesActive + ` href="/prs/` + id + `/files">Files changed</a><a` + commitsActive + ` href="/prs/` + id + `/commits">Commits</a></nav><button type="button" class="inline-action" data-web-diff data-diff-url="/api/diff?pr=` + id + `" data-diff-title="Pull request #` + id + `" title="View diff">DIFF</button></div>`)
+	b.WriteString(`</section>`)
+	return b.String()
+}
+
+func pullRequestConversationHTML(pr brokerPullRequest) string {
+	var b strings.Builder
+	b.WriteString(`<section class="panel pr-conversation" data-pr-id="` + strconv.Itoa(pr.ID) + `"><div class="panel-title">Conversation</div>`)
+	if strings.TrimSpace(pr.Body) != "" {
+		b.WriteString(`<div class="pr-body">` + html.EscapeString(pr.Body) + `</div>`)
+	} else {
+		b.WriteString(`<div class="empty">No description.</div>`)
+	}
+	b.WriteString(`<div class="pr-timeline">`)
+	for _, comment := range pr.Comments {
+		b.WriteString(prNoteHTML(comment, "commented"))
+	}
+	for _, review := range pr.Reviews {
+		label := "reviewed"
+		if review.State == "approved" {
+			label = "approved"
+		} else if review.State == "changes_requested" {
+			label = "requested changes"
+		}
+		b.WriteString(prNoteHTML(review, label))
+	}
+	if len(pr.Comments) == 0 && len(pr.Reviews) == 0 {
+		b.WriteString(`<div class="empty">No comments or reviews yet.</div>`)
+	}
+	b.WriteString(`</div>`)
+	if firstNonEmpty(pr.Status, "open") == "open" {
+		b.WriteString(`<form class="pr-review-form" data-pr-form><label for="pr-comment">Comment</label><textarea id="pr-comment" data-pr-comment rows="4" placeholder="Leave a comment or review note"></textarea><div class="pr-review-actions"><button type="button" class="button-link" data-pr-action="comment">Comment</button><button type="button" class="button-link" data-pr-action="approve">Approve</button><button type="button" class="button-link" data-pr-action="reject">Request changes</button><label class="pr-delete-branch"><input type="checkbox" data-pr-delete-branch> Delete source branch after merge</label><button type="button" class="button-link primary" data-pr-action="merge">Merge</button></div></form>`)
+	} else {
+		b.WriteString(`<div class="pr-closed-note">This pull request is ` + html.EscapeString(firstNonEmpty(pr.Status, "closed")) + `.</div>`)
+	}
+	b.WriteString(`</section>`)
+	return b.String()
+}
+
+func prNoteHTML(note brokerPullRequestNote, action string) string {
+	user := firstNonEmpty(note.User, "unknown")
+	when := note.At
+	if parsed, err := time.Parse(time.RFC3339, note.At); err == nil {
+		when = relativeTime(parsed.Unix())
+	}
+	var b strings.Builder
+	b.WriteString(`<div class="pr-note"><div class="pr-note-meta"><strong>` + html.EscapeString(user) + `</strong> ` + html.EscapeString(action))
+	if when != "" {
+		b.WriteString(` <span>` + html.EscapeString(when) + `</span>`)
+	}
+	b.WriteString(`</div>`)
+	if strings.TrimSpace(note.Body) != "" {
+		b.WriteString(`<div class="pr-note-body">` + html.EscapeString(note.Body) + `</div>`)
+	}
+	b.WriteString(`</div>`)
+	return b.String()
 }
 
 func commitListHTML(commits []commitObject, ref string, compact bool) string {
@@ -655,7 +2648,7 @@ func commitListHTML(commits []commitObject, ref string, compact bool) string {
 		if commit.timestamp > 0 {
 			when = time.Unix(commit.timestamp, 0).Format("2006-01-02 15:04")
 		}
-		b.WriteString(`<li><div><a class="commit-subject" href="` + html.EscapeString(webCommitURL(commit.hash, ref)) + `">` + html.EscapeString(firstNonEmpty(commit.subject, shortHash(commit.hash))) + `</a><div class="meta">` + html.EscapeString(commit.author) + ` authored ` + html.EscapeString(when))
+		b.WriteString(`<li data-commit-row data-commit-hash="` + html.EscapeString(commit.hash) + `"><div><a class="commit-subject" href="` + html.EscapeString(webCommitURL(commit.hash, ref)) + `">` + html.EscapeString(displayCommitSubject(commit)) + `</a><span class="state-actions" data-commit-state><button type="button" class="inline-icon-action" data-web-diff data-diff-url="/api/diff?commit=` + urlQueryEscape(commit.hash) + `" data-diff-title="` + html.EscapeString(shortHash(commit.hash)) + `" data-diff-subtitle="` + html.EscapeString(displayCommitSubject(commit)) + `" title="View diff" aria-label="View diff">` + diffIconSVGHTML() + `</button></span><div class="meta">` + html.EscapeString(commit.author) + ` authored ` + html.EscapeString(when))
 		if !compact && commit.committer != "" && (commit.committer != commit.author || commit.committerEmail != commit.email) {
 			b.WriteString(` · committed by ` + html.EscapeString(commit.committer))
 		}
@@ -667,6 +2660,32 @@ func commitListHTML(commits []commitObject, ref string, compact bool) string {
 		b.WriteString(`</ol>`)
 	}
 	return b.String()
+}
+
+func displayCommitSubject(commit commitObject) string {
+	const maxSubjectRunes = 80
+	subject := firstNonBlankLine(commit.subject)
+	if subject == "" {
+		subject = firstNonBlankLine(commit.body)
+	}
+	if subject == "" {
+		return shortHash(commit.hash)
+	}
+	runes := []rune(subject)
+	if len(runes) <= maxSubjectRunes {
+		return subject
+	}
+	return strings.TrimSpace(string(runes[:maxSubjectRunes-1])) + "…"
+}
+
+func firstNonBlankLine(value string) string {
+	for _, line := range strings.Split(value, "\n") {
+		line = strings.TrimSpace(line)
+		if line != "" {
+			return line
+		}
+	}
+	return ""
 }
 
 func cleanWebPath(value string) string {
@@ -788,6 +2807,52 @@ func (s *webServer) changedFiles(ctx context.Context, commit commitObject) ([]we
 	return files, totalAdditions, totalDeletions, nil
 }
 
+func (s *webServer) changedFilesBetweenTrees(ctx context.Context, beforeTree, afterTree string) ([]webChangedFile, int, int, error) {
+	before := map[string]webTreeFile{}
+	if beforeTree != "" {
+		if err := s.collectTreeFiles(ctx, beforeTree, "", before); err != nil {
+			return nil, 0, 0, err
+		}
+	}
+	after := map[string]webTreeFile{}
+	if afterTree != "" {
+		if err := s.collectTreeFiles(ctx, afterTree, "", after); err != nil {
+			return nil, 0, 0, err
+		}
+	}
+	return s.changedFilesBetweenMaps(ctx, before, after)
+}
+
+func (s *webServer) changedFilesBetweenMaps(ctx context.Context, before, after map[string]webTreeFile) ([]webChangedFile, int, int, error) {
+	seen := map[string]struct{}{}
+	for path := range before {
+		seen[path] = struct{}{}
+	}
+	for path := range after {
+		seen[path] = struct{}{}
+	}
+	var paths []string
+	for path := range seen {
+		if before[path].hash != after[path].hash {
+			paths = append(paths, path)
+		}
+	}
+	sort.Strings(paths)
+	var files []webChangedFile
+	totalAdditions := 0
+	totalDeletions := 0
+	for _, path := range paths {
+		file, err := s.changedFile(ctx, path, before[path].hash, after[path].hash)
+		if err != nil {
+			return nil, 0, 0, err
+		}
+		totalAdditions += file.additions
+		totalDeletions += file.deletions
+		files = append(files, file)
+	}
+	return files, totalAdditions, totalDeletions, nil
+}
+
 func (s *webServer) collectTreeFiles(ctx context.Context, treeHash, prefix string, out map[string]webTreeFile) error {
 	entries, err := s.repo.treeEntries(ctx, treeHash)
 	if err != nil {
@@ -827,6 +2892,7 @@ func (s *webServer) changedFile(ctx context.Context, path, oldHash, newHash stri
 		file.binary = true
 		return file, nil
 	}
+	file.visual = webVisualRowsFromText(string(oldData), string(newData), 3)
 	for _, line := range simpleLineDiff(string(oldData), string(newData)) {
 		diffLine := webDiffLine{text: line}
 		switch {
@@ -859,14 +2925,306 @@ func diffFileHTML(file webChangedFile) string {
 	b.WriteString(`</div></div><div><span class="additions">+` + strconv.Itoa(file.additions) + `</span> <span class="deletions">-` + strconv.Itoa(file.deletions) + `</span></div></div>`)
 	if file.binary {
 		b.WriteString(`<div class="empty">Binary file changed.</div>`)
+	} else if len(file.visual) > 0 {
+		b.WriteString(webVisualDiffGridRowsHTML(file.visual))
 	} else {
-		b.WriteString(`<pre class="diff">`)
-		for _, line := range file.diff {
-			b.WriteString(`<span class="diff-line ` + html.EscapeString(line.kind) + `">` + html.EscapeString(line.text) + `</span>`)
-		}
-		b.WriteString(`</pre>`)
+		b.WriteString(webVisualDiffGridHTML(file.diff))
 	}
 	b.WriteString(`</section>`)
+	return b.String()
+}
+
+type webVisualDiffRow struct {
+	kind    string
+	left    string
+	right   string
+	oldLine string
+	newLine string
+	control string
+	hidden  bool
+}
+
+type webPendingDelete struct {
+	text string
+	line int
+}
+
+func webVisualDiffGridHTML(lines []webDiffLine) string {
+	return webVisualDiffGridRowsHTML(webVisualDiffRows(lines))
+}
+
+func webVisualDiffGridRowsHTML(rows []webVisualDiffRow) string {
+	var b strings.Builder
+	b.WriteString(`<div class="visual-diff"><section class="visual-diff-file"><div class="visual-diff-grid"><div class="visual-diff-heading visual-diff-line-heading"></div><div class="visual-diff-heading">Before</div><div class="visual-diff-heading visual-diff-line-heading"></div><div class="visual-diff-heading">After</div>`)
+	for _, row := range rows {
+		b.WriteString(webVisualDiffRowHTML(row))
+	}
+	b.WriteString(`</div></section></div>`)
+	return b.String()
+}
+
+func webVisualRowsFromText(left, right string, context int) []webVisualDiffRow {
+	a := splitLines(left)
+	b := splitLines(right)
+	ops := simpleLineDiffOps(a, b)
+	hunks := simpleLineDiffHunks(ops, context)
+	if len(hunks) == 0 {
+		return nil
+	}
+	hunkStarts := map[int]int{}
+	hunkEnds := map[int]int{}
+	visible := map[int]struct{}{}
+	for i, hunk := range hunks {
+		hunkStarts[hunk.start] = i
+		hunkEnds[hunk.end] = i
+		for i := hunk.start; i < hunk.end; i++ {
+			visible[i] = struct{}{}
+		}
+	}
+	var rows []webVisualDiffRow
+	var pending []webPendingDelete
+	flushDeletes := func(hidden bool) {
+		for _, deleted := range pending {
+			rows = append(rows, webVisualDiffRow{kind: "del", left: deleted.text, oldLine: strconv.Itoa(deleted.line), hidden: hidden})
+		}
+		pending = nil
+	}
+	for i, op := range ops {
+		if hunkIndex, ok := hunkStarts[i]; ok {
+			hunk := hunks[hunkIndex]
+			flushDeletes(false)
+			oldStart, oldCount, newStart, newCount := simpleDiffHunkRange(ops[hunk.start:hunk.end])
+			control := ""
+			if hunkIndex > 0 && hunks[hunkIndex-1].end < hunk.start {
+				control = "up"
+			}
+			rows = append(rows, webVisualDiffRow{kind: "hunk-top", left: "Lines " + webLineRangeLabel(oldStart, oldCount) + " -> " + webLineRangeLabel(newStart, newCount), control: control})
+		}
+		_, isVisible := visible[i]
+		hidden := !isVisible
+		switch op.kind {
+		case '-':
+			pending = append(pending, webPendingDelete{text: op.text, line: op.oldLine})
+		case '+':
+			if len(pending) > 0 {
+				deleted := pending[0]
+				pending = pending[1:]
+				rows = append(rows, webVisualDiffRow{kind: "change", left: deleted.text, right: op.text, oldLine: strconv.Itoa(deleted.line), newLine: strconv.Itoa(op.newLine), hidden: hidden})
+			} else {
+				rows = append(rows, webVisualDiffRow{kind: "add", right: op.text, newLine: strconv.Itoa(op.newLine), hidden: hidden})
+			}
+		default:
+			flushDeletes(hidden)
+			rows = append(rows, webVisualDiffRow{kind: "same", left: op.text, right: op.text, oldLine: strconv.Itoa(op.oldLine), newLine: strconv.Itoa(op.newLine), hidden: hidden})
+		}
+		if hunkIndex, ok := hunkEnds[i+1]; ok {
+			hunk := hunks[hunkIndex]
+			flushDeletes(false)
+			control := ""
+			if hunkIndex < len(hunks)-1 && hunk.end < hunks[hunkIndex+1].start {
+				control = "down"
+			}
+			if control != "" {
+				rows = append(rows, webVisualDiffRow{kind: "hunk-bottom", control: control})
+			}
+		}
+	}
+	flushDeletes(true)
+	return rows
+}
+
+func webVisualDiffRows(lines []webDiffLine) []webVisualDiffRow {
+	oldLine, newLine := 0, 0
+	var rows []webVisualDiffRow
+	var pending []webPendingDelete
+	flushDeletes := func() {
+		for _, deleted := range pending {
+			rows = append(rows, webVisualDiffRow{kind: "del", left: deleted.text, oldLine: strconv.Itoa(deleted.line)})
+		}
+		pending = nil
+	}
+	for _, line := range lines {
+		text := line.text
+		switch line.kind {
+		case "hunk":
+			flushDeletes()
+			oldLine, newLine = webDiffHunkStarts(text)
+			rows = append(rows, webVisualDiffRow{kind: "hunk", left: webDiffDividerLabel(text)})
+		case "del":
+			pending = append(pending, webPendingDelete{text: strings.TrimPrefix(text, "-"), line: oldLine})
+			oldLine++
+		case "add":
+			added := strings.TrimPrefix(text, "+")
+			if len(pending) > 0 {
+				deleted := pending[0]
+				pending = pending[1:]
+				rows = append(rows, webVisualDiffRow{kind: "change", left: deleted.text, right: added, oldLine: strconv.Itoa(deleted.line), newLine: strconv.Itoa(newLine)})
+			} else {
+				rows = append(rows, webVisualDiffRow{kind: "add", right: added, newLine: strconv.Itoa(newLine)})
+			}
+			newLine++
+		default:
+			flushDeletes()
+			value := strings.TrimPrefix(text, " ")
+			rows = append(rows, webVisualDiffRow{kind: "same", left: value, right: value, oldLine: strconv.Itoa(oldLine), newLine: strconv.Itoa(newLine)})
+			oldLine++
+			newLine++
+		}
+	}
+	flushDeletes()
+	return rows
+}
+
+func webVisualDiffRowHTML(row webVisualDiffRow) string {
+	if row.kind == "hunk" || row.kind == "hunk-top" || row.kind == "hunk-bottom" || row.kind == "note" {
+		controls := webDiffContextControlHTML(row.control)
+		label := html.EscapeString(row.left)
+		if row.kind == "hunk" {
+			label = html.EscapeString(webDiffDividerLabel(row.left))
+		}
+		if row.kind == "hunk-bottom" && label == "" {
+			label = `<span class="sr-only">More context</span>`
+		} else {
+			label = `<span>` + label + `</span>`
+		}
+		return `<div class="visual-diff-divider visual-diff-` + html.EscapeString(row.kind) + `">` + controls + label + `</div>`
+	}
+	left := webDiffCellHTML(row.left, row.kind == "del", false)
+	right := webDiffCellHTML(row.right, false, row.kind == "add")
+	if row.kind == "change" {
+		left, right = webInlineChangedHTML(row.left, row.right)
+	}
+	hidden := ""
+	if row.hidden {
+		hidden = ` data-hidden-context="true" hidden`
+	}
+	return `<div class="visual-diff-row visual-diff-` + html.EscapeString(row.kind) + `"` + hidden + `><div class="visual-diff-line-number">` + html.EscapeString(row.oldLine) + `</div><pre>` + left + `</pre><div class="visual-diff-line-number">` + html.EscapeString(row.newLine) + `</div><pre>` + right + `</pre></div>`
+}
+
+func webDiffContextControlHTML(control string) string {
+	switch control {
+	case "up":
+		return `<span class="diff-context-controls"><button type="button" data-diff-context="up" title="Show 20 more lines above" aria-label="Show 20 more lines above">↑</button></span>`
+	case "down":
+		return `<span class="diff-context-controls"><button type="button" data-diff-context="down" title="Show 20 more lines below" aria-label="Show 20 more lines below">↓</button></span>`
+	default:
+		return ""
+	}
+}
+
+func webDiffCellHTML(text string, deleted, added bool) string {
+	if text == "" {
+		return ""
+	}
+	value := html.EscapeString(text)
+	switch {
+	case deleted:
+		return `<span class="diff-change deleted">` + value + `</span>`
+	case added:
+		return `<span class="diff-change added">` + value + `</span>`
+	default:
+		return value
+	}
+}
+
+func webInlineChangedHTML(left, right string) (string, string) {
+	prefix := 0
+	for prefix < len(left) && prefix < len(right) && left[prefix] == right[prefix] {
+		prefix++
+	}
+	suffix := 0
+	for suffix < len(left)-prefix && suffix < len(right)-prefix && left[len(left)-1-suffix] == right[len(right)-1-suffix] {
+		suffix++
+	}
+	oldEnd := len(left) - suffix
+	newEnd := len(right) - suffix
+	oldChanged := left[prefix:oldEnd]
+	newChanged := right[prefix:newEnd]
+	if oldChanged == "" {
+		oldChanged = " "
+	}
+	if newChanged == "" {
+		newChanged = " "
+	}
+	oldHTML := html.EscapeString(left[:prefix]) + `<span class="diff-change deleted">` + html.EscapeString(oldChanged) + `</span>` + html.EscapeString(left[oldEnd:])
+	newHTML := html.EscapeString(right[:prefix]) + `<span class="diff-change added">` + html.EscapeString(newChanged) + `</span>` + html.EscapeString(right[newEnd:])
+	return oldHTML, newHTML
+}
+
+func webDiffHunkStarts(line string) (int, int) {
+	oldStart, _, newStart, _, ok := webDiffHunkRange(line)
+	if ok {
+		return oldStart, newStart
+	}
+	return 0, 0
+}
+
+func webDiffDividerLabel(line string) string {
+	oldStart, oldCount, newStart, newCount, ok := webDiffHunkRange(line)
+	if ok {
+		return "Lines " + webLineRangeLabel(oldStart, oldCount) + " -> " + webLineRangeLabel(newStart, newCount)
+	}
+	return line
+}
+
+func webDiffHunkRange(line string) (int, int, int, int, bool) {
+	fields := strings.Fields(line)
+	if len(fields) < 3 || fields[0] != "@@" {
+		return 0, 0, 0, 0, false
+	}
+	oldStart, oldCount, ok := webParseHunkPart(fields[1], "-")
+	if !ok {
+		return 0, 0, 0, 0, false
+	}
+	newStart, newCount, ok := webParseHunkPart(fields[2], "+")
+	if !ok {
+		return 0, 0, 0, 0, false
+	}
+	return oldStart, oldCount, newStart, newCount, true
+}
+
+func webParseHunkPart(part, prefix string) (int, int, bool) {
+	part = strings.TrimPrefix(part, prefix)
+	if part == "" {
+		return 0, 0, false
+	}
+	startText, countText, hasCount := strings.Cut(part, ",")
+	start, err := strconv.Atoi(startText)
+	if err != nil {
+		return 0, 0, false
+	}
+	count := 1
+	if hasCount {
+		count, err = strconv.Atoi(countText)
+		if err != nil {
+			return 0, 0, false
+		}
+	}
+	return start, count, true
+}
+
+func webLineRangeLabel(start, count int) string {
+	if count <= 1 {
+		return strconv.Itoa(start)
+	}
+	return strconv.Itoa(start) + "-" + strconv.Itoa(start+count-1)
+}
+
+func diffFilesPanelHTML(files []webChangedFile, additions, deletions int) string {
+	var b strings.Builder
+	b.WriteString(`<section class="panel"><div class="diff-summary"><strong>` + strconv.Itoa(len(files)) + ` changed file` + pluralSuffix(len(files)) + `</strong><span class="additions">+` + strconv.Itoa(additions) + `</span><span class="deletions">-` + strconv.Itoa(deletions) + `</span></div>`)
+	if len(files) == 0 {
+		b.WriteString(`<div class="empty">No file changes.</div></section>`)
+		return b.String()
+	}
+	b.WriteString(`<table class="files changed-files">`)
+	for _, file := range files {
+		b.WriteString(`<tr><td><a href="#diff-` + html.EscapeString(anchorID(file.path)) + `">` + html.EscapeString(file.path) + `</a></td><td class="diff-stat"><span class="additions">+` + strconv.Itoa(file.additions) + `</span> <span class="deletions">-` + strconv.Itoa(file.deletions) + `</span></td></tr>`)
+	}
+	b.WriteString(`</table></section>`)
+	for _, file := range files {
+		b.WriteString(diffFileHTML(file))
+	}
 	return b.String()
 }
 
@@ -894,7 +3252,45 @@ func relativeTime(ts int64) string {
 	if ts == 0 {
 		return "at an unknown time"
 	}
-	return time.Unix(ts, 0).Format("2006-01-02 15:04")
+	then := time.Unix(ts, 0)
+	diff := time.Since(then)
+	suffix := "ago"
+	if diff < 0 {
+		diff = -diff
+		suffix = "from now"
+	}
+	minute := time.Minute
+	hour := time.Hour
+	day := 24 * hour
+	week := 7 * day
+	month := 30 * day
+	year := 365 * day
+	switch {
+	case diff < minute:
+		return "just now"
+	case diff < hour:
+		return relativeTimeUnit(int(diff/minute), "minute", suffix)
+	case diff < day:
+		return relativeTimeUnit(int(diff/hour), "hour", suffix)
+	case diff < week:
+		return relativeTimeUnit(int(diff/day), "day", suffix)
+	case diff < month:
+		return relativeTimeUnit(int(diff/week), "week", suffix)
+	case diff < year:
+		return relativeTimeUnit(int(diff/month), "month", suffix)
+	default:
+		return relativeTimeUnit(int(diff/year), "year", suffix)
+	}
+}
+
+func relativeTimeUnit(count int, unit, suffix string) string {
+	if count < 1 {
+		count = 1
+	}
+	if count != 1 {
+		unit += "s"
+	}
+	return strconv.Itoa(count) + " " + unit + " " + suffix
 }
 
 func firstNonZero(values ...int64) int64 {
@@ -926,94 +3322,132 @@ func anchorID(value string) string {
 	return strings.Trim(b.String(), "-")
 }
 
-const webCSS = `
-:root { color-scheme: light dark; font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; --border: color-mix(in srgb, CanvasText 16%, transparent); --muted: color-mix(in srgb, CanvasText 62%, transparent); --panel: color-mix(in srgb, Canvas 94%, CanvasText 6%); }
-* { box-sizing: border-box; }
-body { margin: 0; background: color-mix(in srgb, Canvas 96%, CanvasText 4%); color: CanvasText; }
-a { color: #0969da; text-decoration: none; }
-a:hover { text-decoration: underline; }
-code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
-.layout { max-width: 1180px; margin: 0 auto; padding: 20px 24px 36px; }
-.repo-header { border-bottom: 1px solid var(--border); margin-bottom: 16px; padding: 8px 0 0; }
-.repo-topline { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
-.repo-kicker { color: var(--muted); font-size: 12px; font-weight: 700; text-transform: uppercase; }
-h1 { font-size: 22px; line-height: 1.25; margin: 2px 0 12px; overflow-wrap: anywhere; }
-h2 { font-size: 21px; line-height: 1.3; margin: 0 0 12px; }
-.ref-pill { border: 1px solid var(--border); border-radius: 999px; padding: 5px 10px; font-size: 13px; background: Canvas; max-width: 280px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.ref-selector { display: grid; gap: 4px; min-width: 210px; max-width: 320px; }
-.ref-selector span { color: var(--muted); font-size: 12px; font-weight: 700; text-transform: uppercase; }
-.ref-selector select { min-height: 34px; border: 1px solid var(--border); border-radius: 6px; background: Canvas; color: CanvasText; padding: 0 32px 0 10px; font: inherit; font-size: 13px; max-width: 100%; }
-.tabs { display: flex; gap: 6px; margin-top: 4px; }
-.tabs a { display: inline-flex; align-items: center; min-height: 36px; padding: 0 12px; border-bottom: 2px solid transparent; color: CanvasText; font-weight: 600; }
-.tabs a:first-child { border-bottom-color: #fd8c73; }
-.crumbs { margin: 10px 0 12px; color: var(--muted); font-size: 13px; overflow-wrap: anywhere; }
-.panel, .clone-panel { background: Canvas; border: 1px solid var(--border); border-radius: 8px; margin: 14px 0; overflow: hidden; }
-.panel-title { font-size: 14px; font-weight: 700; padding: 12px 14px; border-bottom: 1px solid var(--border); background: var(--panel); }
-.clone-panel { display: grid; grid-template-columns: minmax(180px, 270px) 1fr; gap: 14px; padding: 14px; align-items: start; }
-.clone-panel .panel-title { padding: 0; border: 0; background: transparent; }
-.clone-grid { display: grid; gap: 8px; min-width: 0; }
-.clone-row { display: grid; grid-template-columns: 64px minmax(0, 1fr) auto; gap: 8px; align-items: center; }
-.clone-row span { color: var(--muted); font-size: 12px; font-weight: 700; text-transform: uppercase; }
-.clone-row code { border: 1px solid var(--border); background: var(--panel); min-height: 34px; padding: 8px 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.copy-button, .button-link { border: 1px solid var(--border); background: Canvas; color: CanvasText; border-radius: 6px; min-height: 34px; padding: 0 10px; font: inherit; font-size: 13px; display: inline-flex; align-items: center; justify-content: center; cursor: pointer; }
-.copy-button:hover, .button-link:hover { background: var(--panel); text-decoration: none; }
-.commit-strip { display: flex; justify-content: space-between; gap: 14px; align-items: center; padding: 12px 14px; }
-.commit-subject { color: CanvasText; font-weight: 700; }
-.muted, .meta { color: var(--muted); font-size: 13px; }
-.files { border-collapse: collapse; width: 100%; }
-.files td { border-top: 1px solid var(--border); padding: 10px 12px; vertical-align: top; }
-.files tr:first-child td { border-top: 0; }
-.kind { width: 54px; color: var(--muted); text-transform: uppercase; font-size: 11px; font-weight: 700; }
-.hash { width: 112px; text-align: right; color: var(--muted); font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; }
-.readme-panel .panel-title { border-bottom: 1px solid var(--border); }
-.blob, .readme pre, .commit-message { margin: 0; padding: 14px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 13px; line-height: 1.5; background: Canvas; }
-.blob-toolbar { display: flex; justify-content: space-between; gap: 14px; align-items: center; padding: 12px 14px; border-bottom: 1px solid var(--border); background: var(--panel); }
-.blob-toolbar .panel-title { padding: 0; border: 0; background: transparent; overflow-wrap: anywhere; }
-.actions { display: flex; gap: 8px; align-items: center; margin: 10px 14px 14px; font-size: 13px; }
-.blob-toolbar .actions { margin: 0; }
-.commits { list-style: none; margin: 0; padding: 0; }
-.commits li { display: flex; justify-content: space-between; gap: 16px; padding: 12px 14px; border-top: 1px solid var(--border); }
-.commits li:first-child { border-top: 0; }
-.commit-detail { padding: 16px; }
-.commit-detail .commit-message { border: 1px solid var(--border); border-radius: 6px; margin-bottom: 14px; background: var(--panel); }
-.metadata-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
-.metadata-grid div { min-width: 0; }
-.metadata-grid span { display: block; color: var(--muted); font-size: 12px; font-weight: 700; text-transform: uppercase; margin-bottom: 3px; }
-.metadata-grid small { display: block; color: var(--muted); overflow-wrap: anywhere; }
-.diff-summary { display: flex; gap: 12px; align-items: center; padding: 12px 14px; border-bottom: 1px solid var(--border); }
-.additions { color: #1a7f37; font-weight: 700; }
-.deletions { color: #cf222e; font-weight: 700; }
-.changed-files .diff-stat { width: 120px; text-align: right; }
-.diff-file { scroll-margin-top: 16px; }
-.diff-header { display: flex; justify-content: space-between; gap: 12px; align-items: center; padding: 12px 14px; border-bottom: 1px solid var(--border); background: var(--panel); overflow-wrap: anywhere; }
-.diff { margin: 0; overflow: auto; font-size: 12px; line-height: 1.45; }
-.diff-line { display: block; padding: 0 12px; white-space: pre; }
-.diff-line.add { background: color-mix(in srgb, #2da44e 16%, Canvas); }
-.diff-line.del { background: color-mix(in srgb, #cf222e 14%, Canvas); }
-.diff-line.hunk { background: color-mix(in srgb, #0969da 12%, Canvas); color: #0969da; }
-.empty { margin: 14px; border: 1px solid var(--border); border-radius: 6px; padding: 14px; color: var(--muted); }
-.sr-only { position: absolute; left: -9999px; width: 1px; height: 1px; overflow: hidden; }
-@media (max-width: 720px) { .layout { padding: 14px; } .repo-topline, .commit-strip, .blob-toolbar, .diff-header { flex-direction: column; align-items: stretch; } .ref-selector { max-width: none; } .clone-panel { grid-template-columns: 1fr; } .clone-row { grid-template-columns: 1fr; } .hash { display: none; } .commits li { flex-direction: column; gap: 6px; } .metadata-grid { grid-template-columns: 1fr; } }
-`
+type webEventHub struct {
+	mu      sync.Mutex
+	clients map[chan string]struct{}
+}
 
-const webJS = `<script>
-document.addEventListener('click', function (event) {
-  const button = event.target.closest('[data-copy-target]');
-  if (!button) return;
-  const target = document.getElementById(button.getAttribute('data-copy-target'));
-  if (!target) return;
-  const value = target.value !== undefined ? target.value : target.textContent;
-  navigator.clipboard.writeText(value).then(function () {
-    const old = button.textContent;
-    button.textContent = 'Copied';
-    window.setTimeout(function () { button.textContent = old; }, 1200);
-  });
-});
-document.addEventListener('change', function (event) {
-  const select = event.target.closest('[data-ref-selector]');
-  if (!select) return;
-  const url = new URL(window.location.href);
-  url.searchParams.set('ref', select.value);
-  window.location.href = url.toString();
-});
-</script>`
+func newWebEventHub() *webEventHub {
+	return &webEventHub{clients: map[chan string]struct{}{}}
+}
+
+func (h *webEventHub) subscribe() chan string {
+	ch := make(chan string, 8)
+	h.mu.Lock()
+	h.clients[ch] = struct{}{}
+	h.mu.Unlock()
+	return ch
+}
+
+func (h *webEventHub) unsubscribe(ch chan string) {
+	h.mu.Lock()
+	delete(h.clients, ch)
+	close(ch)
+	h.mu.Unlock()
+}
+
+func (h *webEventHub) broadcast(name string) {
+	payload := fmt.Sprintf("event: %s\ndata: {\"time\":%d}\n\n", name, time.Now().UnixMilli())
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for ch := range h.clients {
+		select {
+		case ch <- payload:
+		default:
+		}
+	}
+}
+
+func monitorWebPath(ctx context.Context, root, eventName string, hub *webEventHub) {
+	if root == "" || hub == nil {
+		return
+	}
+	last := webPathFingerprint(root)
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			next := webPathFingerprint(root)
+			if next != "" && next != last {
+				last = next
+				hub.broadcast(eventName)
+			}
+		}
+	}
+}
+
+func webPathFingerprint(root string) string {
+	var newest int64
+	var count int
+	_ = filepath.WalkDir(root, func(path string, entry fs.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if rel, relErr := filepath.Rel(root, path); relErr == nil {
+			slashRel := filepath.ToSlash(rel)
+			if strings.HasPrefix(slashRel, "refs/remotes/bucketgit/") || strings.HasPrefix(slashRel, "refs/tags/") {
+				if entry.IsDir() {
+					return filepath.SkipDir
+				}
+				return nil
+			}
+		}
+		name := entry.Name()
+		if entry.IsDir() {
+			if name == "objects" || name == "tmp" || name == "bucketgit" {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if strings.HasSuffix(name, ".lock") {
+			return nil
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return nil
+		}
+		count++
+		if mod := info.ModTime().UnixNano(); mod > newest {
+			newest = mod
+		}
+		return nil
+	})
+	return fmt.Sprintf("%d:%d", newest, count)
+}
+
+func webAssetString(path string) string {
+	data, err := webAssetBytes(path)
+	if err != nil {
+		return ""
+	}
+	return string(data)
+}
+
+func webAssetBytes(path string) ([]byte, error) {
+	if diskPath := webAssetDiskPath(path); diskPath != "" {
+		if data, err := os.ReadFile(diskPath); err == nil {
+			return data, nil
+		}
+	}
+	return webAssets.ReadFile(path)
+}
+
+func webAssetDiskPath(path string) string {
+	if _, err := os.Stat(path); err == nil {
+		return path
+	}
+	if exe, err := os.Executable(); err == nil {
+		candidate := filepath.Join(filepath.Dir(exe), path)
+		if _, statErr := os.Stat(candidate); statErr == nil {
+			return candidate
+		}
+	}
+	return ""
+}
+
+func webAssetDir() string {
+	return filepath.Dir(webAssetDiskPath(webJSPath))
+}

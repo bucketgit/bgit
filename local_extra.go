@@ -37,6 +37,7 @@ type renameChange struct {
 
 func (r *localRepository) diff(args []string, stdout io.Writer) error {
 	cached := false
+	var revisions []string
 	for _, arg := range args {
 		switch arg {
 		case "--cached", "--staged":
@@ -45,14 +46,23 @@ func (r *localRepository) diff(args []string, stdout io.Writer) error {
 			if strings.HasPrefix(arg, "-") {
 				return fmt.Errorf("unsupported diff option %s", arg)
 			}
+			revisions = append(revisions, arg)
 		}
+	}
+	if len(revisions) > 2 {
+		return errors.New("diff accepts at most two revisions")
 	}
 	idx, err := r.readIndex()
 	if err != nil {
 		return err
 	}
 	var left map[string]string
-	if cached {
+	if len(revisions) > 0 {
+		left, err = r.revisionTreeFiles(revisions[0])
+		if err != nil {
+			return err
+		}
+	} else if cached {
 		left, err = r.headTreeFiles()
 		if err != nil {
 			return err
@@ -64,23 +74,51 @@ func (r *localRepository) diff(args []string, stdout io.Writer) error {
 		}
 	}
 	right := map[string]string{}
-	if cached {
+	if len(revisions) == 2 {
+		right, err = r.revisionTreeFiles(revisions[1])
+		if err != nil {
+			return err
+		}
+	} else if cached {
 		for _, entry := range idx.entries {
 			right[entry.path] = entry.hash
 		}
 	} else {
+		paths := map[string]struct{}{}
+		for path := range left {
+			paths[path] = struct{}{}
+		}
 		for _, entry := range idx.entries {
-			hash, err := r.writeBlobFromWorktree(entry.path)
+			paths[entry.path] = struct{}{}
+		}
+		for path := range paths {
+			hash, err := r.writeBlobFromWorktree(path)
 			if errors.Is(err, fs.ErrNotExist) {
 				continue
 			}
 			if err != nil {
 				return err
 			}
-			right[entry.path] = hash
+			right[path] = hash
 		}
 	}
 	return r.printDiff(left, right, stdout)
+}
+
+func (r *localRepository) revisionTreeFiles(revision string) (map[string]string, error) {
+	hash, err := r.resolveRevision(revision)
+	if err != nil {
+		return nil, fmt.Errorf("unknown revision %q", revision)
+	}
+	commit, err := r.commitObject(hash)
+	if err != nil {
+		return nil, err
+	}
+	files := map[string]string{}
+	if err := r.collectTreeFiles(commit.tree, "", files); err != nil {
+		return nil, err
+	}
+	return files, nil
 }
 
 func (r *localRepository) headTreeFiles() (map[string]string, error) {
@@ -1178,6 +1216,131 @@ func simpleLineDiff(left, right string) []string {
 	if left == right {
 		return nil
 	}
+	if len(a)*len(b) > 900000 {
+		return simpleWholeFileDiff(a, b)
+	}
+	ops := simpleLineDiffOps(a, b)
+	hunks := simpleLineDiffHunks(ops, 3)
+	var out []string
+	for _, hunk := range hunks {
+		oldStart, oldCount, newStart, newCount := simpleDiffHunkRange(ops[hunk.start:hunk.end])
+		out = append(out, fmt.Sprintf("@@ %s %s @@", hunkRangeFrom(oldStart, oldCount, "-"), hunkRangeFrom(newStart, newCount, "+")))
+		for _, op := range ops[hunk.start:hunk.end] {
+			out = append(out, string(op.kind)+op.text)
+		}
+	}
+	return out
+}
+
+type simpleDiffOp struct {
+	kind    byte
+	text    string
+	oldLine int
+	newLine int
+}
+
+type simpleDiffHunk struct {
+	start int
+	end   int
+}
+
+func simpleLineDiffOps(a, b []string) []simpleDiffOp {
+	rows := make([][]int, len(a)+1)
+	for i := range rows {
+		rows[i] = make([]int, len(b)+1)
+	}
+	for i := len(a) - 1; i >= 0; i-- {
+		for j := len(b) - 1; j >= 0; j-- {
+			if a[i] == b[j] {
+				rows[i][j] = rows[i+1][j+1] + 1
+			} else if rows[i+1][j] >= rows[i][j+1] {
+				rows[i][j] = rows[i+1][j]
+			} else {
+				rows[i][j] = rows[i][j+1]
+			}
+		}
+	}
+	i, j := 0, 0
+	var ops []simpleDiffOp
+	for i < len(a) || j < len(b) {
+		switch {
+		case i < len(a) && j < len(b) && a[i] == b[j]:
+			ops = append(ops, simpleDiffOp{kind: ' ', text: a[i], oldLine: i + 1, newLine: j + 1})
+			i++
+			j++
+		case i < len(a) && (j == len(b) || rows[i+1][j] >= rows[i][j+1]):
+			ops = append(ops, simpleDiffOp{kind: '-', text: a[i], oldLine: i + 1, newLine: j + 1})
+			i++
+		case j < len(b):
+			ops = append(ops, simpleDiffOp{kind: '+', text: b[j], oldLine: i + 1, newLine: j + 1})
+			j++
+		}
+	}
+	return ops
+}
+
+func simpleLineDiffHunks(ops []simpleDiffOp, context int) []simpleDiffHunk {
+	var hunks []simpleDiffHunk
+	for i, op := range ops {
+		if op.kind == ' ' {
+			continue
+		}
+		start := i - context
+		if start < 0 {
+			start = 0
+		}
+		end := i + context + 1
+		if end > len(ops) {
+			end = len(ops)
+		}
+		if len(hunks) > 0 && start <= hunks[len(hunks)-1].end {
+			if end > hunks[len(hunks)-1].end {
+				hunks[len(hunks)-1].end = end
+			}
+			continue
+		}
+		hunks = append(hunks, simpleDiffHunk{start: start, end: end})
+	}
+	return hunks
+}
+
+func simpleDiffHunkRange(ops []simpleDiffOp) (int, int, int, int) {
+	oldStart, newStart := 0, 0
+	oldCount, newCount := 0, 0
+	for _, op := range ops {
+		if op.kind != '+' {
+			if oldStart == 0 {
+				oldStart = op.oldLine
+			}
+			oldCount++
+		}
+		if op.kind != '-' {
+			if newStart == 0 {
+				newStart = op.newLine
+			}
+			newCount++
+		}
+	}
+	if oldStart == 0 && len(ops) > 0 {
+		oldStart = ops[0].oldLine - 1
+	}
+	if newStart == 0 && len(ops) > 0 {
+		newStart = ops[0].newLine - 1
+	}
+	return oldStart, oldCount, newStart, newCount
+}
+
+func hunkRangeFrom(start, count int, prefix string) string {
+	if count == 0 {
+		return prefix + strconv.Itoa(start) + ",0"
+	}
+	if count == 1 {
+		return prefix + strconv.Itoa(start)
+	}
+	return prefix + strconv.Itoa(start) + "," + strconv.Itoa(count)
+}
+
+func simpleWholeFileDiff(a, b []string) []string {
 	var out []string
 	out = append(out, fmt.Sprintf("@@ %s %s @@", hunkRange("-", len(a)), hunkRange("+", len(b))))
 	for _, line := range a {
@@ -1264,8 +1427,8 @@ func (r *localRepository) findPathInTree(treeHash, path string) (string, error) 
 }
 
 func (r *localRepository) commitWithParents(treeHash string, parents []string, message string) (string, error) {
-	authorName := firstNonEmpty(os.Getenv("GIT_AUTHOR_NAME"), r.configValue("user.name"), "bgit")
-	authorEmail := firstNonEmpty(os.Getenv("GIT_AUTHOR_EMAIL"), r.configValue("user.email"), "bgit@example.com")
+	authorName := firstNonEmpty(os.Getenv("GIT_AUTHOR_NAME"), r.identityValue("user.name"), defaultBucketGitIdentityName)
+	authorEmail := firstNonEmpty(os.Getenv("GIT_AUTHOR_EMAIL"), r.identityValue("user.email"), defaultBucketGitIdentityEmail())
 	committerName := firstNonEmpty(os.Getenv("GIT_COMMITTER_NAME"), authorName)
 	committerEmail := firstNonEmpty(os.Getenv("GIT_COMMITTER_EMAIL"), authorEmail)
 	now := time.Now()

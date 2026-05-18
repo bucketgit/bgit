@@ -1,0 +1,725 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Minimal bgit SSH broker control-plane endpoint.
+Resources:
+  BrokerTransferRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub bgit-broker-transfer-${AWS::Region}
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub arn:aws:iam::${AWS::AccountId}:root
+            Action:
+              - sts:AssumeRole
+              - sts:TagSession
+            Condition:
+              ArnEquals:
+                aws:PrincipalArn: !Sub arn:aws:iam::${AWS::AccountId}:role/bgit-broker-${AWS::Region}
+      Policies:
+        - PolicyName: bgit-transfer-session-boundary
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:AbortMultipartUpload
+                Resource: arn:aws:s3:::*/*
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                  - s3:CreateBucket
+                  - s3:HeadBucket
+                Resource: arn:aws:s3:::*
+  BrokerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub bgit-broker-${AWS::Region}
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: bgit-broker-table
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:Query
+                Resource:
+                  - !GetAtt BrokerTable.Arn
+                  - !GetAtt BrokerPullRequestTable.Arn
+              - Effect: Allow
+                Action:
+                  - sts:AssumeRole
+                  - sts:TagSession
+                Resource: !GetAtt BrokerTransferRole.Arn
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                  - s3:CreateBucket
+                  - s3:HeadBucket
+                Resource:
+                  - arn:aws:s3:::*
+                  - arn:aws:s3:::*/*
+  BrokerTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: bgit-broker-repos
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+  BrokerPullRequestTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: bgit-broker-prs
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: repo_id
+          AttributeType: S
+        - AttributeName: pr_id
+          AttributeType: N
+      KeySchema:
+        - AttributeName: repo_id
+          KeyType: HASH
+        - AttributeName: pr_id
+          KeyType: RANGE
+  BrokerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: bgit-broker
+      Runtime: nodejs22.x
+      Handler: index.handler
+      Role: !GetAtt BrokerRole.Arn
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref BrokerTable
+          PR_TABLE_NAME: !Ref BrokerPullRequestTable
+          TRANSFER_ROLE_ARN: !GetAtt BrokerTransferRole.Arn
+          BROKER_VERSION: {{BROKER_VERSION}}
+      Code:
+        ZipFile: |
+          const crypto = require("crypto");
+          const {DynamoDBClient, GetItemCommand, PutItemCommand, QueryCommand} = require("@aws-sdk/client-dynamodb");
+          const {S3Client, GetObjectCommand, PutObjectCommand, DeleteObjectCommand, ListObjectsV2Command, HeadBucketCommand, CreateBucketCommand} = require("@aws-sdk/client-s3");
+          const {STSClient, AssumeRoleCommand} = require("@aws-sdk/client-sts");
+          const db = new DynamoDBClient({});
+          const s3 = new S3Client({});
+          const sts = new STSClient({});
+          const table = process.env.TABLE_NAME;
+          const prTable = process.env.PR_TABLE_NAME;
+          const transferRoleArn = process.env.TRANSFER_ROLE_ARN;
+          const brokerVersion = process.env.BROKER_VERSION || "{{BROKER_VERSION}}";
+          const zero = "0000000000000000000000000000000000000000";
+          function response(statusCode, body) {
+            return {statusCode, headers: {"content-type": "application/json"}, body: JSON.stringify(body)};
+          }
+          function repoID(repo) {
+            if (repo && repo.logical) return ["logical", repo.logical].join(":");
+            return [repo.provider || "s3", repo.bucket, repo.prefix].join(":");
+          }
+          function docID(repo) {
+            return Buffer.from(repoID(repo)).toString("base64url");
+          }
+          function cleanName(value) {
+            return String(value || "repo").toLowerCase().replace(/[^a-z0-9.-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 40) || "repo";
+          }
+          function randomSuffix() {
+            return crypto.randomBytes(5).toString("hex");
+          }
+          async function loadRepo(repo) {
+            if (!repo || (!repo.logical && (!repo.bucket || !repo.prefix))) throw new Error("repo is required");
+            const id = docID(repo);
+            const out = await db.send(new GetItemCommand({TableName: table, Key: {id: {S: id}}}));
+            let data = {repo, keys: [], audit: []};
+            if (out.Item) data = JSON.parse(out.Item.data.S || "{}");
+            data.repo = data.repo || repo;
+            data.keys = data.keys || [];
+            data.audit = data.audit || [];
+            const owners = await loadOwners();
+            for (const owner of owners.data.keys || []) {
+              if (owner.role === "owner" && !data.keys.find((k) => normalizeKey(k.public_key) === normalizeKey(owner.public_key))) data.keys.push(owner);
+            }
+            return {id, data};
+          }
+          async function saveRepo(entry) {
+            await db.send(new PutItemCommand({TableName: table, Item: {id: {S: entry.id}, data: {S: JSON.stringify(entry.data)}}}));
+          }
+          function prKey(repoID, id) {
+            return {repo_id: {S: repoID}, pr_id: {N: String(Number(id))}};
+          }
+          async function savePR(entry, pr) {
+            await db.send(new PutItemCommand({TableName: prTable, Item: {...prKey(entry.id, pr.id), data: {S: JSON.stringify(pr)}}}));
+          }
+          async function loadPR(entry, id) {
+            const out = await db.send(new GetItemCommand({TableName: prTable, Key: prKey(entry.id, id)}));
+            if (!out.Item) return null;
+            return JSON.parse(out.Item.data.S || "{}");
+          }
+          async function listPRs(entry) {
+            const prs = [];
+            let startKey = undefined;
+            do {
+              const out = await db.send(new QueryCommand({
+                TableName: prTable,
+                KeyConditionExpression: "repo_id = :repo",
+                ExpressionAttributeValues: {":repo": {S: entry.id}},
+                ScanIndexForward: false,
+                ExclusiveStartKey: startKey
+              }));
+              for (const item of out.Items || []) prs.push(JSON.parse(item.data.S || "{}"));
+              startKey = out.LastEvaluatedKey;
+            } while (startKey);
+            return prs;
+          }
+          async function syncPRRecords(entry, known) {
+            const knownMap = known && typeof known === "object" ? known : {};
+            const prs = await listPRs(entry);
+            const present = new Set(prs.map((pr) => String(pr.id)));
+            const deleted = Object.keys(knownMap).filter((id) => !present.has(String(id))).map((id) => Number(id)).filter((id) => Number.isFinite(id));
+            return {
+              prs: prs.filter((pr) => String(pr.version || "") !== String(knownMap[String(pr.id)] || "")),
+              deleted,
+            };
+          }
+          async function loadOwners() {
+            const id = "_owners";
+            const out = await db.send(new GetItemCommand({TableName: table, Key: {id: {S: id}}}));
+            if (!out.Item) return {id, data: {keys: [], audit: []}};
+            const data = JSON.parse(out.Item.data.S || "{}");
+            data.keys = data.keys || [];
+            data.audit = data.audit || [];
+            return {id, data};
+          }
+          function audit(entry, event) {
+            entry.data.audit = (entry.data.audit || []).concat([{...event, at: new Date().toISOString()}]).slice(-500);
+          }
+          function readSSHString(buf, offset) {
+            const len = buf.readUInt32BE(offset);
+            const start = offset + 4;
+            return {value: buf.subarray(start, start + len), offset: start + len};
+          }
+          function header(event, name) {
+            const headers = event.headers || {};
+            return headers[name] || headers[name.toLowerCase()] || "";
+          }
+          function expectedMessage(rawBody) {
+            const digest = crypto.createHash("sha256").update(Buffer.from(rawBody || "{}")).digest("base64");
+            return Buffer.from("bgit-broker-v1\n" + digest).toString("base64");
+          }
+          function normalizeKey(key) {
+            return String(key || "").trim().split(/\s+/).slice(0, 2).join(" ");
+          }
+          function publicKeyObject(publicKey) {
+            const parts = normalizeKey(publicKey).split(/\s+/);
+            if (parts[0] !== "ssh-ed25519") return crypto.createPublicKey(publicKey);
+            const blob = Buffer.from(parts[1], "base64");
+            let parsed = readSSHString(blob, 0);
+            if (parsed.value.toString() !== "ssh-ed25519") throw new Error("unsupported SSH key algorithm");
+            parsed = readSSHString(blob, parsed.offset);
+            const derPrefix = Buffer.from("302a300506032b6570032100", "hex");
+            return crypto.createPublicKey({key: Buffer.concat([derPrefix, parsed.value]), format: "der", type: "spki"});
+          }
+          function signedKey(event, entry) {
+            const keys = (entry.data.keys || []).filter((k) => !k.suspended);
+            const publicKey = normalizeKey(header(event, "x-bgit-key"));
+            const message = String(header(event, "x-bgit-signature-message"));
+            const signature = String(header(event, "x-bgit-signature"));
+            if (!publicKey || !message || !signature || message !== expectedMessage(event.body)) return null;
+            const key = keys.find((k) => normalizeKey(k.public_key) === publicKey);
+            if (!key) return null;
+            const parsed = readSSHString(Buffer.from(signature, "base64"), 0);
+            const alg = parsed.value.toString();
+            const sig = readSSHString(Buffer.from(signature, "base64"), parsed.offset).value;
+            const verifyAlg = alg === "ssh-ed25519" ? null : "sha256";
+            if (!crypto.verify(verifyAlg, Buffer.from(message, "base64"), publicKeyObject(publicKey), sig)) return null;
+            return key;
+          }
+          function verifySignature(event, entry) {
+            const adminKeys = (entry.data.keys || []).filter((k) => (k.role === "admin" || k.role === "owner") && !k.suspended);
+            if (adminKeys.length === 0) return true;
+            const key = signedKey(event, entry);
+            return !!key && (key.role === "admin" || key.role === "owner");
+          }
+          function roleAllows(role, operation) {
+            if (role === "owner" || role === "admin") return true;
+            if (operation === "read") return ["read", "triage", "developer", "maintainer"].includes(role);
+            if (operation === "write") return ["developer", "maintainer"].includes(role);
+            if (operation === "merge") return ["maintainer"].includes(role);
+            return false;
+          }
+          function validRole(role) {
+            return ["owner", "admin", "maintainer", "developer", "triage", "read"].includes(role);
+          }
+          function normalizeRole(role) {
+            return role === "write" ? "developer" : role;
+          }
+          function requireAdmin(event, entry) {
+            if (!verifySignature(event, entry)) throw Object.assign(new Error("admin SSH signature required"), {statusCode: 403});
+          }
+          function requireOperation(event, entry, operation) {
+            const key = signedKey(event, entry);
+            if (!key || !roleAllows(key.role, operation)) throw Object.assign(new Error(operation + " SSH signature required"), {statusCode: 403});
+            return key;
+          }
+          function cleanObjectPath(value) {
+            const path = String(value || "").replace(/^\/+/, "");
+            if (path.includes("\0") || path.includes("..")) throw new Error("invalid object path");
+            return path;
+          }
+          function objectName(repo, objectPath) {
+            const prefix = String(repo.prefix || "").replace(/^\/+|\/+$/g, "");
+            const path = cleanObjectPath(objectPath);
+            return prefix ? prefix + "/" + path : path;
+          }
+          async function ensurePhysicalRepo(entry) {
+            const repo = entry.data.repo || {};
+            if (repo.bucket && repo.prefix) return repo;
+            const logical = cleanName(repo.logical || repo.prefix || "repo.git");
+            const suffix = entry.data.bucket_suffix || randomSuffix();
+            const bucket = `bgit-${logical.replace(/\.git$/, "")}-${suffix}`.slice(0, 63).replace(/\.+$/g, "");
+            try {
+              await s3.send(new HeadBucketCommand({Bucket: bucket}));
+            } catch (err) {
+              await s3.send(new CreateBucketCommand({Bucket: bucket}));
+            }
+            entry.data.bucket_suffix = suffix;
+            entry.data.repo = {...repo, provider: "s3", bucket, prefix: "repo.git"};
+            await saveRepo(entry);
+            return entry.data.repo;
+          }
+          async function streamToBuffer(stream) {
+            const chunks = [];
+            for await (const chunk of stream) chunks.push(Buffer.from(chunk));
+            return Buffer.concat(chunks);
+          }
+          async function readObject(repo, objectPath) {
+            const out = await s3.send(new GetObjectCommand({Bucket: repo.bucket, Key: objectName(repo, objectPath)}));
+            const data = await streamToBuffer(out.Body);
+            return data.toString("base64");
+          }
+          async function writeTextObject(repo, objectPath, value) {
+            await s3.send(new PutObjectCommand({Bucket: repo.bucket, Key: objectName(repo, objectPath), Body: value}));
+          }
+          async function deleteObject(repo, objectPath) {
+            await s3.send(new DeleteObjectCommand({Bucket: repo.bucket, Key: objectName(repo, objectPath)}));
+          }
+          async function listObjects(repo, prefix) {
+            const repoPrefix = String(repo.prefix || "").replace(/^\/+|\/+$/g, "");
+            const queryPrefix = objectName(repo, prefix);
+            const paths = [];
+            let token = undefined;
+            do {
+              const out = await s3.send(new ListObjectsV2Command({Bucket: repo.bucket, Prefix: queryPrefix, ContinuationToken: token}));
+              for (const item of out.Contents || []) {
+                const strip = repoPrefix ? repoPrefix + "/" : "";
+                paths.push(item.Key.startsWith(strip) ? item.Key.slice(strip.length) : item.Key);
+              }
+              token = out.NextContinuationToken;
+            } while (token);
+            return paths;
+          }
+          function policyFor(repo, objectPath, operation) {
+            const key = objectName(repo, objectPath);
+            const actions = operation === "read" ? ["s3:GetObject"] : operation === "delete" ? ["s3:DeleteObject"] : ["s3:PutObject", "s3:AbortMultipartUpload"];
+            return JSON.stringify({Version: "2012-10-17", Statement: [
+              {Effect: "Allow", Action: actions, Resource: `arn:aws:s3:::${repo.bucket}/${key}`},
+              {Effect: "Allow", Action: ["s3:ListBucket"], Resource: `arn:aws:s3:::${repo.bucket}`, Condition: {StringLike: {"s3:prefix": [`${repo.prefix}/*`]}}}
+            ]});
+          }
+          async function objectCapability(repo, objectPath, operation, key) {
+            const out = await sts.send(new AssumeRoleCommand({
+              RoleArn: transferRoleArn,
+              RoleSessionName: `bgit-${operation}-${Date.now()}`,
+              DurationSeconds: 900,
+              Policy: policyFor(repo, objectPath, operation),
+              Tags: [
+                {Key: "bgit-operation", Value: operation},
+                {Key: "bgit-user", Value: String(key.user || "unknown").slice(0, 128)},
+                {Key: "bgit-repo", Value: String(repo.prefix || "repo").slice(0, 128)}
+              ]
+            }));
+            return {
+              provider: "s3", mode: "sts", bucket: repo.bucket, prefix: repo.prefix,
+              object: objectName(repo, objectPath), region: process.env.AWS_REGION,
+              expires_in: 900,
+              credentials: {
+                access_key_id: out.Credentials.AccessKeyId,
+                secret_access_key: out.Credentials.SecretAccessKey,
+                session_token: out.Credentials.SessionToken
+              }
+            };
+          }
+          function protectionFor(data, ref) {
+            return (data.protections || []).find((p) => p.ref === ref);
+          }
+          function assertRefAllowed(data, ref, key, opts) {
+            const protection = protectionFor(data, ref);
+            if (!protection || !protection.require_pr) return;
+            if (opts && opts.fromPR) return;
+            if (protection.allow_overrides && key && (key.role === "owner" || key.role === "admin")) return;
+            throw Object.assign(new Error(`protected branch ${ref} requires a pull request`), {statusCode: 403});
+          }
+          function nextPRID(data) {
+            data.next_pr_id = Number(data.next_pr_id || 1);
+            return data.next_pr_id++;
+          }
+          function findPR(data, id) {
+            return (data.prs || []).find((pr) => Number(pr.id) === Number(id));
+          }
+          function nextPRNoteID(pr) {
+            pr.next_note_id = Number(pr.next_note_id || 1);
+            return pr.next_note_id++;
+          }
+          function bumpPRVersion(data, pr) {
+            const now = new Date().toISOString();
+            data.next_pr_version = Number(data.next_pr_version || 1);
+            pr.version = `${data.next_pr_version++}-${crypto.randomBytes(4).toString("hex")}`;
+            pr.updated_at = now;
+            return pr;
+          }
+          function ensurePRVersions(data) {
+            let changed = false;
+            for (const pr of data.prs || []) {
+              if (!pr.version) {
+                bumpPRVersion(data, pr);
+                changed = true;
+              }
+            }
+            return changed;
+          }
+          function syncPRs(data, known) {
+            const knownMap = known && typeof known === "object" ? known : {};
+            return (data.prs || []).filter((pr) => String(pr.version || "") !== String(knownMap[String(pr.id)] || ""));
+          }
+          function countApprovals(pr) {
+            const latest = new Map();
+            for (const review of pr.reviews || []) {
+              if (review.user) latest.set(review.user, review.state);
+            }
+            return Array.from(latest.values()).filter((state) => state === "approved").length;
+          }
+          async function updateRefCAS(repo, ref, oldHash, newHash, key, opts = {}) {
+            const id = docID(repo);
+            const out = await db.send(new GetItemCommand({TableName: table, Key: {id: {S: id}}}));
+            const oldData = out.Item && out.Item.data ? out.Item.data.S : "";
+            const data = oldData ? JSON.parse(oldData || "{}") : {repo, keys: [], refs: {}, audit: []};
+            data.repo = data.repo || repo;
+            data.keys = data.keys || [];
+            data.refs = data.refs || {};
+            data.protections = data.protections || [];
+            assertRefAllowed(data, ref, key, opts);
+            const current = Object.prototype.hasOwnProperty.call(data.refs, ref) ? data.refs[ref] : oldHash;
+            if (current !== oldHash) throw Object.assign(new Error("stale ref"), {statusCode: 409});
+            if (newHash === zero) delete data.refs[ref];
+            else data.refs[ref] = newHash;
+            audit({data}, {type: "ref_update", ref, old: oldHash, new: newHash});
+            const item = {id: {S: id}, data: {S: JSON.stringify(data)}};
+            const input = {TableName: table, Item: item};
+            if (oldData) {
+              input.ConditionExpression = "#data = :old";
+              input.ExpressionAttributeNames = {"#data": "data"};
+              input.ExpressionAttributeValues = {":old": {S: oldData}};
+            } else {
+              input.ConditionExpression = "attribute_not_exists(id)";
+            }
+            try {
+              await db.send(new PutItemCommand(input));
+            } catch (err) {
+              if (err.name === "ConditionalCheckFailedException") throw Object.assign(new Error("stale ref"), {statusCode: 409});
+              throw err;
+            }
+          }
+          exports.handler = async (event) => {
+            const path = event.rawPath || "/";
+            const method = event.requestContext && event.requestContext.http ? event.requestContext.http.method : "GET";
+            const body = event.body ? JSON.parse(event.body) : {};
+            try {
+              if (path === "/" || path === "/health") return response(200, {ok: true, service: "bgit-broker", version: brokerVersion});
+              if (path === "/owners/upsert" && method === "POST") {
+                const entry = await loadOwners();
+                if (!verifySignature(event, entry)) throw Object.assign(new Error("owner SSH signature required"), {statusCode: 403});
+                const user = body.user || "owner";
+                const role = normalizeRole(body.role || "owner");
+                if (role !== "owner") throw new Error("owner bootstrap only accepts owner role");
+                for (const publicKey of body.public_keys || []) {
+                  if (!entry.data.keys.find((k) => normalizeKey(k.public_key) === normalizeKey(publicKey))) entry.data.keys.push({user, role, public_key: publicKey, source: body.source || "", suspended: false});
+                }
+                await saveRepo(entry);
+                return response(200, {ok: true});
+              }
+              if (path === "/repos/upsert" && method === "POST") {
+                const entry = await loadRepo(body.repo);
+                requireAdmin(event, entry);
+                entry.data.repo = {...(entry.data.repo || {}), ...(body.repo || {})};
+                if (body.repo && body.repo.logical && !entry.data.repo.bucket) await ensurePhysicalRepo(entry);
+                const user = body.admin_user || "admin";
+                const role = normalizeRole(body.role || "admin");
+                if (!validRole(role)) throw new Error("invalid role");
+                for (const publicKey of body.public_keys || []) {
+                  if (!entry.data.keys.find((k) => normalizeKey(k.public_key) === normalizeKey(publicKey))) entry.data.keys.push({user, role, public_key: publicKey, source: body.source || "", suspended: false});
+                }
+                audit(entry, {type: "repo_upsert", user});
+                await saveRepo(entry);
+                return response(200, {ok: true, repo: entry.data.repo, bucket_suffix: entry.data.bucket_suffix});
+              }
+              if (path === "/keys/list" && method === "POST") {
+                const entry = await loadRepo(body.repo);
+                requireAdmin(event, entry);
+                return response(200, {keys: entry.data.keys});
+              }
+              if (path === "/keys/add" && method === "POST") {
+                const entry = await loadRepo(body.repo);
+                requireAdmin(event, entry);
+                const user = body.user || "admin";
+                const role = normalizeRole(body.role || "read");
+                if (!validRole(role) || role === "owner") throw new Error("invalid role");
+                for (const publicKey of body.public_keys || []) {
+                  if (!entry.data.keys.find((k) => normalizeKey(k.public_key) === normalizeKey(publicKey))) entry.data.keys.push({user, role, public_key: publicKey, source: body.source || "", suspended: false});
+                }
+                await saveRepo(entry);
+                return response(200, {ok: true});
+              }
+              if ((path === "/keys/remove" || path === "/keys/suspend") && method === "POST") {
+                const entry = await loadRepo(body.repo);
+                requireAdmin(event, entry);
+                const key = String(body.key || "").trim();
+                const normalized = normalizeKey(key);
+                const match = (k) => normalizeKey(k.public_key) === normalized || k.public_key.includes(key);
+                if (entry.data.keys.some((k) => match(k) && k.role === "owner")) throw Object.assign(new Error("owners cannot be removed or suspended"), {statusCode: 403});
+                if (path === "/keys/remove") entry.data.keys = entry.data.keys.filter((k) => !match(k));
+                else for (const item of entry.data.keys) if (match(item)) item.suspended = true;
+                await saveRepo(entry);
+                return response(200, {ok: true});
+              }
+              if (path === "/owners/transfer" && method === "POST") {
+                const entry = await loadRepo(body.repo);
+                const key = signedKey(event, entry);
+                if (!key || key.role !== "owner") throw Object.assign(new Error("owner SSH signature required"), {statusCode: 403});
+                const target = String(body.key || "").trim();
+                const normalized = normalizeKey(target);
+                const match = (k) => normalizeKey(k.public_key) === normalized || k.public_key.includes(target);
+                let changed = false;
+                for (const item of entry.data.keys) {
+                  if (match(item)) {
+                    item.role = "owner";
+                    item.user = body.user || item.user;
+                    changed = true;
+                  } else if (item.role === "owner" && normalizeKey(item.public_key) === normalizeKey(key.public_key)) {
+                    item.role = "admin";
+                  }
+                }
+                if (!changed) throw new Error("target key not found");
+                audit(entry, {type: "owner_transfer", user: body.user || ""});
+                await saveRepo(entry);
+                return response(200, {ok: true});
+              }
+              if (path === "/protection/list" && method === "POST") {
+                const entry = await loadRepo(body.repo);
+                requireAdmin(event, entry);
+                return response(200, {protections: entry.data.protections || []});
+              }
+              if (path === "/protection/upsert" && method === "POST") {
+                const entry = await loadRepo(body.repo);
+                requireAdmin(event, entry);
+                entry.data.protections = (entry.data.protections || []).filter((p) => p.ref !== body.ref);
+                entry.data.protections.push({ref: body.ref, require_pr: body.require_pr !== false, allow_overrides: !!body.allow_overrides});
+                audit(entry, {type: "protection_upsert", ref: body.ref});
+                await saveRepo(entry);
+                return response(200, {ok: true});
+              }
+              if (path === "/protection/remove" && method === "POST") {
+                const entry = await loadRepo(body.repo);
+                requireAdmin(event, entry);
+                entry.data.protections = (entry.data.protections || []).filter((p) => p.ref !== body.ref);
+                audit(entry, {type: "protection_remove", ref: body.ref});
+                await saveRepo(entry);
+                return response(200, {ok: true});
+              }
+              if (path === "/prs/create" && method === "POST") {
+                const entry = await loadRepo(body.repo);
+                const key = requireOperation(event, entry, "write");
+                entry.data.refs = entry.data.refs || {};
+                const pr = {...(body.pr || {})};
+                pr.id = nextPRID(entry.data);
+                pr.status = "open";
+                pr.author = key.user;
+                pr.approvals = pr.approvals || 0;
+                pr.checks = pr.checks || [];
+                pr.head = entry.data.refs[pr.source] || "";
+                bumpPRVersion(entry.data, pr);
+                audit(entry, {type: "pr_create", id: pr.id, source: pr.source, target: pr.target, user: key.user});
+                await saveRepo(entry);
+                await savePR(entry, pr);
+                return response(200, {pr});
+              }
+              if (path === "/prs/list" && method === "POST") {
+                const entry = await loadRepo(body.repo);
+                requireOperation(event, entry, "read");
+                return response(200, {prs: await listPRs(entry)});
+              }
+              if (path === "/prs/sync" && method === "POST") {
+                const entry = await loadRepo(body.repo);
+                requireOperation(event, entry, "read");
+                return response(200, await syncPRRecords(entry, body.known || {}));
+              }
+              if (path === "/prs/view" && method === "POST") {
+                const entry = await loadRepo(body.repo);
+                requireOperation(event, entry, "read");
+                const pr = await loadPR(entry, body.id);
+                if (!pr) throw Object.assign(new Error("pull request not found"), {statusCode: 404});
+                return response(200, {pr});
+              }
+              if (path === "/prs/close" && method === "POST") {
+                const entry = await loadRepo(body.repo);
+                const key = requireOperation(event, entry, "write");
+                const pr = await loadPR(entry, body.id);
+                if (!pr) throw Object.assign(new Error("pull request not found"), {statusCode: 404});
+                pr.status = "closed";
+                pr.closed_by = key.user;
+                pr.closed_at = new Date().toISOString();
+                bumpPRVersion(entry.data, pr);
+                audit(entry, {type: "pr_close", id: pr.id, user: key.user});
+                await saveRepo(entry);
+                await savePR(entry, pr);
+                return response(200, {ok: true, pr});
+              }
+              if (path === "/prs/comment" && method === "POST") {
+                const entry = await loadRepo(body.repo);
+                const key = requireOperation(event, entry, "read");
+                const pr = await loadPR(entry, body.id);
+                if (!pr) throw Object.assign(new Error("pull request not found"), {statusCode: 404});
+                const comment = String(body.comment || "").trim();
+                if (!comment) throw Object.assign(new Error("comment is required"), {statusCode: 400});
+                pr.comments = pr.comments || [];
+                pr.comments.push({id: nextPRNoteID(pr), user: key.user, body: comment, at: new Date().toISOString()});
+                bumpPRVersion(entry.data, pr);
+                audit(entry, {type: "pr_comment", id: pr.id, user: key.user});
+                await saveRepo(entry);
+                await savePR(entry, pr);
+                return response(200, {ok: true, pr});
+              }
+              if (path === "/prs/review" && method === "POST") {
+                const entry = await loadRepo(body.repo);
+                const key = requireOperation(event, entry, "write");
+                const pr = await loadPR(entry, body.id);
+                if (!pr) throw Object.assign(new Error("pull request not found"), {statusCode: 404});
+                const state = String(body.review || "").trim();
+                if (!["approved", "changes_requested"].includes(state)) throw Object.assign(new Error("unsupported review state"), {statusCode: 400});
+                pr.reviews = pr.reviews || [];
+                pr.reviews.push({id: nextPRNoteID(pr), user: key.user, body: String(body.comment || "").trim(), state, at: new Date().toISOString()});
+                pr.approvals = countApprovals(pr);
+                bumpPRVersion(entry.data, pr);
+                audit(entry, {type: "pr_review", id: pr.id, user: key.user, state});
+                await saveRepo(entry);
+                await savePR(entry, pr);
+                return response(200, {ok: true, pr});
+              }
+              if (path === "/prs/merge" && method === "POST") {
+                const entry = await loadRepo(body.repo);
+                const key = requireOperation(event, entry, "merge");
+                const pr = await loadPR(entry, body.id);
+                if (!pr) throw Object.assign(new Error("pull request not found"), {statusCode: 404});
+                if (pr.status !== "open") throw new Error("pull request is not open");
+                const newHash = (entry.data.refs || {})[pr.source] || pr.head;
+                if (!newHash) throw new Error("pull request source ref has no head");
+                const oldHash = (entry.data.refs || {})[pr.target] || zero;
+                await updateRefCAS(body.repo, pr.target, oldHash, newHash, key, {fromPR: true});
+                const repo = await ensurePhysicalRepo(entry);
+                await writeTextObject(repo, pr.target, newHash + "\n");
+                entry.data.refs = entry.data.refs || {};
+                entry.data.refs[pr.target] = newHash;
+                pr.status = "merged";
+                pr.merged_by = key.user;
+                pr.merged_at = new Date().toISOString();
+                bumpPRVersion(entry.data, pr);
+                if (body.delete_branch && pr.source && pr.source !== pr.target) {
+                  delete entry.data.refs[pr.source];
+                  await deleteObject(repo, pr.source);
+                  audit(entry, {type: "branch_delete", ref: pr.source, from_pr: pr.id, user: key.user});
+                }
+                await saveRepo(entry);
+                await savePR(entry, pr);
+                return response(200, {ok: true, pr});
+              }
+              if (path === "/auth/check" && method === "POST") {
+                const entry = await loadRepo(body.repo);
+                const key = signedKey(event, entry);
+                const operation = body.operation || "";
+                const allowed = !!key && roleAllows(key.role, operation);
+                return response(200, {allowed, user: key && key.user, role: key && key.role});
+              }
+              if (path === "/objects/capability" && method === "POST") {
+                const entry = await loadRepo(body.repo);
+                const operation = body.operation || "read";
+                const key = requireOperation(event, entry, operation === "read" ? "read" : "write");
+                const repo = await ensurePhysicalRepo(entry);
+                const capability = await objectCapability(repo, body.path, operation, key);
+                audit(entry, {type: "capability_issued", operation, path: body.path, user: key.user, role: key.role});
+                await saveRepo(entry);
+                return response(200, capability);
+              }
+              if (path === "/objects/read" && method === "POST") {
+                const entry = await loadRepo(body.repo);
+                requireOperation(event, entry, "read");
+                const repo = await ensurePhysicalRepo(entry);
+                return response(200, {data: await readObject(repo, body.path)});
+              }
+              if (path === "/objects/list" && method === "POST") {
+                const entry = await loadRepo(body.repo);
+                requireOperation(event, entry, "read");
+                const repo = await ensurePhysicalRepo(entry);
+                return response(200, {paths: await listObjects(repo, body.prefix)});
+              }
+              if (path === "/refs/update" && method === "POST") {
+                const entry = await loadRepo(body.repo);
+                const key = requireOperation(event, entry, "write");
+                await updateRefCAS(body.repo, body.ref, body.old, body.new, key, {override: !!body.override});
+                return response(200, {ok: true});
+              }
+              return response(404, {error: "unknown broker endpoint"});
+            } catch (err) {
+              return response(err.statusCode || 500, {error: err.message || String(err)});
+            }
+          };
+  BrokerFunctionUrl:
+    Type: AWS::Lambda::Url
+    Properties:
+      TargetFunctionArn: !Ref BrokerFunction
+      AuthType: NONE
+  BrokerFunctionUrlPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref BrokerFunction
+      Action: lambda:InvokeFunctionUrl
+      Principal: '*'
+      FunctionUrlAuthType: NONE
+  BrokerFunctionInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref BrokerFunction
+      Action: lambda:InvokeFunction
+      Principal: '*'
+      InvokedViaFunctionUrl: true
+Outputs:
+  BrokerUrl:
+    Value: !GetAtt BrokerFunctionUrl.FunctionUrl

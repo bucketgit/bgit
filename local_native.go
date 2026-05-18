@@ -555,8 +555,8 @@ func (r *localRepository) commit(args []string, stdout io.Writer) error {
 		}
 	}
 	after := idx.treeFiles()
-	authorName := firstNonEmpty(os.Getenv("GIT_AUTHOR_NAME"), r.configValue("user.name"), "bgit")
-	authorEmail := firstNonEmpty(os.Getenv("GIT_AUTHOR_EMAIL"), r.configValue("user.email"), "bgit@example.com")
+	authorName := firstNonEmpty(os.Getenv("GIT_AUTHOR_NAME"), r.identityValue("user.name"), defaultBucketGitIdentityName)
+	authorEmail := firstNonEmpty(os.Getenv("GIT_AUTHOR_EMAIL"), r.identityValue("user.email"), defaultBucketGitIdentityEmail())
 	committerName := firstNonEmpty(os.Getenv("GIT_COMMITTER_NAME"), authorName)
 	committerEmail := firstNonEmpty(os.Getenv("GIT_COMMITTER_EMAIL"), authorEmail)
 	now := time.Now()
@@ -620,21 +620,33 @@ func (r *localRepository) checkout(cmd string, args []string, stdout io.Writer) 
 		if err := r.writeRef(branchRef(opts.target), hash); err != nil {
 			return err
 		}
+		if err := setGitBranchTrackingIfOrigin(r.worktree, opts.target); err != nil {
+			return err
+		}
+		if err := r.checkoutCommit(hash); err != nil {
+			return err
+		}
 		if err := r.setHEADSymbolic(branchRef(opts.target)); err != nil {
 			return err
 		}
 		fmt.Fprintf(stdout, "Switched to a new branch '%s'\n", opts.target)
-		return r.checkoutCommit(hash)
+		return nil
 	}
 	if hash, err := r.resolveRevision(branchRef(opts.target)); err == nil {
+		if err := r.checkoutCommit(hash); err != nil {
+			return err
+		}
 		if err := r.setHEADSymbolic(branchRef(opts.target)); err != nil {
 			return err
 		}
 		fmt.Fprintf(stdout, "Switched to branch '%s'\n", opts.target)
-		return r.checkoutCommit(hash)
+		return nil
 	}
 	hash, err := r.resolveRevision(opts.target)
 	if err != nil {
+		return err
+	}
+	if err := r.checkoutCommit(hash); err != nil {
 		return err
 	}
 	if err := os.WriteFile(filepath.Join(r.gitDir, "HEAD"), []byte(hash+"\n"), 0o644); err != nil {
@@ -643,7 +655,7 @@ func (r *localRepository) checkout(cmd string, args []string, stdout io.Writer) 
 	if commit, err := r.commitObject(hash); err == nil {
 		fmt.Fprintf(stdout, "HEAD is now at %s %s\n", hash[:7], commit.subject)
 	}
-	return r.checkoutCommit(hash)
+	return nil
 }
 
 func (r *localRepository) pathExistsInHead(path string) bool {
@@ -714,7 +726,7 @@ func (r *localRepository) checkoutPaths(source string, paths []string) error {
 }
 
 func (r *localRepository) branch(args []string, stdout io.Writer) error {
-	if len(args) == 0 {
+	if len(args) == 0 || (len(args) == 1 && args[0] == "-a") {
 		branches, err := r.listRefs("refs/heads")
 		if err != nil {
 			return err
@@ -728,6 +740,15 @@ func (r *localRepository) branch(args []string, stdout io.Writer) error {
 			}
 			fmt.Fprintln(stdout, prefix+short)
 		}
+		if len(args) == 1 {
+			remotes, err := r.listRefs("refs/remotes")
+			if err != nil {
+				return err
+			}
+			for _, name := range remotes {
+				fmt.Fprintln(stdout, "  "+strings.TrimPrefix(name, "refs/"))
+			}
+		}
 		return nil
 	}
 	if args[0] == "-d" || args[0] == "-D" {
@@ -737,6 +758,9 @@ func (r *localRepository) branch(args []string, stdout io.Writer) error {
 		ref := branchRef(args[1])
 		hash, _ := r.readRef(ref)
 		if err := r.deleteRef(ref); err != nil {
+			return err
+		}
+		if err := unsetGitBranchTracking(r.worktree, args[1]); err != nil {
 			return err
 		}
 		short := hash
@@ -757,7 +781,10 @@ func (r *localRepository) branch(args []string, stdout io.Writer) error {
 	if err != nil {
 		return err
 	}
-	return r.writeRef(branchRef(args[0]), hash)
+	if err := r.writeRef(branchRef(args[0]), hash); err != nil {
+		return err
+	}
+	return setGitBranchTrackingIfOrigin(r.worktree, args[0])
 }
 
 func (r *localRepository) tag(args []string, stdout io.Writer) error {
@@ -814,8 +841,8 @@ func (r *localRepository) tag(args []string, stdout io.Writer) error {
 			return errors.New("annotated tags require -m")
 		}
 		now := time.Now()
-		name := firstNonEmpty(r.configValue("user.name"), "bgit")
-		email := firstNonEmpty(r.configValue("user.email"), "bgit@example.com")
+		name := firstNonEmpty(r.identityValue("user.name"), defaultBucketGitIdentityName)
+		email := firstNonEmpty(r.identityValue("user.email"), defaultBucketGitIdentityEmail())
 		var buf bytes.Buffer
 		fmt.Fprintf(&buf, "object %s\n", hash)
 		fmt.Fprintf(&buf, "type commit\n")
@@ -1150,40 +1177,76 @@ func (r *localRepository) checkoutCommit(hash string) error {
 	if err != nil {
 		return err
 	}
-	files := map[string]string{}
-	if err := r.collectTreeFiles(commit.tree, "", files); err != nil {
+	files := map[string]treeFile{}
+	if err := r.collectTreeFileEntries(commit.tree, "", files); err != nil {
 		return err
 	}
 	current, err := r.readIndex()
 	if err != nil {
 		return err
 	}
+	dirty, err := r.dirtyTrackedFiles(current)
+	if err != nil {
+		return err
+	}
+	var conflicts []string
 	for _, entry := range current.entries {
-		if _, ok := files[entry.path]; !ok {
+		target, ok := files[entry.path]
+		_, isDirty := dirty[entry.path]
+		if isDirty && (!ok || target.hash != entry.hash) {
+			conflicts = append(conflicts, entry.path)
+			continue
+		}
+		if !ok && !isDirty {
 			err := os.Remove(filepath.Join(r.worktree, filepath.FromSlash(entry.path)))
 			if err != nil && !errors.Is(err, fs.ErrNotExist) {
 				return err
 			}
 		}
 	}
+	if len(conflicts) > 0 {
+		sort.Strings(conflicts)
+		return checkoutLocalChangesError(conflicts)
+	}
 	idx := gitIndex{}
-	for path, blobHash := range files {
-		obj, err := r.storeObject(blobHash)
+	for path, meta := range files {
+		if _, isDirty := dirty[path]; !isDirty {
+			if err := r.writeBlobToWorktree(meta.hash, path); err != nil {
+				return err
+			}
+		}
+		idx.entries = append(idx.entries, indexEntry{path: path, hash: meta.hash, mode: meta.mode})
+	}
+	idx.sort()
+	return r.writeIndex(idx)
+}
+
+func (r *localRepository) dirtyTrackedFiles(idx gitIndex) (map[string]string, error) {
+	dirty := map[string]string{}
+	for _, entry := range idx.entries {
+		hash, err := r.writeBlobFromWorktree(entry.path)
+		if errors.Is(err, fs.ErrNotExist) {
+			dirty[entry.path] = ""
+			continue
+		}
 		if err != nil {
-			return err
+			return nil, err
 		}
-		target := filepath.Join(r.worktree, filepath.FromSlash(path))
-		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
-			return err
-		}
-		if err := os.WriteFile(target, obj.data, 0o644); err != nil {
-			return err
-		}
-		if err := r.addPathToIndex(&idx, path); err != nil {
-			return err
+		if hash != entry.hash {
+			dirty[entry.path] = hash
 		}
 	}
-	return r.writeIndex(idx)
+	return dirty, nil
+}
+
+func checkoutLocalChangesError(paths []string) error {
+	var b strings.Builder
+	b.WriteString("Your local changes to the following files would be overwritten by checkout:\n")
+	for _, path := range paths {
+		fmt.Fprintf(&b, "\t%s\n", path)
+	}
+	b.WriteString("Please commit your changes or stash them before you switch branches.")
+	return errors.New(b.String())
 }
 
 func (r *localRepository) commitObject(hash string) (commitObject, error) {

@@ -6,7 +6,9 @@ require (
 	cloud.google.com/go/iam v1.1.12
 	cloud.google.com/go/storage v1.43.0
 	golang.org/x/oauth2 v0.22.0
+	golang.org/x/term v0.22.0
 	google.golang.org/api v0.191.0
+	gopkg.in/yaml.v3 v3.0.1
 )
 
 require (

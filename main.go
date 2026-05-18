@@ -21,6 +21,7 @@ import (
 
 const defaultBranch = "main"
 const defaultAuthMode = "gcloud"
+const brokerVersion = "1.0.0-dev"
 
 var version = "dev"
 
@@ -30,8 +31,12 @@ type config struct {
 	prefix                      string
 	branch                      string
 	origin                      string
+	brokerURL                   string
+	logicalRepo                 string
+	region                      string
 	auth                        string
 	gcloudConfiguration         string
+	direct                      bool
 	authExplicit                bool
 	gcloudConfigurationExplicit bool
 	versionRequested            bool
@@ -77,29 +82,189 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 	if isUnsupportedCommand(cmd) && !(cmd == "show" && explicitBucket) {
 		return unsupportedCommand(cmd)
 	}
+	if cmd == "origin" || cmd == "remote" {
+		return fmt.Errorf("bgit %s is direct bucket configuration; use bgit direct %s", cmd, strings.Join(append([]string{cmd}, cmdArgs...), " "))
+	}
+	if cmd == "direct" {
+		cfg.direct = true
+		return directCommand(context.Background(), cfg, cmdArgs, stdin, stdout)
+	}
+	if cmd == "admin" {
+		return brokerAdminCommandWithInput(cfg, cmdArgs, stdin, stdout)
+	}
+	if cmd == "ssh" {
+		return sshCommand(cfg, cmdArgs, stdout, stderr)
+	}
+	if cmd == "import-gh-user" || cmd == "create-gcloud-profile" || cmd == "create-aws-profile" {
+		return fmt.Errorf("unknown command %q", cmd)
+	}
+	if cmd == "setup" {
+		return setupCommand(context.Background(), cfg, cmdArgs, stdin, stdout)
+	}
+	if cmd == "broker" {
+		return brokerCommand(context.Background(), cfg, cmdArgs, stdin, stdout)
+	}
+	if cmd == "pr" {
+		return prCommand(cmdArgs, stdin, stdout)
+	}
+	if cmd == "web" {
+		return webCommand(context.Background(), cfg, cmdArgs, stdout)
+	}
+	if cmd == "config" && configArgsAreGlobal(cmdArgs) {
+		return globalConfigCommand(cmdArgs, stdout)
+	}
+	if isLocalGitCommand(cmd) || (!explicitBucket && isPreferLocalGitCommand(cmd)) {
+		return nativeLocalCommand(cmd, cmdArgs, stdout)
+	}
+	if cfg.authExplicit {
+		return errors.New("--auth is only supported with bgit direct")
+	}
+	if explicitBucket {
+		return errors.New("direct bucket operations require bgit direct; run bgit direct help")
+	}
+
+	if cmd == "clone" {
+		cmdArgs = mergeBrokerSelectionArgs(cmdArgs, cfg)
+		return brokerCloneCommand(cmdArgs, stdin, stdout)
+	}
+	if cmd == "init" {
+		cmdArgs = mergeBrokerSelectionArgs(cmdArgs, cfg)
+		return brokerInitCommand(cmdArgs, stdin, stdout)
+	}
+	if cfg.bucket == "" {
+		localCfg, err := readLocalConfig(".")
+		if err == nil {
+			cfg = mergeConfig(cfg, localCfg)
+		}
+	}
+	if !cfg.direct && cfg.gcloudConfigurationExplicit && isNativeRemoteCommand(cmd) {
+		if err := applyExplicitBrokerProfileSelection(&cfg, cmd); err != nil {
+			return err
+		}
+	}
+	if cfg.bucket == "" && cfg.brokerURL == "" {
+		if cmd == "push" {
+			return missingOriginError()
+		}
+		return errors.New("--bucket is required outside a bucketgit checkout")
+	}
+
+	ctx := context.Background()
+	store, closeStore, err := newRemoteStore(ctx, cfg, isReadOnlyRemoteCommand(cmd))
+	if err != nil {
+		return fmt.Errorf("create remote store: %w", err)
+	}
+	defer closeStore()
+
+	if isNativeRemoteCommand(cmd) {
+		if cfg.brokerURL == "" && (commandCreatesBucket(cmd) || cmd == "push") {
+			if err := ensureBucket(ctx, cfg); err != nil {
+				return err
+			}
+		}
+		repo := openNativeGitRepo(store, cfg)
+		switch cmd {
+		case "init":
+			return repo.initWorktree(ctx, cmdArgs, stdout)
+		case "fetch":
+			return repo.fetch(ctx, cmdArgs, stdout)
+		case "pull":
+			return repo.pull(ctx, cmdArgs, stdout)
+		case "push":
+			if err := maybeConfigureIdentityBeforePush(stdin, stdout); err != nil {
+				return err
+			}
+			return repo.push(ctx, cmdArgs, stdout)
+		case "ls-remote":
+			return repo.lsRemote(ctx, cmdArgs, stdout)
+		case "ls", "list":
+			return repo.listFiles(ctx, cmdArgs, stdout)
+		case "cat", "show":
+			return repo.catFile(ctx, cmdArgs, stdout)
+		case "log":
+			return repo.log(ctx, cmdArgs, stdout)
+		case "put":
+			return repo.putFile(ctx, cmdArgs, stdin, stdout)
+		}
+	}
+
+	return fmt.Errorf("unknown command %q", cmd)
+}
+
+func applyExplicitBrokerProfileSelection(cfg *config, cmd string) error {
+	path, err := defaultGlobalConfigPath()
+	if err != nil {
+		return err
+	}
+	global, err := readGlobalConfig(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	profiles := brokerProfilesFromGlobalConfig(global)
+	if len(profiles) == 0 {
+		return nil
+	}
+	profile, err := selectBrokerProfileForCommand(profiles, cfg.gcloudConfiguration, cfg.region, "bgit "+cmd)
+	if err != nil {
+		return err
+	}
+	cfg.provider = profile.Provider
+	cfg.brokerURL = profile.BrokerURL
+	cfg.region = profile.Region
+	cfg.gcloudConfiguration = profile.QualifiedName
+	if cfg.logicalRepo == "" && cfg.prefix != "" {
+		cfg.logicalRepo = strings.Trim(cfg.prefix, "/")
+	}
+	return nil
+}
+
+func mergeBrokerProfileArg(args []string, cfg config) []string {
+	return mergeBrokerSelectionArgs(args, cfg)
+}
+
+func mergeBrokerSelectionArgs(args []string, cfg config) []string {
+	merged := append([]string{}, args...)
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		name, _, _ := strings.Cut(arg, "=")
+		switch name {
+		case "--profile":
+			cfg.gcloudConfigurationExplicit = false
+		case "--region":
+			cfg.region = ""
+		}
+	}
+	if cfg.gcloudConfigurationExplicit && strings.TrimSpace(cfg.gcloudConfiguration) != "" {
+		merged = append(merged, "--profile", cfg.gcloudConfiguration)
+	}
+	if strings.TrimSpace(cfg.region) != "" {
+		merged = append(merged, "--region", cfg.region)
+	}
+	return merged
+}
+
+func directCommand(ctx context.Context, cfg config, args []string, stdin io.Reader, stdout io.Writer) error {
+	cfg.direct = true
+	if len(args) == 0 {
+		return errors.New("usage: bgit direct clone|init|fetch|pull|push|ls-remote|ls|cat|show|log|put|admin [args]")
+	}
+	cmd := args[0]
+	cmdArgs := args[1:]
+	if cmd == "help" || cmd == "-h" || cmd == "--help" {
+		return commandHelp("direct", stdout)
+	}
+	if cmd == "admin" {
+		return adminCommand(cfg, cmdArgs, stdout)
+	}
 	if cmd == "origin" {
 		return originCommand(cmdArgs, stdout)
 	}
 	if cmd == "remote" {
 		return remoteCommand(cmdArgs, stdout)
 	}
-	if cmd == "admin" {
-		return adminCommand(cfg, cmdArgs, stdout)
-	}
-	if cmd == "ssh" {
-		return sshCommand(cfg, cmdArgs, stdout, stderr)
-	}
-	if cmd == "web" {
-		return webCommand(context.Background(), cfg, cmdArgs, stdout)
-	}
-	if cmd == "create-gcloud-profile" {
-		return createGcloudProfileCommand(cmdArgs, stdin, stdout)
-	}
-	if isLocalGitCommand(cmd) || (!explicitBucket && isPreferLocalGitCommand(cmd)) {
-		return nativeLocalCommand(cmd, cmdArgs, stdout)
-	}
-
-	ctx := context.Background()
 	if cmd == "clone" {
 		return cloneCommand(ctx, cfg, cmdArgs, stdout)
 	}
@@ -118,43 +283,42 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 		}
 		return errors.New("--bucket is required outside a bucketgit checkout")
 	}
-
 	store, closeStore, err := newRemoteStore(ctx, cfg, isReadOnlyRemoteCommand(cmd))
 	if err != nil {
 		return fmt.Errorf("create remote store: %w", err)
 	}
 	defer closeStore()
-
-	if isNativeRemoteCommand(cmd) {
-		if commandCreatesBucket(cmd) || cmd == "push" {
-			if err := ensureBucket(ctx, cfg); err != nil {
-				return err
-			}
-		}
-		repo := openNativeGitRepo(store, cfg)
-		switch cmd {
-		case "init":
-			return repo.initWorktree(ctx, cmdArgs, stdout)
-		case "fetch":
-			return repo.fetch(ctx, cmdArgs, stdout)
-		case "pull":
-			return repo.pull(ctx, cmdArgs, stdout)
-		case "push":
-			return repo.push(ctx, cmdArgs, stdout)
-		case "ls-remote":
-			return repo.lsRemote(ctx, cmdArgs, stdout)
-		case "ls", "list":
-			return repo.listFiles(ctx, cmdArgs, stdout)
-		case "cat", "show":
-			return repo.catFile(ctx, cmdArgs, stdout)
-		case "log":
-			return repo.log(ctx, cmdArgs, stdout)
-		case "put":
-			return repo.putFile(ctx, cmdArgs, stdin, stdout)
+	if !isNativeRemoteCommand(cmd) {
+		return fmt.Errorf("unknown direct command %q", cmd)
+	}
+	if commandCreatesBucket(cmd) || cmd == "push" {
+		if err := ensureBucket(ctx, cfg); err != nil {
+			return err
 		}
 	}
-
-	return fmt.Errorf("unknown command %q", cmd)
+	repo := openNativeGitRepo(store, cfg)
+	switch cmd {
+	case "init":
+		return repo.initWorktree(ctx, cmdArgs, stdout)
+	case "fetch":
+		return repo.fetch(ctx, cmdArgs, stdout)
+	case "pull":
+		return repo.pull(ctx, cmdArgs, stdout)
+	case "push":
+		return repo.push(ctx, cmdArgs, stdout)
+	case "ls-remote":
+		return repo.lsRemote(ctx, cmdArgs, stdout)
+	case "ls", "list":
+		return repo.listFiles(ctx, cmdArgs, stdout)
+	case "cat", "show":
+		return repo.catFile(ctx, cmdArgs, stdout)
+	case "log":
+		return repo.log(ctx, cmdArgs, stdout)
+	case "put":
+		return repo.putFile(ctx, cmdArgs, stdin, stdout)
+	default:
+		return fmt.Errorf("unknown direct command %q", cmd)
+	}
 }
 
 func isNativeRemoteCommand(cmd string) bool {
@@ -222,6 +386,15 @@ func extractGlobalFlags(args []string, cfg *config) ([]string, error) {
 				value = args[i]
 			}
 			cfg.branch = value
+		case "--region":
+			if !hasValue {
+				i++
+				if i >= len(args) {
+					return nil, errors.New("--region requires a value")
+				}
+				value = args[i]
+			}
+			cfg.region = value
 		case "--auth":
 			if !hasValue {
 				i++
@@ -275,6 +448,12 @@ func mergeConfig(primary, fallback config) config {
 	}
 	if primary.prefix == "" {
 		primary.prefix = fallback.prefix
+	}
+	if primary.brokerURL == "" {
+		primary.brokerURL = fallback.brokerURL
+	}
+	if primary.logicalRepo == "" {
+		primary.logicalRepo = fallback.logicalRepo
 	}
 	if primary.branch == "" || primary.branch == defaultBranch {
 		primary.branch = fallback.branch
@@ -337,6 +516,31 @@ func readLocalConfig(dir string) (config, error) {
 		branch = defaultBranch
 	}
 	localAuth := defaultBranchAuth(dir)
+	brokerURL := ""
+	if brokerOut, brokerErr := runGit(dir, "config", "--get", "bucketgit.broker"); brokerErr == nil {
+		brokerURL = strings.TrimSpace(string(brokerOut))
+	}
+	logicalRepo := ""
+	if logicalOut, logicalErr := runGit(dir, "config", "--get", "bucketgit.logicalRepo"); logicalErr == nil {
+		logicalRepo = strings.Trim(strings.TrimSpace(string(logicalOut)), "/")
+	}
+	localProvider := ""
+	if providerOut, providerErr := runGit(dir, "config", "--get", "bucketgit.provider"); providerErr == nil {
+		localProvider = strings.TrimSpace(string(providerOut))
+	}
+	if brokerURL != "" && logicalRepo != "" {
+		provider := firstNonEmpty(localProvider, "gcs")
+		return config{
+			provider:            provider,
+			prefix:              logicalRepo,
+			branch:              branch,
+			origin:              fmt.Sprintf("git@%s:%s", defaultSSHHost, logicalRepo),
+			brokerURL:           brokerURL,
+			logicalRepo:         logicalRepo,
+			auth:                localAuth.auth,
+			gcloudConfiguration: localAuth.gcloudConfiguration,
+		}, nil
+	}
 
 	originOut, originErr := runGit(dir, "config", "--get", "bucketgit.origin")
 	if originErr == nil {
@@ -371,18 +575,15 @@ func readLocalConfig(dir string) (config, error) {
 	}
 	bucket := strings.TrimSpace(string(bucketOut))
 	prefix := strings.Trim(strings.TrimSpace(string(prefixOut)), "/")
-	provider := "gcs"
-	if providerOut, err := runGit(dir, "config", "--get", "bucketgit.provider"); err == nil {
-		if value := strings.TrimSpace(string(providerOut)); value != "" {
-			provider = value
-		}
-	}
+	provider := firstNonEmpty(localProvider, "gcs")
 	return config{
 		provider:            provider,
 		bucket:              bucket,
 		prefix:              prefix,
 		branch:              branch,
 		origin:              originForConfig(config{provider: provider, bucket: bucket, prefix: prefix}),
+		brokerURL:           brokerURL,
+		logicalRepo:         logicalRepo,
 		auth:                localAuth.auth,
 		gcloudConfiguration: localAuth.gcloudConfiguration,
 	}, nil
@@ -411,16 +612,16 @@ func missingOriginError() error {
 	return errors.New(`No configured push destination.
 Either specify the repository from the command-line:
 
-    bgit --bucket bucket-name --prefix path/to/repo.git push
+    bgit --bucket bucket-name --prefix path/to/repo.git direct push
 
-or configure a bgit origin:
+or configure a direct bgit origin:
 
-    bgit origin gs://bucket-name/path/to/repo.git
-    bgit origin s3://bucket-name/path/to/repo.git
+    bgit direct origin gs://bucket-name/path/to/repo.git
+    bgit direct origin s3://bucket-name/path/to/repo.git
 
 and then push:
 
-    bgit push`)
+    bgit direct push`)
 }
 
 func newStorageClient(ctx context.Context, cfg config) (*storage.Client, error) {
@@ -455,6 +656,21 @@ func isReadOnlyRemoteCommand(cmd string) bool {
 }
 
 func newRemoteStore(ctx context.Context, cfg config, publicFallback bool) (gitRemoteStore, func(), error) {
+	if !cfg.direct {
+		if cfg.brokerURL == "" {
+			if out, err := runGit(".", "config", "--get", "bucketgit.broker"); err == nil {
+				cfg.brokerURL = strings.TrimSpace(string(out))
+			}
+		}
+		if cfg.logicalRepo == "" {
+			if out, err := runGit(".", "config", "--get", "bucketgit.logicalRepo"); err == nil {
+				cfg.logicalRepo = strings.Trim(strings.TrimSpace(string(out)), "/")
+			}
+		}
+		if cfg.brokerURL != "" {
+			return &brokerGitStore{brokerURL: cfg.brokerURL, cfg: cfg}, func() {}, nil
+		}
+	}
 	provider := cfg.provider
 	if provider == "" {
 		provider = "gcs"
@@ -549,32 +765,52 @@ func gcloudCommand(configuration string, args ...string) *exec.Cmd {
 func usage(w io.Writer) error {
 	_, err := fmt.Fprint(w, `usage: bgit <command> [args]
 
-common commands:
-  clone gs://bucket/prefix.git [directory]
-  clone s3://bucket/prefix.git [directory]
-  init [directory]
-  origin gs://bucket/prefix.git
-  origin s3://bucket/prefix.git
-  ssh setup [gs://bucket/prefix.git|s3://bucket/prefix.git]
-  web [--addr 127.0.0.1] [--port 8042] [--local]
-  admin grant-read|grant-write|grant-admin IDENTITY
-  create-gcloud-profile NAME
-  fetch | pull | push | ls-remote
-  status | add | commit | checkout | branch | merge | tag
-  diff | log | show | reset | restore | stash | revert
-  grep | blame | cherry-pick | clean | describe
-  ls-files | ls-tree | archive | config | rev-parse | rm | mv
+These are common BucketGit commands:
 
-direct GCS mode:
-  bgit --bucket BUCKET --prefix PREFIX ls [prefix]
-  bgit --bucket BUCKET --prefix PREFIX cat [--commit SHA] path
-  bgit --bucket BUCKET --prefix PREFIX log [--limit N] [--skip N] [--path PATH]
-  put path [--file FILE] -m MSG --author NAME --email EMAIL
+start a repository
+   setup      Connect a cloud account and deploy or update BucketGit
+   init       Create a local Git repository backed by BucketGit
+   clone      Clone a BucketGit repository into a new directory
+
+work on the current change
+   add        Add file contents to the index
+   mv         Move or rename a file, directory, or symlink
+   restore    Restore working tree files
+   rm         Remove files from the working tree and index
+
+examine history and state
+   diff       Show changes between commits, commit and working tree, etc
+   grep       Print lines matching a pattern
+   log        Show commit logs
+   show       Show objects
+   status     Show the working tree status
+
+grow, mark, and tweak history
+   branch     List, create, or delete branches
+   checkout   Switch branches or restore paths
+   commit     Record changes to the repository
+   merge      Join development histories together
+   reset      Reset HEAD, index, or working tree state
+   tag        Create, list, delete, or verify tags
+
+collaborate
+   fetch      Download objects and refs from BucketGit
+   pull       Fetch and integrate with the current branch
+   push       Update remote refs and upload objects
+   ls-remote  List remote refs
+   pr         Create, review, merge, and close pull requests
+
+administer
+   admin      Manage broker-backed users, keys, owners, and protection
+   broker     Delete or decommission deployed broker infrastructure
+   web        Browse a repository locally
 
 global options:
   --profile NAME
-  --auth gcloud|adc
   --version
+
+Legacy direct bucket operations are under "bgit direct".
+Run "bgit help <command>" or "bgit direct help" for details.
 `)
 	return err
 }
@@ -619,101 +855,133 @@ func commandHelp(cmd string, stdout io.Writer) error {
 
 func helpPages() map[string]string {
 	return map[string]string{
-		"clone": `usage: bgit clone gs://bucket/prefix.git [directory]
-       bgit clone s3://bucket/prefix.git [directory]
+		"clone": `usage:
+  bgit clone <broker-repo> [directory]
+  bgit clone https://broker.example.com/team/app.git [directory]
+  bgit clone --broker https://broker.example.com team/app.git [directory]
 
-Clone a bucketgit repository from object storage into a local worktree.
-The origin is stored in .git/config so later bgit fetch, pull, and push
-commands can infer it.
+Clone a BucketGit repository by logical repo name. Passing a broker URL makes
+the checkout self-contained and does not require a local profile. Direct
+object-storage clone moved to bgit direct clone.
 
 examples:
-  bgit clone gs://my-bucket/repositories/app.git
-  bgit clone s3://my-bucket/repositories/app.git --profile aws-profile
-  bgit clone gs://my-bucket/repositories/app.git ./app
-  bgit --branch develop clone gs://my-bucket/repositories/app.git
+  bgit clone team/app.git
+  bgit clone https://bgit-broker.example.com/team/app.git
+  bgit direct clone gs://my-bucket/repositories/app.git
+  bgit direct clone s3://my-bucket/repositories/app.git --profile aws-profile
 `,
-		"init": `usage: bgit init [directory]
+		"init": `usage:
+  bgit init
+  bgit init --noninteractive --repo NAME --profile PROFILE[.REGION] [--region REGION] [directory]
 
-Create a local Git repository. This does not require an origin. Configure one
-later with bgit origin before pushing.
+Create a local Git repository and attach it to a BucketGit repository from
+~/.bgit/config.yaml. Without --noninteractive, init prompts for missing repo,
+profile, and region choices.
 
 examples:
   bgit init
-  bgit init ./app
-  bgit origin gs://my-bucket/repositories/app.git
-  bgit push
+  bgit init --noninteractive --repo app --profile gcp:work.europe-west1
+  bgit init --noninteractive --repo app --profile work --region europe-west1
+`,
+		"setup": `usage:
+  bgit setup
+  bgit setup --yes [--provider gcp|aws] [--profile NAME] [--key PATH] [--region REGION]
+  bgit setup profile create --provider gcp|aws NAME
+
+Discover cloud profiles, deploy or update a bgit broker, import owner SSH keys,
+and write the global BucketGit config at ~/.bgit/config.yaml.
+
+GCP profiles are discovered from gcloud configurations. AWS profiles are
+discovered from AWS config/credentials files and aws configure list-profiles
+when the AWS CLI is available.
+
+examples:
+  bgit setup
+  bgit setup profile create --provider gcp work
+  bgit setup --yes --provider gcp --profile work --key ~/.ssh/id_ed25519.pub
+  bgit setup --yes --provider aws --profile production --region us-east-1
+`,
+		"broker": `usage:
+  bgit broker delete --provider gcp --profile NAME [--region REGION] [--data] --yes
+  bgit broker delete --provider aws --profile NAME [--region REGION] --yes
+
+Delete deployed bgit broker infrastructure for a selected cloud profile.
+AWS deletes the CloudFormation stack and waits for deletion. GCP deletes the
+Gen2 function/Cloud Run service; pass --data to also delete the Firestore
+broker database.
 `,
 		"origin": `usage:
-  bgit origin gs://bucket/prefix.git
-  bgit origin s3://bucket/prefix.git
+  bgit direct origin gs://bucket/prefix.git
+  bgit direct origin s3://bucket/prefix.git
 
-Set the bucketgit origin for the current local Git repository. This also
+Set a direct bucketgit origin for the current local Git repository. This also
 sets the regular Git remote named origin to the same URL for visibility.
 
 examples:
-  bgit origin gs://my-bucket/repositories/app.git
-  bgit origin s3://my-bucket/repositories/app.git --profile aws-profile
+  bgit direct origin gs://my-bucket/repositories/app.git
+  bgit direct origin s3://my-bucket/repositories/app.git --profile aws-profile
   git remote -v
 `,
 		"remote": `usage:
-  bgit remote add origin gs://bucket/prefix.git
-  bgit remote add origin s3://bucket/prefix.git
-  bgit remote set-url origin gs://bucket/prefix.git
+  bgit direct remote add origin gs://bucket/prefix.git
+  bgit direct remote add origin s3://bucket/prefix.git
+  bgit direct remote set-url origin gs://bucket/prefix.git
 
-Configure the bucketgit origin using Git remote syntax.
+Configure a direct bucketgit origin using Git remote syntax.
 `,
 		"admin": `usage:
-  bgit admin grant-read IDENTITY
-  bgit admin grant-write IDENTITY
-  bgit admin grant-admin IDENTITY
-  bgit admin make-public
-  bgit admin make-private
-  bgit admin --bucket BUCKET grant-write IDENTITY
+  bgit admin keys list|add|remove|suspend|import-github [args]
+  bgit admin owner transfer --user USER KEY_OR_FINGERPRINT
+  bgit admin protect add|list|remove [ref]
 
-Grant bucket access or toggle public read access for GCS or S3 repositories.
-Run inside a bgit checkout to infer the bucket and prefix, or pass --bucket
-explicitly.
-
-For GCS, IDENTITY may be user@example.com, user:user@example.com,
-serviceAccount:name@project.iam.gserviceaccount.com, group:team@example.com,
-allUsers, or allAuthenticatedUsers.
-
-For S3, IDENTITY must be an IAM/STS ARN, a 12 digit AWS account ID, or *.
-
-grant-read grants object read access plus bucket/prefix listing.
-grant-write grants object read/write/delete access plus bucket/prefix listing.
-grant-admin grants storage admin access on the bucket or repository prefix.
-make-public grants anonymous read access.
-make-private removes bgit-managed anonymous read access.
+Broker-backed repository administration. Cloud IAM and bucket-policy
+administration moved to bgit direct admin.
 
 examples:
-  bgit admin grant-read user:dev@example.com
-  bgit admin grant-write serviceAccount:ci@project.iam.gserviceaccount.com
-  bgit admin --bucket my-bucket grant-admin admin@example.com
-  bgit admin make-public
-  bgit admin make-private
-  bgit admin --bucket s3://my-bucket/repositories/app.git grant-read arn:aws:iam::123456789012:role/Developer
+  bgit admin keys list
+  bgit admin keys add --user ada --role developer --key ~/.ssh/ada.pub
+  bgit admin keys import-github octocat --role read
+  bgit admin protect add main
+  bgit direct admin grant-read user:dev@example.com
+`,
+		"pr": `usage:
+  bgit pr create [--title TITLE] [--body BODY] [--source BRANCH] [--target BRANCH]
+  bgit pr list
+  bgit pr view ID
+  bgit pr checkout ID
+  bgit pr diff ID
+  bgit pr merge ID
+  bgit pr close ID
+
+Broker-backed pull request metadata and merge/ref protection workflow.
+Pull requests are stored in the broker control plane, not in Git itself.
+`,
+		"direct": `usage:
+  bgit direct help
+  bgit direct clone gs://bucket/prefix.git [directory]
+  bgit direct clone s3://bucket/prefix.git [directory]
+  bgit direct origin gs://bucket/prefix.git
+  bgit direct remote add origin s3://bucket/prefix.git
+  bgit direct fetch|pull|push|ls-remote
+  bgit direct ls|cat|show|log|put [args]
+  bgit direct admin grant-read|grant-write|grant-admin IDENTITY
+
+Low-level object-storage and cloud IAM escape hatch for legacy direct bucket
+operations, recovery, migration, and debugging. Normal BucketGit workflows
+should use setup, init, git transport, and admin commands.
+
+Direct mode also owns --bucket/--prefix and --auth gcloud|adc.
 `,
 		"ssh": `usage:
-  bgit ssh setup [--broker URL] [--region REGION] [--firestore-database NAME] [--firestore-location LOCATION] [--key PATH] [--no-agent] [gs://bucket/prefix.git|s3://bucket/prefix.git]
-  bgit ssh scaffold [--broker URL] [gs://bucket/prefix.git|s3://bucket/prefix.git]
-  bgit ssh repo add [--broker URL] [--key PATH] [repo]
-  bgit ssh keys list|add|remove|suspend [--broker URL] [--key PATH] [repo]
+  bgit ssh git-upload-pack <repo>
+  bgit ssh git-receive-pack <repo>
 
-Configure the current repository so normal git fetch/push uses bgit as the SSH
-transport command. The setup command also records public keys from ssh-agent or
---key for a future broker-backed authorization flow. When --broker is omitted,
-setup looks for an existing bgit-broker endpoint in the selected cloud account
-and region. Setup also upserts the repository into the broker with discovered
-SSH identities under an admin user.
+Internal SSH transport used by Git for BucketGit remotes. Most users should not
+run this command directly; bgit init writes the required core.sshCommand config.
 
 examples:
-  bgit ssh setup gs://my-bucket/repositories/app.git
-  bgit ssh setup s3://my-bucket/repositories/app.git --profile aws-profile --key ~/.ssh/id_ed25519.pub
-  bgit ssh repo add --key ~/.ssh/id_ed25519.pub
-  bgit ssh keys add --user ada --role write --key ~/.ssh/ada.pub
-  bgit ssh keys list
-  bgit ssh scaffold
+  git fetch origin
+  git push origin main
 `,
 		"web": `usage: bgit web [--addr ADDR] [--port PORT] [--local]
 
@@ -727,15 +995,6 @@ examples:
   bgit web
   bgit web --port 8042
   bgit web --local
-`,
-		"create-gcloud-profile": `usage: bgit create-gcloud-profile [--yes] NAME
-
-Create a gcloud configuration, run gcloud auth login for that configuration,
-and save it as bucketgit.profile in the current checkout when run inside one.
-
-examples:
-  bgit create-gcloud-profile my-profile
-  bgit create-gcloud-profile --yes my-profile
 `,
 		"fetch": `usage: bgit fetch
 
@@ -766,21 +1025,21 @@ examples:
 
 List refs from the configured object-storage repository.
 `,
-		"ls": `usage: bgit --bucket BUCKET --prefix PREFIX ls [path-prefix]
+		"ls": `usage: bgit --bucket BUCKET --prefix PREFIX direct ls [path-prefix]
 
-Direct GCS mode: list files at the configured branch without a checkout.
+Direct bucket mode: list files at the configured branch without a checkout.
 `,
-		"list": `usage: bgit --bucket BUCKET --prefix PREFIX list [path-prefix]
+		"list": `usage: bgit --bucket BUCKET --prefix PREFIX direct list [path-prefix]
 
-Direct GCS mode: list files at the configured branch without a checkout.
+Direct bucket mode: list files at the configured branch without a checkout.
 `,
-		"cat": `usage: bgit --bucket BUCKET --prefix PREFIX cat [--commit SHA] path
+		"cat": `usage: bgit --bucket BUCKET --prefix PREFIX direct cat [--commit SHA] path
 
-Direct GCS mode: print one file from the configured branch or commit.
+Direct bucket mode: print one file from the configured branch or commit.
 `,
-		"put": `usage: bgit --bucket BUCKET --prefix PREFIX put path [--file FILE] -m MSG --author NAME --email EMAIL
+		"put": `usage: bgit --bucket BUCKET --prefix PREFIX direct put path [--file FILE] -m MSG --author NAME --email EMAIL
 
-Direct GCS mode: write one file and commit it to the GCS-backed repository.
+Direct bucket mode: write one file and commit it to the bucket-backed repository.
 Use --file - or omit --file to read content from stdin.
 `,
 	}
@@ -827,16 +1086,16 @@ func createGcloudProfileCommand(args []string, stdin io.Reader, stdout io.Writer
 			yes = true
 		default:
 			if strings.HasPrefix(arg, "-") {
-				return fmt.Errorf("unsupported create-gcloud-profile option %s", arg)
+				return fmt.Errorf("unsupported setup profile create option %s", arg)
 			}
 			if profile != "" {
-				return errors.New("create-gcloud-profile accepts exactly one profile name")
+				return errors.New("setup profile create accepts exactly one profile name")
 			}
 			profile = arg
 		}
 	}
 	if profile == "" {
-		return errors.New("create-gcloud-profile requires a profile name")
+		return errors.New("setup profile create requires a profile name")
 	}
 	if !yes {
 		fmt.Fprintf(stdout, "Create gcloud configuration %q, run browser login, and save it in this checkout if possible? [y/N] ", profile)
@@ -864,20 +1123,90 @@ func createGcloudProfileCommand(args []string, stdin io.Reader, stdout io.Writer
 	return nil
 }
 
+func createAWSProfileCommand(args []string, stdin io.Reader, stdout io.Writer) error {
+	yes := false
+	var profile string
+	for _, arg := range args {
+		switch arg {
+		case "-y", "--yes":
+			yes = true
+		default:
+			if strings.HasPrefix(arg, "-") {
+				return fmt.Errorf("unsupported setup profile create option %s", arg)
+			}
+			if profile != "" {
+				return errors.New("setup profile create accepts exactly one profile name")
+			}
+			profile = arg
+		}
+	}
+	if profile == "" {
+		return errors.New("setup profile create requires a profile name")
+	}
+	if !yes {
+		fmt.Fprintf(stdout, "Create or update AWS profile %q with aws configure? [y/N] ", profile)
+		var answer string
+		_, _ = fmt.Fscanln(stdin, &answer)
+		answer = strings.ToLower(strings.TrimSpace(answer))
+		if answer != "y" && answer != "yes" {
+			return errors.New("aborted")
+		}
+	}
+	if err := runAWSProfileCommand(stdout, "configure", "--profile", profile); err != nil {
+		return err
+	}
+	fmt.Fprintf(stdout, "created AWS profile %s\n", profile)
+	return nil
+}
+
+func createAWSProfileConfigured(profile, accessKey, secretKey, region string, stdout io.Writer) error {
+	profile = strings.TrimSpace(profile)
+	accessKey = strings.TrimSpace(accessKey)
+	secretKey = strings.TrimSpace(secretKey)
+	region = strings.TrimSpace(region)
+	if profile == "" {
+		return errors.New("setup profile create requires a profile name")
+	}
+	if accessKey == "" {
+		return errors.New("AWS access key ID is required")
+	}
+	if secretKey == "" {
+		return errors.New("AWS secret access key is required")
+	}
+	fmt.Fprintf(stdout, "configuring AWS profile %s\n", profile)
+	if err := runAWSProfileCommand(stdout, "configure", "set", "aws_access_key_id", accessKey, "--profile", profile); err != nil {
+		return err
+	}
+	if err := runAWSProfileCommand(stdout, "configure", "set", "aws_secret_access_key", secretKey, "--profile", profile); err != nil {
+		return err
+	}
+	if region != "" {
+		if err := runAWSProfileCommand(stdout, "configure", "set", "region", region, "--profile", profile); err != nil {
+			return err
+		}
+	}
+	fmt.Fprintf(stdout, "created AWS profile %s\n", profile)
+	return nil
+}
+
 func runGcloudProfileCommand(stdout io.Writer, args ...string) error {
 	cmd := exec.Command("gcloud", args...)
 	cmd.Stdin = os.Stdin
-	var out bytes.Buffer
-	cmd.Stdout = &out
-	cmd.Stderr = &out
+	cmd.Stdout = stdout
+	cmd.Stderr = stdout
 	if err := cmd.Run(); err != nil {
-		if out.Len() > 0 {
-			_, _ = stdout.Write(out.Bytes())
-		}
 		return fmt.Errorf("gcloud %s: %w", strings.Join(args, " "), err)
 	}
-	if out.Len() > 0 {
-		_, _ = stdout.Write(out.Bytes())
+	return nil
+}
+
+func runAWSProfileCommand(stdout io.Writer, args ...string) error {
+	cmd := exec.Command("aws", args...)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = stdout
+	cmd.Stderr = stdout
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("aws %s failed: %w", strings.Join(args, " "), err)
 	}
 	return nil
 }
@@ -1022,6 +1351,12 @@ func writeBucketGitConfig(worktree string, cfg config) error {
 		{"bucketgit.prefix", cfg.prefix},
 		{"bucketgit.branch", cfg.branch},
 	}
+	if strings.TrimSpace(cfg.auth) != "" && cfg.auth != defaultAuthMode {
+		pairs = append(pairs, []string{"bucketgit.auth", cfg.auth})
+	}
+	if strings.TrimSpace(cfg.gcloudConfiguration) != "" {
+		pairs = append(pairs, []string{"bucketgit.profile", cfg.gcloudConfiguration})
+	}
 	for _, pair := range pairs {
 		if _, err := runGit(worktree, "config", "--local", pair[0], pair[1]); err != nil {
 			return err
@@ -1040,6 +1375,41 @@ func setGitOrigin(worktree string, origin string) error {
 	}
 	_, err := runGit(worktree, "remote", "add", "origin", origin)
 	return err
+}
+
+func setGitBranchTracking(worktree, branch, remote string) error {
+	branch = shortBranchName(firstNonEmpty(branch, defaultBranch))
+	remote = firstNonEmpty(strings.TrimSpace(remote), "origin")
+	pairs := [][]string{
+		{"branch." + branch + ".remote", remote},
+		{"branch." + branch + ".merge", branchRef(branch)},
+	}
+	for _, pair := range pairs {
+		if _, err := runGit(worktree, "config", "--local", pair[0], pair[1]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func setGitBranchTrackingIfOrigin(worktree, branch string) error {
+	if _, err := runGit(worktree, "remote", "get-url", "origin"); err != nil {
+		return nil
+	}
+	return setGitBranchTracking(worktree, branch, "origin")
+}
+
+func unsetGitBranchTracking(worktree, branch string) error {
+	branch = shortBranchName(strings.TrimSpace(branch))
+	if branch == "" {
+		return nil
+	}
+	for _, key := range []string{"branch." + branch + ".remote", "branch." + branch + ".merge"} {
+		if _, err := runGit(worktree, "config", "--local", "--unset-all", key); err != nil {
+			continue
+		}
+	}
+	return nil
 }
 
 func originForConfig(cfg config) string {
@@ -1129,6 +1499,7 @@ type pushOptions struct {
 	force      bool
 	delete     bool
 	skipBroker bool
+	remote     string
 	refs       []string
 }
 
@@ -1142,6 +1513,10 @@ func parsePushArgs(args []string) (pushOptions, error) {
 			opts.force = true
 		case "--delete", "-d":
 			opts.delete = true
+		case "--set-upstream", "-u":
+			// bgit records the configured remote in the worktree. Accept Git's
+			// common upstream flag for CLI compatibility, but there is nothing
+			// extra to persist in the object-store ref update path.
 		case "--skip-broker":
 			opts.skipBroker = true
 		default:
@@ -1153,6 +1528,10 @@ func parsePushArgs(args []string) (pushOptions, error) {
 				opts.refs = append(opts.refs, arg)
 			}
 		}
+	}
+	if len(opts.refs) > 0 && opts.refs[0] == "origin" {
+		opts.remote = opts.refs[0]
+		opts.refs = opts.refs[1:]
 	}
 	if opts.delete && len(opts.refs) == 0 {
 		return opts, errors.New("push --delete requires at least one branch or ref")

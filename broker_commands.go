@@ -28,7 +28,7 @@ func brokerAdminCommand(cfg config, args []string, stdout io.Writer) error {
 
 func brokerAdminCommandWithInput(cfg config, args []string, stdin io.Reader, stdout io.Writer) error {
 	if len(args) == 0 {
-		return errors.New("usage: bgit admin keys|owner|protect [args]\n\nCloud IAM administration moved to bgit direct admin.")
+		return errors.New("usage: bgit admin keys|owner|protect|members [args]\n\nCloud IAM administration moved to bgit direct admin.")
 	}
 	switch args[0] {
 	case "keys":
@@ -39,11 +39,51 @@ func brokerAdminCommandWithInput(cfg config, args []string, stdin io.Reader, std
 		return brokerOwnerCommand(cfg, args[1:], stdout)
 	case "protect":
 		return brokerProtectionCommand(cfg, args[1:], stdout)
+	case "members":
+		return brokerMembersCommand(cfg, args[1:], stdout)
 	case "grant-read", "grant-write", "grant-admin", "make-public", "make-private":
 		return errors.New("cloud IAM administration moved to bgit direct admin")
 	default:
 		return fmt.Errorf("unknown admin command %q", args[0])
 	}
+}
+
+func brokerMembersCommand(cfg config, args []string, stdout io.Writer) error {
+	if len(args) != 1 || args[0] != "reindex" {
+		return errors.New("usage: bgit admin members reindex")
+	}
+	return janitorMembersReindex(cfg, stdout)
+}
+
+func janitorCommand(cfg config, args []string, stdout io.Writer) error {
+	if len(args) == 0 {
+		return errors.New("usage: bgit janitor members reindex")
+	}
+	switch args[0] {
+	case "members":
+		if len(args) == 2 && args[1] == "reindex" {
+			return janitorMembersReindex(cfg, stdout)
+		}
+		return errors.New("usage: bgit janitor members reindex")
+	default:
+		return fmt.Errorf("unknown janitor command %q", args[0])
+	}
+}
+
+func janitorMembersReindex(cfg config, stdout io.Writer) error {
+	brokerURL := strings.TrimSpace(cfg.brokerURL)
+	if brokerURL == "" {
+		var err error
+		brokerURL, err = brokerURLForCommand(sshSetupOptions{})
+		if err != nil {
+			return err
+		}
+	}
+	if err := brokerPost(brokerURL, "/members/reindex", brokerKeyRequest{Repo: repoForBroker(cfg)}, nil); err != nil {
+		return err
+	}
+	fmt.Fprintln(stdout, "reindexed broker membership")
+	return nil
 }
 
 func brokerInitCommand(args []string, stdin io.Reader, stdout io.Writer) error {
@@ -470,29 +510,56 @@ type brokerPullRequest struct {
 }
 
 type brokerPullRequestNote struct {
-	ID     int    `json:"id,omitempty"`
-	User   string `json:"user,omitempty"`
-	Body   string `json:"body,omitempty"`
-	State  string `json:"state,omitempty"`
-	Source string `json:"source,omitempty"`
-	At     string `json:"at,omitempty"`
+	ID       int                        `json:"id,omitempty"`
+	User     string                     `json:"user,omitempty"`
+	Body     string                     `json:"body,omitempty"`
+	State    string                     `json:"state,omitempty"`
+	Source   string                     `json:"source,omitempty"`
+	At       string                     `json:"at,omitempty"`
+	Comments []brokerPullRequestComment `json:"comments,omitempty"`
+	Replies  []brokerPullRequestComment `json:"replies,omitempty"`
+	Head     string                     `json:"head,omitempty"`
+}
+
+type brokerPullRequestComment struct {
+	ID        int                        `json:"id,omitempty"`
+	User      string                     `json:"user,omitempty"`
+	Body      string                     `json:"body,omitempty"`
+	File      string                     `json:"file,omitempty"`
+	Kind      string                     `json:"kind,omitempty"`
+	Side      string                     `json:"side,omitempty"`
+	Hunk      string                     `json:"hunk,omitempty"`
+	HunkIndex int                        `json:"hunk_index,omitempty"`
+	OldStart  int                        `json:"old_start,omitempty"`
+	NewStart  int                        `json:"new_start,omitempty"`
+	Offset    int                        `json:"offset,omitempty"`
+	Line      int                        `json:"line,omitempty"`
+	LineText  string                     `json:"line_text,omitempty"`
+	LineHash  string                     `json:"line_hash,omitempty"`
+	Head      string                     `json:"head,omitempty"`
+	Outdated  bool                       `json:"outdated,omitempty"`
+	At        string                     `json:"at,omitempty"`
+	Replies   []brokerPullRequestComment `json:"replies,omitempty"`
 }
 
 type brokerPullRequestRequest struct {
-	Repo         brokerRepo        `json:"repo"`
-	ID           int               `json:"id,omitempty"`
-	PR           brokerPullRequest `json:"pr,omitempty"`
-	Known        map[string]string `json:"known,omitempty"`
-	Merge        bool              `json:"merge,omitempty"`
-	DeleteBranch bool              `json:"delete_branch,omitempty"`
-	Comment      string            `json:"comment,omitempty"`
-	Review       string            `json:"review,omitempty"`
+	Repo            brokerRepo                 `json:"repo"`
+	ID              int                        `json:"id,omitempty"`
+	PR              brokerPullRequest          `json:"pr,omitempty"`
+	Known           map[string]string          `json:"known,omitempty"`
+	Merge           bool                       `json:"merge,omitempty"`
+	DeleteBranch    bool                       `json:"delete_branch,omitempty"`
+	Comment         string                     `json:"comment,omitempty"`
+	Review          string                     `json:"review,omitempty"`
+	Comments        []brokerPullRequestComment `json:"comments,omitempty"`
+	TargetNoteID    int                        `json:"target_note_id,omitempty"`
+	TargetCommentID int                        `json:"target_comment_id,omitempty"`
 }
 
 func prCommand(args []string, stdin io.Reader, stdout io.Writer) error {
 	_ = stdin
 	if len(args) == 0 {
-		return errors.New("usage: bgit pr create|list|view|checkout|diff|merge|close [args]")
+		return errors.New("usage: bgit pr create|list|view|checkout|diff|merge|close|reopen [args]")
 	}
 	cfg, err := configForBrokerCommand(config{})
 	if err != nil {
@@ -531,6 +598,16 @@ func prCommand(args []string, stdin io.Reader, stdout io.Writer) error {
 			return err
 		}
 		fmt.Fprintf(stdout, "closed PR #%d\n", id)
+		return nil
+	case "reopen":
+		id, err := parsePRIDArg(args[1:])
+		if err != nil {
+			return err
+		}
+		if err := brokerPost(cfg.brokerURL, "/prs/reopen", brokerPullRequestRequest{Repo: repoForBroker(cfg), ID: id}, nil); err != nil {
+			return err
+		}
+		fmt.Fprintf(stdout, "reopened PR #%d\n", id)
 		return nil
 	case "merge":
 		id, err := parsePRIDArg(args[1:])

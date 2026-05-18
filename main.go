@@ -36,6 +36,7 @@ type config struct {
 	region                      string
 	auth                        string
 	gcloudConfiguration         string
+	identity                    string
 	direct                      bool
 	authExplicit                bool
 	gcloudConfigurationExplicit bool
@@ -60,6 +61,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 		}
 		return usage(stderr)
 	}
+	setBrokerIdentityPreference(cfg.identity)
 	if cfg.versionRequested {
 		return versionCommand(stdout)
 	}
@@ -90,7 +92,28 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 		return directCommand(context.Background(), cfg, cmdArgs, stdin, stdout)
 	}
 	if cmd == "admin" {
+		if localCfg, err := readLocalConfig("."); err == nil {
+			cfg = mergeConfig(cfg, localCfg)
+			setBrokerIdentityPreference(cfg.identity)
+		}
+		if cfg.gcloudConfigurationExplicit {
+			if err := applyExplicitBrokerProfileSelection(&cfg, cmd); err != nil {
+				return err
+			}
+		}
 		return brokerAdminCommandWithInput(cfg, cmdArgs, stdin, stdout)
+	}
+	if cmd == "janitor" {
+		if localCfg, err := readLocalConfig("."); err == nil {
+			cfg = mergeConfig(cfg, localCfg)
+			setBrokerIdentityPreference(cfg.identity)
+		}
+		if cfg.gcloudConfigurationExplicit {
+			if err := applyExplicitBrokerProfileSelection(&cfg, cmd); err != nil {
+				return err
+			}
+		}
+		return janitorCommand(cfg, cmdArgs, stdout)
 	}
 	if cmd == "ssh" {
 		return sshCommand(cfg, cmdArgs, stdout, stderr)
@@ -104,7 +127,23 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 	if cmd == "broker" {
 		return brokerCommand(context.Background(), cfg, cmdArgs, stdin, stdout)
 	}
+	if cmd == "repos" {
+		if localCfg, err := readLocalConfig("."); err == nil {
+			cfg = mergeConfig(cfg, localCfg)
+			setBrokerIdentityPreference(cfg.identity)
+		}
+		if cfg.gcloudConfigurationExplicit {
+			if err := applyExplicitBrokerProfileSelection(&cfg, cmd); err != nil {
+				return err
+			}
+		}
+		return reposCommand(context.Background(), cfg, cmdArgs, stdout)
+	}
 	if cmd == "pr" {
+		if localCfg, err := readLocalConfig("."); err == nil {
+			cfg = mergeConfig(cfg, localCfg)
+			setBrokerIdentityPreference(cfg.identity)
+		}
 		return prCommand(cmdArgs, stdin, stdout)
 	}
 	if cmd == "web" {
@@ -135,7 +174,16 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 		localCfg, err := readLocalConfig(".")
 		if err == nil {
 			cfg = mergeConfig(cfg, localCfg)
+			setBrokerIdentityPreference(cfg.identity)
 		}
+	}
+	if cmd == "whoami" {
+		if cfg.gcloudConfigurationExplicit {
+			if err := applyExplicitBrokerProfileSelection(&cfg, cmd); err != nil {
+				return err
+			}
+		}
+		return whoamiCommand(context.Background(), cfg, cmdArgs, stdout)
 	}
 	if !cfg.direct && cfg.gcloudConfigurationExplicit && isNativeRemoteCommand(cmd) {
 		if err := applyExplicitBrokerProfileSelection(&cfg, cmd); err != nil {
@@ -415,6 +463,15 @@ func extractGlobalFlags(args []string, cfg *config) ([]string, error) {
 			}
 			cfg.gcloudConfiguration = value
 			cfg.gcloudConfigurationExplicit = true
+		case "--identity":
+			if !hasValue {
+				i++
+				if i >= len(args) {
+					return nil, errors.New("--identity requires a value")
+				}
+				value = args[i]
+			}
+			cfg.identity = value
 		case "--version", "-v":
 			cfg.versionRequested = true
 		default:
@@ -469,6 +526,9 @@ func mergeConfig(primary, fallback config) config {
 	}
 	if !primary.gcloudConfigurationExplicit && fallback.gcloudConfiguration != "" {
 		primary.gcloudConfiguration = fallback.gcloudConfiguration
+	}
+	if primary.identity == "" {
+		primary.identity = fallback.identity
 	}
 	return primary
 }
@@ -529,6 +589,7 @@ func readLocalConfig(dir string) (config, error) {
 		localProvider = strings.TrimSpace(string(providerOut))
 	}
 	if brokerURL != "" && logicalRepo != "" {
+		identity := localIdentityPreference(dir)
 		provider := firstNonEmpty(localProvider, "gcs")
 		return config{
 			provider:            provider,
@@ -537,6 +598,7 @@ func readLocalConfig(dir string) (config, error) {
 			origin:              fmt.Sprintf("git@%s:%s", defaultSSHHost, logicalRepo),
 			brokerURL:           brokerURL,
 			logicalRepo:         logicalRepo,
+			identity:            identity,
 			auth:                localAuth.auth,
 			gcloudConfiguration: localAuth.gcloudConfiguration,
 		}, nil
@@ -587,6 +649,18 @@ func readLocalConfig(dir string) (config, error) {
 		auth:                localAuth.auth,
 		gcloudConfiguration: localAuth.gcloudConfiguration,
 	}, nil
+}
+
+func localIdentityPreference(dir string) string {
+	for _, key := range []string{"bucketgit.sshKeyFingerprint", "bucketgit.sshKey", "bucketgit.identity"} {
+		out, err := runGit(dir, "config", "--get", key)
+		if err == nil {
+			if value := strings.TrimSpace(string(out)); value != "" {
+				return value
+			}
+		}
+	}
+	return ""
 }
 
 func defaultBranchAuth(dir string) config {
@@ -801,12 +875,16 @@ collaborate
    pr         Create, review, merge, and close pull requests
 
 administer
+   whoami     Show broker identity, role, and capabilities for this repo
+   repos      List repositories visible to local SSH keys
    admin      Manage broker-backed users, keys, owners, and protection
+   janitor    Run broker maintenance and repair tasks
    broker     Delete or decommission deployed broker infrastructure
    web        Browse a repository locally
 
 global options:
   --profile NAME
+  --identity KEY_OR_FINGERPRINT
   --version
 
 Legacy direct bucket operations are under "bgit direct".
@@ -955,6 +1033,23 @@ examples:
 
 Broker-backed pull request metadata and merge/ref protection workflow.
 Pull requests are stored in the broker control plane, not in Git itself.
+`,
+		"whoami": `usage: bgit whoami [--json] [--refresh] [--all]
+
+Show the SSH identity, repo role, and broker capabilities for the current
+broker-backed repository. Results are cached under ~/.bgit/cache/<broker>/.
+Use --all to list repositories visible to the SSH keys currently loaded in
+ssh-agent.
+`,
+		"repos": `usage: bgit repos mine [--json]
+
+List repositories visible to the SSH keys currently loaded in ssh-agent using
+the broker membership index.
+`,
+		"janitor": `usage: bgit janitor members reindex
+
+Broker maintenance and repair commands. These commands rebuild derived broker
+metadata from authoritative repo state and are not needed for normal use.
 `,
 		"direct": `usage:
   bgit direct help

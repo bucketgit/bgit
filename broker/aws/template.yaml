@@ -58,9 +58,11 @@ Resources:
                   - dynamodb:GetItem
                   - dynamodb:PutItem
                   - dynamodb:Query
+                  - dynamodb:Scan
                 Resource:
                   - !GetAtt BrokerTable.Arn
                   - !GetAtt BrokerPullRequestTable.Arn
+                  - !GetAtt BrokerMemberTable.Arn
               - Effect: Allow
                 Action:
                   - sts:AssumeRole
@@ -103,6 +105,21 @@ Resources:
           KeyType: HASH
         - AttributeName: pr_id
           KeyType: RANGE
+  BrokerMemberTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: bgit-broker-members
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: fingerprint
+          AttributeType: S
+        - AttributeName: repo_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: fingerprint
+          KeyType: HASH
+        - AttributeName: repo_id
+          KeyType: RANGE
   BrokerFunction:
     Type: AWS::Lambda::Function
     Properties:
@@ -114,12 +131,13 @@ Resources:
         Variables:
           TABLE_NAME: !Ref BrokerTable
           PR_TABLE_NAME: !Ref BrokerPullRequestTable
+          MEMBER_TABLE_NAME: !Ref BrokerMemberTable
           TRANSFER_ROLE_ARN: !GetAtt BrokerTransferRole.Arn
           BROKER_VERSION: {{BROKER_VERSION}}
       Code:
         ZipFile: |
           const crypto = require("crypto");
-          const {DynamoDBClient, GetItemCommand, PutItemCommand, QueryCommand} = require("@aws-sdk/client-dynamodb");
+          const {DynamoDBClient, GetItemCommand, PutItemCommand, QueryCommand, ScanCommand} = require("@aws-sdk/client-dynamodb");
           const {S3Client, GetObjectCommand, PutObjectCommand, DeleteObjectCommand, ListObjectsV2Command, HeadBucketCommand, CreateBucketCommand} = require("@aws-sdk/client-s3");
           const {STSClient, AssumeRoleCommand} = require("@aws-sdk/client-sts");
           const db = new DynamoDBClient({});
@@ -127,6 +145,7 @@ Resources:
           const sts = new STSClient({});
           const table = process.env.TABLE_NAME;
           const prTable = process.env.PR_TABLE_NAME;
+          const memberTable = process.env.MEMBER_TABLE_NAME;
           const transferRoleArn = process.env.TRANSFER_ROLE_ARN;
           const brokerVersion = process.env.BROKER_VERSION || "{{BROKER_VERSION}}";
           const zero = "0000000000000000000000000000000000000000";
@@ -163,6 +182,40 @@ Resources:
           }
           async function saveRepo(entry) {
             await db.send(new PutItemCommand({TableName: table, Item: {id: {S: entry.id}, data: {S: JSON.stringify(entry.data)}}}));
+            await syncMembershipIndex(entry);
+          }
+          async function syncMembershipIndex(entry) {
+            const repo = entry.data.repo || {};
+            if (!repo.logical && (!repo.bucket || !repo.prefix)) return;
+            const repoIDValue = repoID(repo);
+            const logical = repo.logical || repo.prefix || repoIDValue;
+            for (const key of entry.data.keys || []) {
+              if (!key.public_key) continue;
+              const fingerprint = keyFingerprint(key.public_key);
+              await db.send(new PutItemCommand({TableName: memberTable, Item: {
+                fingerprint: {S: fingerprint},
+                repo_id: {S: repoIDValue},
+                data: {S: JSON.stringify({repo_id: repoIDValue, logical, repo, user: key.user || "", role: key.role || "", source: key.source || "", suspended: !!key.suspended, updated_at: new Date().toISOString()})}
+              }}));
+            }
+          }
+          async function syncAllMembershipIndexes() {
+            let count = 0;
+            let ExclusiveStartKey;
+            do {
+              const out = await db.send(new ScanCommand({TableName: table, ExclusiveStartKey}));
+              for (const item of out.Items || []) {
+                const id = item.id && item.id.S || "";
+                if (id === "_owners") continue;
+                const data = JSON.parse(item.data && item.data.S || "{}");
+                const repo = data.repo || {};
+                if (!repo.logical && (!repo.bucket || !repo.prefix)) continue;
+                count++;
+                await syncMembershipIndex({id, data});
+              }
+              ExclusiveStartKey = out.LastEvaluatedKey;
+            } while (ExclusiveStartKey);
+            return count;
           }
           function prKey(repoID, id) {
             return {repo_id: {S: repoID}, pr_id: {N: String(Number(id))}};
@@ -266,6 +319,26 @@ Resources:
             if (operation === "write") return ["developer", "maintainer"].includes(role);
             if (operation === "merge") return ["maintainer"].includes(role);
             return false;
+          }
+          function keyFingerprint(publicKey) {
+            const parts = String(publicKey || "").trim().split(/\s+/);
+            const data = parts.length >= 2 ? Buffer.from(parts[1], "base64") : Buffer.from(normalizeKey(publicKey));
+            return "SHA256:" + crypto.createHash("sha256").update(data).digest("base64").replace(/=+$/g, "");
+          }
+          function roleCapabilities(role) {
+            return {
+              read: roleAllows(role, "read"),
+              push: roleAllows(role, "write"),
+              comment: ["owner", "admin", "maintainer", "developer", "triage"].includes(role),
+              review: ["owner", "admin", "maintainer", "developer", "triage"].includes(role),
+              approve: ["owner", "admin", "maintainer", "triage"].includes(role),
+              merge: roleAllows(role, "merge"),
+              admin_keys: role === "owner" || role === "admin",
+              manage_protection: role === "owner" || role === "admin",
+              reopen_pr: ["owner", "admin", "maintainer"].includes(role),
+              owner_transfer: role === "owner",
+              broker_upgrade: role === "owner" || role === "admin",
+            };
           }
           function validRole(role) {
             return ["owner", "admin", "maintainer", "developer", "triage", "read"].includes(role);
@@ -389,6 +462,62 @@ Resources:
           function nextPRNoteID(pr) {
             pr.next_note_id = Number(pr.next_note_id || 1);
             return pr.next_note_id++;
+          }
+          function nextPRCommentID(pr) {
+            pr.next_comment_id = Number(pr.next_comment_id || 1);
+            return pr.next_comment_id++;
+          }
+          function hashLineText(value) {
+            return crypto.createHash("sha1").update(String(value || "")).digest("hex");
+          }
+          function normalizeReviewComments(pr, comments, key, head) {
+            if (!Array.isArray(comments)) return [];
+            const now = new Date().toISOString();
+            return comments.map((comment) => {
+              const body = String(comment.body || "").trim();
+              if (!body) return null;
+              const lineText = String(comment.line_text || "");
+              return {
+                id: nextPRCommentID(pr),
+                user: key.user,
+                body,
+                file: String(comment.file || "").trim(),
+                kind: String(comment.kind || "line").trim(),
+                side: String(comment.side || "new").trim(),
+                hunk: String(comment.hunk || "").trim(),
+                hunk_index: Number(comment.hunk_index || 0),
+                old_start: Number(comment.old_start || 0),
+                new_start: Number(comment.new_start || 0),
+                offset: Number(comment.offset || 0),
+                line: Number(comment.line || 0),
+                line_text: lineText,
+                line_hash: String(comment.line_hash || hashLineText(lineText)),
+                head: String(comment.head || head || pr.head || ""),
+                at: now,
+              };
+            }).filter(Boolean);
+          }
+          function findPRComment(comments, id) {
+            if (!Array.isArray(comments) || !id) return null;
+            for (const comment of comments) {
+              if (Number(comment.id) === Number(id)) return comment;
+              const nested = findPRComment(comment.replies || [], id);
+              if (nested) return nested;
+            }
+            return null;
+          }
+          function findPRReplyTarget(pr, noteID, commentID) {
+            const notes = [...(pr.comments || []), ...(pr.reviews || [])];
+            for (const note of notes) {
+              if (commentID) {
+                const inline = findPRComment(note.comments || [], commentID);
+                if (inline) return inline;
+                const reply = findPRComment(note.replies || [], commentID);
+                if (reply) return reply;
+              }
+              if (noteID && Number(note.id) === Number(noteID)) return note;
+            }
+            return null;
           }
           function bumpPRVersion(data, pr) {
             const now = new Date().toISOString();
@@ -603,6 +732,20 @@ Resources:
                 await savePR(entry, pr);
                 return response(200, {ok: true, pr});
               }
+              if (path === "/prs/reopen" && method === "POST") {
+                const entry = await loadRepo(body.repo);
+                const key = requireOperation(event, entry, "write");
+                const pr = await loadPR(entry, body.id);
+                if (!pr) throw Object.assign(new Error("pull request not found"), {statusCode: 404});
+                pr.status = "open";
+                delete pr.closed_by;
+                delete pr.closed_at;
+                bumpPRVersion(entry.data, pr);
+                audit(entry, {type: "pr_reopen", id: pr.id, user: key.user});
+                await saveRepo(entry);
+                await savePR(entry, pr);
+                return response(200, {ok: true, pr});
+              }
               if (path === "/prs/comment" && method === "POST") {
                 const entry = await loadRepo(body.repo);
                 const key = requireOperation(event, entry, "read");
@@ -618,15 +761,33 @@ Resources:
                 await savePR(entry, pr);
                 return response(200, {ok: true, pr});
               }
+              if (path === "/prs/reply" && method === "POST") {
+                const entry = await loadRepo(body.repo);
+                const key = requireOperation(event, entry, "read");
+                const pr = await loadPR(entry, body.id);
+                if (!pr) throw Object.assign(new Error("pull request not found"), {statusCode: 404});
+                const comment = String(body.comment || "").trim();
+                if (!comment) throw Object.assign(new Error("comment is required"), {statusCode: 400});
+                const target = findPRReplyTarget(pr, Number(body.target_note_id || 0), Number(body.target_comment_id || 0));
+                if (!target) throw Object.assign(new Error("reply target not found"), {statusCode: 404});
+                target.replies = target.replies || [];
+                target.replies.push({id: nextPRCommentID(pr), user: key.user, body: comment, kind: "reply", at: new Date().toISOString()});
+                bumpPRVersion(entry.data, pr);
+                audit(entry, {type: "pr_reply", id: pr.id, user: key.user});
+                await saveRepo(entry);
+                await savePR(entry, pr);
+                return response(200, {ok: true, pr});
+              }
               if (path === "/prs/review" && method === "POST") {
                 const entry = await loadRepo(body.repo);
                 const key = requireOperation(event, entry, "write");
                 const pr = await loadPR(entry, body.id);
                 if (!pr) throw Object.assign(new Error("pull request not found"), {statusCode: 404});
                 const state = String(body.review || "").trim();
-                if (!["approved", "changes_requested"].includes(state)) throw Object.assign(new Error("unsupported review state"), {statusCode: 400});
+                if (!["commented", "approved", "changes_requested"].includes(state)) throw Object.assign(new Error("unsupported review state"), {statusCode: 400});
                 pr.reviews = pr.reviews || [];
-                pr.reviews.push({id: nextPRNoteID(pr), user: key.user, body: String(body.comment || "").trim(), state, at: new Date().toISOString()});
+                const comments = normalizeReviewComments(pr, body.comments, key, pr.head);
+                pr.reviews.push({id: nextPRNoteID(pr), user: key.user, body: String(body.comment || "").trim(), state, comments, head: String(pr.head || ""), at: new Date().toISOString()});
                 pr.approvals = countApprovals(pr);
                 bumpPRVersion(entry.data, pr);
                 audit(entry, {type: "pr_review", id: pr.id, user: key.user, state});
@@ -667,6 +828,48 @@ Resources:
                 const operation = body.operation || "";
                 const allowed = !!key && roleAllows(key.role, operation);
                 return response(200, {allowed, user: key && key.user, role: key && key.role});
+              }
+              if (path === "/auth/status" && method === "POST") {
+                const entry = await loadRepo(body.repo);
+                const key = signedKey(event, entry);
+                if (!key) throw Object.assign(new Error("SSH signature required"), {statusCode: 403});
+                return response(200, {
+                  broker_version: brokerVersion,
+                  repo: entry.data.repo || body.repo,
+                  identity: {user: key.user || "", source: key.source || "", key_fingerprint: keyFingerprint(key.public_key), public_key: key.public_key || ""},
+                  user: key.user || "",
+                  role: key.role || "",
+                  capabilities: roleCapabilities(key.role || ""),
+                  resolved_at: new Date().toISOString(),
+                });
+              }
+              if (path === "/repos/mine" && method === "POST") {
+                const fingerprint = header(event, "x-bgit-key-fingerprint") || "";
+                if (!fingerprint) throw Object.assign(new Error("SSH signature required"), {statusCode: 403});
+                const out = await db.send(new QueryCommand({
+                  TableName: memberTable,
+                  KeyConditionExpression: "fingerprint = :fingerprint",
+                  ExpressionAttributeValues: {":fingerprint": {S: fingerprint}}
+                }));
+                const repos = [];
+                for (const item of out.Items || []) {
+                  const data = JSON.parse(item.data.S || "{}");
+                  if (!data.suspended && data.repo && (data.repo.logical || (data.repo.bucket && data.repo.prefix))) repos.push({...data, key_fingerprint: fingerprint});
+                }
+                repos.sort((a, b) => String(a.logical || a.repo_id || "").localeCompare(String(b.logical || b.repo_id || "")));
+                return response(200, {repos});
+              }
+              if (path === "/members/reindex" && method === "POST") {
+                if (body.repo && (body.repo.logical || body.repo.bucket || body.repo.prefix)) {
+                  const entry = await loadRepo(body.repo);
+                  requireAdmin(event, entry);
+                  await syncMembershipIndex(entry);
+                  return response(200, {ok: true, repositories: 1});
+                }
+                const owners = await loadOwners();
+                if (!verifySignature(event, owners)) throw Object.assign(new Error("owner SSH signature required"), {statusCode: 403});
+                const count = await syncAllMembershipIndexes();
+                return response(200, {ok: true, repositories: count});
               }
               if (path === "/objects/capability" && method === "POST") {
                 const entry = await loadRepo(body.repo);

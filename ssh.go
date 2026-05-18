@@ -25,6 +25,12 @@ import (
 
 const defaultSSHHost = "git.bucketgit.com"
 
+var brokerIdentityPreference string
+
+func setBrokerIdentityPreference(value string) {
+	brokerIdentityPreference = strings.TrimSpace(value)
+}
+
 type sshSetupOptions struct {
 	broker            string
 	region            string
@@ -731,62 +737,115 @@ func brokerPostContext(ctx context.Context, brokerURL, path string, req any, res
 	if err != nil {
 		return err
 	}
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(data))
-	if err != nil {
-		return err
+	headerSets := brokerSignatureHeaderSetsForBroker(brokerURL, data)
+	if len(headerSets) == 0 {
+		headerSets = []map[string]string{{}}
 	}
-	httpReq.Header.Set("content-type", "application/json")
-	for key, value := range brokerSignatureHeaders(data) {
-		httpReq.Header.Set(key, value)
-	}
-	httpResp, err := http.DefaultClient.Do(httpReq)
-	if err != nil {
-		return err
-	}
-	defer httpResp.Body.Close()
-	body, readErr := io.ReadAll(httpResp.Body)
-	if readErr != nil {
-		return readErr
-	}
-	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
+	var lastErr error
+	for i, headers := range headerSets {
+		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(data))
+		if err != nil {
+			return err
+		}
+		httpReq.Header.Set("content-type", "application/json")
+		for key, value := range headers {
+			httpReq.Header.Set(key, value)
+		}
+		httpResp, err := http.DefaultClient.Do(httpReq)
+		if err != nil {
+			return err
+		}
+		body, readErr := io.ReadAll(httpResp.Body)
+		_ = httpResp.Body.Close()
+		if readErr != nil {
+			return readErr
+		}
+		if httpResp.StatusCode >= 200 && httpResp.StatusCode < 300 {
+			if fingerprint := headers["X-Bgit-Key-Fingerprint"]; fingerprint != "" {
+				_ = writeRepoAuthCache(brokerURL, data, fingerprint)
+			}
+			if resp != nil && len(body) > 0 {
+				if err := json.Unmarshal(body, resp); err != nil {
+					return err
+				}
+			}
+			return nil
+		}
 		msg := strings.TrimSpace(string(body))
 		if msg == "" {
 			msg = httpResp.Status
 		}
-		return fmt.Errorf("broker %s: %s", path, msg)
-	}
-	if resp != nil && len(body) > 0 {
-		if err := json.Unmarshal(body, resp); err != nil {
-			return err
+		lastErr = fmt.Errorf("broker %s: %s", path, msg)
+		if httpResp.StatusCode != http.StatusForbidden || i == len(headerSets)-1 {
+			return lastErr
 		}
 	}
-	return nil
+	return lastErr
 }
 
 func brokerSignatureHeaders(payload []byte) map[string]string {
-	headers := map[string]string{}
+	sets := brokerSignatureHeaderSetsForBroker("", payload)
+	if len(sets) == 0 {
+		return map[string]string{}
+	}
+	return sets[0]
+}
+
+func brokerSignatureHeaderSets(payload []byte) []map[string]string {
+	return brokerSignatureHeaderSetsForBroker("", payload)
+}
+
+func brokerSignatureHeaderSetsForBroker(brokerURL string, payload []byte) []map[string]string {
 	sock := strings.TrimSpace(os.Getenv("SSH_AUTH_SOCK"))
 	if sock == "" {
-		return headers
+		return nil
 	}
 	conn, err := net.Dial("unix", sock)
 	if err != nil {
-		return headers
+		return nil
 	}
 	defer conn.Close()
 	signers, err := agent.NewClient(conn).Signers()
 	if err != nil || len(signers) == 0 {
-		return headers
+		return nil
 	}
 	message := brokerSignatureMessage(payload)
-	sig, err := signers[0].Sign(nil, message)
-	if err != nil {
-		return headers
+	preferred := preferredBrokerKeyFingerprints(brokerURL, payload)
+	type signedHeaders struct {
+		fingerprint string
+		headers     map[string]string
 	}
-	headers["X-Bgit-Key"] = strings.TrimSpace(string(ssh.MarshalAuthorizedKey(signers[0].PublicKey())))
-	headers["X-Bgit-Signature"] = base64.StdEncoding.EncodeToString(ssh.Marshal(sig))
-	headers["X-Bgit-Signature-Message"] = base64.StdEncoding.EncodeToString(message)
-	return headers
+	var signed []signedHeaders
+	for _, signer := range signers {
+		sig, err := signer.Sign(nil, message)
+		if err != nil {
+			continue
+		}
+		fingerprint := ssh.FingerprintSHA256(signer.PublicKey())
+		signed = append(signed, signedHeaders{fingerprint: fingerprint, headers: map[string]string{
+			"X-Bgit-Key":               strings.TrimSpace(string(ssh.MarshalAuthorizedKey(signer.PublicKey()))),
+			"X-Bgit-Key-Fingerprint":   fingerprint,
+			"X-Bgit-Signature":         base64.StdEncoding.EncodeToString(ssh.Marshal(sig)),
+			"X-Bgit-Signature-Message": base64.StdEncoding.EncodeToString(message),
+		}})
+	}
+	sort.SliceStable(signed, func(i, j int) bool {
+		return preferredBrokerKeyRank(signed[i].fingerprint, preferred) < preferredBrokerKeyRank(signed[j].fingerprint, preferred)
+	})
+	var sets []map[string]string
+	for _, item := range signed {
+		sets = append(sets, item.headers)
+	}
+	return sets
+}
+
+func preferredBrokerKeyRank(fingerprint string, preferred []string) int {
+	for i, value := range preferred {
+		if strings.EqualFold(strings.TrimSpace(value), strings.TrimSpace(fingerprint)) {
+			return i
+		}
+	}
+	return len(preferred) + 1
 }
 
 func brokerSignatureMessage(payload []byte) []byte {

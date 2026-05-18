@@ -93,6 +93,11 @@ type webChangedFile struct {
 	binary    bool
 }
 
+type webDiffRenderOptions struct {
+	Review bool
+	PRID   int
+}
+
 type webRefOption struct {
 	name     string
 	fullName string
@@ -364,6 +369,8 @@ func (s *webServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.handleEvents(w, r)
 	case route == "api/state":
 		s.handleAPIState(ctx, w, r)
+	case route == "api/me":
+		s.handleAPIMe(ctx, w, r)
 	case route == "api/actions/commit":
 		s.handleAPIActionCommit(ctx, w, r)
 	case route == "api/actions/stage":
@@ -459,11 +466,55 @@ func (s *webServer) startLiveMonitors(ctx context.Context) {
 	if s.events == nil {
 		return
 	}
+	if s.cfg.brokerURL != "" && s.cfg.logicalRepo != "" {
+		go s.refreshWhoamiForWeb(ctx)
+	}
 	if repo, err := openLocalRepository("."); err == nil {
 		go monitorWebPath(ctx, repo.gitDir, "git", s.events)
 	}
 	if dir := webAssetDir(); dir != "" {
 		go monitorWebPath(ctx, dir, "assets", s.events)
+	}
+}
+
+func (s *webServer) handleAPIMe(ctx context.Context, w http.ResponseWriter, r *http.Request) {
+	status, err := s.webWhoami(ctx, r.URL.Query().Get("refresh") == "1")
+	if err != nil {
+		s.renderJSONError(w, http.StatusBadRequest, err)
+		return
+	}
+	s.renderJSON(w, status)
+}
+
+func (s *webServer) cachedWhoamiJSON() string {
+	if s.cfg.brokerURL == "" {
+		return "null"
+	}
+	status, err := readWhoamiCache(s.cfg.brokerURL)
+	if err != nil {
+		return "null"
+	}
+	data, err := json.Marshal(status)
+	if err != nil {
+		return "null"
+	}
+	return string(data)
+}
+
+func (s *webServer) webWhoami(ctx context.Context, refresh bool) (brokerAuthStatus, error) {
+	if s.cfg.brokerURL == "" || s.cfg.logicalRepo == "" {
+		return brokerAuthStatus{}, errors.New("whoami requires a broker-backed repository")
+	}
+	return brokerWhoami(ctx, s.cfg, refresh)
+}
+
+func (s *webServer) refreshWhoamiForWeb(ctx context.Context) {
+	status, err := s.webWhoami(ctx, true)
+	if err != nil {
+		return
+	}
+	if s.events != nil {
+		s.events.broadcastJSON("whoami", status)
 	}
 }
 
@@ -713,12 +764,22 @@ func (s *webServer) handleAPIDiff(ctx context.Context, w http.ResponseWriter, r 
 		return
 	}
 	if commit := strings.TrimSpace(r.URL.Query().Get("commit")); commit != "" {
-		diff, err := localCommitDiff(commit)
-		if err != nil {
+		files, additions, deletions, err := s.commitChangedFiles(ctx, commit)
+		if err == nil {
+			s.renderJSON(w, map[string]any{"commit": commit, "diff": changedFilesUnifiedDiff(files), "html": diffFilesPanelHTML(files, additions, deletions)})
+			return
+		}
+		diffHTML, htmlErr := localCommitVisualDiffHTML(commit)
+		diff, diffErr := localCommitDiff(commit)
+		if diffErr != nil && htmlErr != nil {
 			s.renderJSONError(w, http.StatusBadRequest, err)
 			return
 		}
-		s.renderJSON(w, map[string]any{"commit": commit, "diff": diff})
+		resp := map[string]any{"commit": commit, "diff": diff}
+		if htmlErr == nil {
+			resp["html"] = diffHTML
+		}
+		s.renderJSON(w, resp)
 		return
 	}
 	if prID := strings.TrimSpace(r.URL.Query().Get("pr")); prID != "" {
@@ -732,7 +793,11 @@ func (s *webServer) handleAPIDiff(ctx context.Context, w http.ResponseWriter, r 
 			s.renderJSONError(w, http.StatusBadRequest, err)
 			return
 		}
-		s.renderJSON(w, map[string]any{"pr": id, "diff": diff})
+		resp := map[string]any{"pr": id, "diff": diff}
+		if pr, prErr := s.pullRequestByID(ctx, id); prErr == nil {
+			resp["html"] = s.pullRequestFilesHTML(ctx, pr)
+		}
+		s.renderJSON(w, resp)
 		return
 	}
 	repoPath := cleanWebPath(r.URL.Query().Get("path"))
@@ -749,11 +814,16 @@ func (s *webServer) handleAPIDiff(ctx context.Context, w http.ResponseWriter, r 
 		s.renderJSONError(w, http.StatusBadRequest, err)
 		return
 	}
-	s.renderJSON(w, map[string]any{
+	diffHTML, htmlErr := localFileVisualDiffHTML(repoPath, mode)
+	resp := map[string]any{
 		"path": repoPath,
 		"mode": mode,
 		"diff": diff,
-	})
+	}
+	if htmlErr == nil {
+		resp["html"] = diffHTML
+	}
+	s.renderJSON(w, resp)
 	_ = ctx
 }
 
@@ -997,10 +1067,13 @@ func (s *webServer) handleAPIActionPullRequest(ctx context.Context, w http.Respo
 		return
 	}
 	var req struct {
-		ID           int    `json:"id"`
-		Action       string `json:"action"`
-		Comment      string `json:"comment"`
-		DeleteBranch bool   `json:"delete_branch"`
+		ID              int                        `json:"id"`
+		Action          string                     `json:"action"`
+		Comment         string                     `json:"comment"`
+		DeleteBranch    bool                       `json:"delete_branch"`
+		Comments        []brokerPullRequestComment `json:"comments"`
+		TargetNoteID    int                        `json:"target_note_id"`
+		TargetCommentID int                        `json:"target_comment_id"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		s.renderJSONError(w, http.StatusBadRequest, err)
@@ -1014,10 +1087,13 @@ func (s *webServer) handleAPIActionPullRequest(ctx context.Context, w http.Respo
 		PR brokerPullRequest `json:"pr"`
 	}
 	brokerReq := brokerPullRequestRequest{
-		Repo:         repoForBroker(s.cfg),
-		ID:           req.ID,
-		Comment:      strings.TrimSpace(req.Comment),
-		DeleteBranch: req.DeleteBranch,
+		Repo:            repoForBroker(s.cfg),
+		ID:              req.ID,
+		Comment:         strings.TrimSpace(req.Comment),
+		DeleteBranch:    req.DeleteBranch,
+		Comments:        req.Comments,
+		TargetNoteID:    req.TargetNoteID,
+		TargetCommentID: req.TargetCommentID,
 	}
 	endpoint := ""
 	switch strings.TrimSpace(req.Action) {
@@ -1033,11 +1109,22 @@ func (s *webServer) handleAPIActionPullRequest(ctx context.Context, w http.Respo
 	case "reject":
 		endpoint = "/prs/review"
 		brokerReq.Review = "changes_requested"
+	case "review-comment":
+		endpoint = "/prs/review"
+		brokerReq.Review = "commented"
+	case "reply":
+		if brokerReq.Comment == "" {
+			s.renderJSONError(w, http.StatusBadRequest, errors.New("comment is required"))
+			return
+		}
+		endpoint = "/prs/reply"
 	case "merge":
 		endpoint = "/prs/merge"
 		brokerReq.Merge = true
 	case "close":
 		endpoint = "/prs/close"
+	case "reopen":
+		endpoint = "/prs/reopen"
 	default:
 		s.renderJSONError(w, http.StatusBadRequest, fmt.Errorf("unsupported pull request action %q", req.Action))
 		return
@@ -1210,6 +1297,52 @@ func localFileDiff(repoPath, mode string) (string, error) {
 	}
 }
 
+func (s *webServer) commitChangedFiles(ctx context.Context, hash string) ([]webChangedFile, int, int, error) {
+	commitHash, err := s.repo.resolveRevision(ctx, hash)
+	if err != nil {
+		commitHash = hash
+	}
+	commit, err := s.repo.commit(ctx, commitHash)
+	if err != nil {
+		return nil, 0, 0, err
+	}
+	return s.changedFiles(ctx, commit)
+}
+
+func localFileVisualDiffHTML(repoPath, mode string) (string, error) {
+	repo, err := openLocalRepository(".")
+	if err != nil {
+		return "", err
+	}
+	repoPath = canonicalWorktreePath(repo, repoPath)
+	var oldData, newData []byte
+	switch mode {
+	case "staged", "cached":
+		oldData = gitBlobData("HEAD:" + repoPath)
+		newData = gitBlobData(":" + repoPath)
+	case "worktree", "unstaged", "":
+		oldData = gitBlobData(":" + repoPath)
+		if oldData == nil {
+			oldData = gitBlobData("HEAD:" + repoPath)
+		}
+		if data, err := os.ReadFile(repoPath); err == nil {
+			newData = data
+		}
+	default:
+		return "", fmt.Errorf("unsupported diff mode %q", mode)
+	}
+	file := webChangedFileFromData(repoPath, "", "", oldData, newData)
+	return diffFileHTML(file), nil
+}
+
+func gitBlobData(revisionPath string) []byte {
+	out, err := runGit(".", "show", revisionPath)
+	if err != nil {
+		return nil
+	}
+	return out
+}
+
 func localUntrackedFileDiff(repoPath string) (string, error) {
 	data, err := os.ReadFile(repoPath)
 	if err != nil {
@@ -1258,6 +1391,54 @@ func localCommitDiff(hash string) (string, error) {
 		return "", err
 	}
 	return string(out), nil
+}
+
+func localCommitVisualDiffHTML(hash string) (string, error) {
+	fullHash, err := gitOutputLine("rev-parse", hash)
+	if err != nil {
+		return "", err
+	}
+	parentLine, _ := gitOutputLine("show", "-s", "--format=%P", fullHash)
+	parent := ""
+	if fields := strings.Fields(parentLine); len(fields) > 0 {
+		parent = fields[0]
+	}
+	var namesOut []byte
+	if parent != "" {
+		namesOut, err = runGit(".", "diff", "--name-only", parent, fullHash)
+	} else {
+		namesOut, err = runGit(".", "show", "--format=", "--name-only", fullHash)
+	}
+	if err != nil {
+		return "", err
+	}
+	var files []webChangedFile
+	totalAdditions := 0
+	totalDeletions := 0
+	for _, name := range strings.Split(strings.TrimSpace(string(namesOut)), "\n") {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+		var oldData []byte
+		if parent != "" {
+			oldData = gitBlobData(parent + ":" + name)
+		}
+		newData := gitBlobData(fullHash + ":" + name)
+		file := webChangedFileFromData(name, "", "", oldData, newData)
+		totalAdditions += file.additions
+		totalDeletions += file.deletions
+		files = append(files, file)
+	}
+	return diffFilesPanelHTML(files, totalAdditions, totalDeletions), nil
+}
+
+func gitOutputLine(args ...string) (string, error) {
+	out, err := runGit(".", args...)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(out)), nil
 }
 
 func uniqueSortedStrings(values []string) []string {
@@ -1409,7 +1590,7 @@ func (s *webServer) handleTree(ctx context.Context, w http.ResponseWriter, r *ht
 	body.WriteString(s.repoToolbarHTML(ref, true))
 	body.WriteString(s.fileIndexHTML(ctx, commit.tree, ref))
 	body.WriteString(`<div class="repo-content"><div class="repo-primary">`)
-	body.WriteString(`<section class="panel files-panel"><div class="commit-strip"><span class="commit-author">` + html.EscapeString(commit.author) + `</span><a class="commit-subject" href="` + html.EscapeString(webCommitURL(commit.hash, ref)) + `">` + html.EscapeString(displayCommitSubject(commit)) + `</a><code>` + html.EscapeString(shortHash(commit.hash)) + `</code><span class="commit-when">` + html.EscapeString(relativeTime(commit.timestamp)) + `</span></div><table class="files" data-file-list>`)
+	body.WriteString(`<section class="panel files-panel"><div class="commit-strip"><span class="commit-author">` + html.EscapeString(commit.author) + `</span><a class="commit-subject" href="` + html.EscapeString(webCommitURL(commit.hash, ref)) + `">` + html.EscapeString(displayCommitSubject(commit)) + `</a><a class="commit-hash-link" href="` + html.EscapeString(webCommitURL(commit.hash, ref)) + `"><code>` + html.EscapeString(shortHash(commit.hash)) + `</code></a><span class="commit-when">` + html.EscapeString(relativeTime(commit.timestamp)) + `</span></div><table class="files" data-file-list>`)
 	if repoPath != "" && repoPath != "commits" && repoPath != "prs" {
 		parent := pathpkg.Dir(repoPath)
 		if parent == "." {
@@ -1447,6 +1628,15 @@ func (s *webServer) handleCommits(ctx context.Context, w http.ResponseWriter, r 
 		s.renderError(w, http.StatusNotFound, err)
 		return
 	}
+	selectedHash := strings.TrimSpace(r.URL.Query().Get("commit"))
+	if selectedHash == "" {
+		selectedHash = strings.TrimSpace(r.URL.Query().Get("selected"))
+	}
+	if selectedHash != "" {
+		if resolved, err := s.repo.resolveRevision(ctx, selectedHash); err == nil {
+			selectedHash = resolved
+		}
+	}
 	commits, err := s.repo.walkCommits(ctx, commit.hash, 100, 0, "")
 	if err != nil {
 		s.renderError(w, http.StatusInternalServerError, err)
@@ -1456,7 +1646,7 @@ func (s *webServer) handleCommits(ctx context.Context, w http.ResponseWriter, r 
 	body.WriteString(`<main class="layout" data-bgit-head="` + html.EscapeString(commit.hash) + `" data-bgit-source="seed">`)
 	body.WriteString(s.headerHTML(ref, "commits"))
 	body.WriteString(`<div class="repo-content repo-content-single"><div class="repo-primary"><section class="panel"><div class="panel-title">Commits</div>`)
-	body.WriteString(commitListHTML(commits, ref, false))
+	body.WriteString(s.commitListHTML(ctx, commits, ref, false, selectedHash))
 	body.WriteString(`</section></div></div></main>`)
 	s.renderPage(w, webPageTitle(s.title, "commits"), body.String())
 }
@@ -1513,8 +1703,10 @@ func (s *webServer) handlePullRequest(ctx context.Context, w http.ResponseWriter
 		body.WriteString(s.pullRequestFilesHTML(ctx, pr))
 	case "commits":
 		body.WriteString(s.pullRequestCommitsHTML(ctx, pr))
+	case "review":
+		body.WriteString(s.pullRequestReviewHTML(ctx, pr))
 	default:
-		body.WriteString(pullRequestConversationHTML(pr))
+		body.WriteString(s.pullRequestConversationHTML(ctx, pr))
 	}
 	body.WriteString(`</div></div></main>`)
 	s.renderPage(w, webPageTitle(s.title, fmt.Sprintf("PR #%d", pr.ID)), body.String())
@@ -1539,6 +1731,37 @@ func (s *webServer) pullRequestByID(ctx context.Context, id int) (brokerPullRequ
 }
 
 func (s *webServer) pullRequestFilesHTML(ctx context.Context, pr brokerPullRequest) string {
+	files, additions, deletions, err := s.pullRequestChangedFiles(ctx, pr)
+	if err != nil {
+		return `<section class="panel"><div class="empty">` + html.EscapeString(err.Error()) + `</div></section>`
+	}
+	return diffFilesPanelHTML(files, additions, deletions)
+}
+
+func (s *webServer) pullRequestReviewHTML(ctx context.Context, pr brokerPullRequest) string {
+	files, additions, deletions, err := s.pullRequestChangedFiles(ctx, pr)
+	if err != nil {
+		return `<section class="panel"><div class="empty">` + html.EscapeString(err.Error()) + `</div></section>`
+	}
+	var b strings.Builder
+	commentJSON, _ := json.Marshal(prReviewComments(pr))
+	b.WriteString(`<script type="application/json" id="pr-review-comments">` + html.EscapeString(string(commentJSON)) + `</script>`)
+	b.WriteString(`<section class="panel pr-review-workspace" data-pr-review-workspace data-pr-id="` + strconv.Itoa(pr.ID) + `"><div class="panel-title">Review changes</div><div class="muted review-help">Hover a new-side line or file header to add review comments. Submit them together at the bottom.</div></section>`)
+	b.WriteString(`<div class="pr-review-diff" data-pr-review-diff data-pr-id="` + strconv.Itoa(pr.ID) + `">`)
+	b.WriteString(diffFilesPanelHTMLWithOptions(files, additions, deletions, webDiffRenderOptions{Review: true, PRID: pr.ID}))
+	b.WriteString(`</div><form class="pr-review-submit" data-pr-review-submit data-pr-id="` + strconv.Itoa(pr.ID) + `"><label for="pr-review-note">Review note</label><textarea id="pr-review-note" data-pr-review-note rows="3" placeholder="Leave an optional review note"></textarea><div class="pr-review-actions"><a class="button-link" href="/prs/` + strconv.Itoa(pr.ID) + `" data-review-cancel>Cancel review</a><button type="button" class="button-link" data-pr-review-action="comment" data-capability="comment">Finish review</button><button type="button" class="button-link" data-pr-review-action="approve" data-capability="approve">Approve</button><button type="button" class="button-link" data-pr-review-action="reject" data-capability="review">Request changes</button></div></form>`)
+	return b.String()
+}
+
+func prReviewComments(pr brokerPullRequest) []brokerPullRequestComment {
+	var comments []brokerPullRequestComment
+	for _, review := range pr.Reviews {
+		comments = append(comments, review.Comments...)
+	}
+	return comments
+}
+
+func (s *webServer) pullRequestChangedFiles(ctx context.Context, pr brokerPullRequest) ([]webChangedFile, int, int, error) {
 	repo := s
 	targetRef := firstNonEmpty(pr.Target, branchRef(defaultBranch))
 	sourceRef := firstNonEmpty(pr.Source, pr.Head)
@@ -1552,21 +1775,17 @@ func (s *webServer) pullRequestFilesHTML(ctx context.Context, pr brokerPullReque
 		sourceHash, sourceErr = repo.resolvePullRequestRevision(ctx, sourceRef, pr.Head)
 	}
 	if targetErr != nil || sourceErr != nil {
-		return `<section class="panel"><div class="empty">Pull request refs are not available locally yet. Fetch the source and target branches, then refresh this page.</div></section>`
+		return nil, 0, 0, errors.New("pull request refs are not available locally yet. Fetch the source and target branches, then refresh this page")
 	}
 	targetCommit, err := repo.repo.commit(ctx, targetHash)
 	if err != nil {
-		return `<section class="panel"><div class="empty">` + html.EscapeString(err.Error()) + `</div></section>`
+		return nil, 0, 0, err
 	}
 	sourceCommit, err := repo.repo.commit(ctx, sourceHash)
 	if err != nil {
-		return `<section class="panel"><div class="empty">` + html.EscapeString(err.Error()) + `</div></section>`
+		return nil, 0, 0, err
 	}
-	files, additions, deletions, err := repo.changedFilesBetweenTrees(ctx, targetCommit.tree, sourceCommit.tree)
-	if err != nil {
-		return `<section class="panel"><div class="empty">` + html.EscapeString(err.Error()) + `</div></section>`
-	}
-	return diffFilesPanelHTML(files, additions, deletions)
+	return repo.changedFilesBetweenTrees(ctx, targetCommit.tree, sourceCommit.tree)
 }
 
 func (s *webServer) pullRequestUnifiedDiff(ctx context.Context, id int) (string, error) {
@@ -1660,7 +1879,7 @@ func (s *webServer) pullRequestCommitsHTML(ctx context.Context, pr brokerPullReq
 	if err != nil {
 		return `<section class="panel"><div class="empty">` + html.EscapeString(err.Error()) + `</div></section>`
 	}
-	return `<section class="panel"><div class="panel-title">Commits</div>` + commitListHTML(commits, firstNonEmpty(pr.Source, pr.Head), false) + `</section>`
+	return `<section class="panel"><div class="panel-title">Commits</div>` + s.commitListHTML(ctx, commits, firstNonEmpty(pr.Source, pr.Head), false, "") + `</section>`
 }
 
 func (s *webServer) resolvePullRequestRevision(ctx context.Context, ref, fallbackHash string) (string, error) {
@@ -1760,45 +1979,8 @@ func (s *webServer) handleCommit(ctx context.Context, w http.ResponseWriter, r *
 		s.renderError(w, http.StatusNotFound, fs.ErrNotExist)
 		return
 	}
-	commitHash, err := s.repo.resolveRevision(ctx, hash)
-	if err != nil {
-		commitHash = hash
-	}
-	commit, err := s.repo.commit(ctx, commitHash)
-	if err != nil {
-		s.renderError(w, http.StatusNotFound, err)
-		return
-	}
 	ref := strings.TrimSpace(r.URL.Query().Get("ref"))
-	files, additions, deletions, err := s.changedFiles(ctx, commit)
-	if err != nil {
-		s.renderError(w, http.StatusInternalServerError, err)
-		return
-	}
-	var body strings.Builder
-	body.WriteString(`<main class="layout" data-bgit-head="` + html.EscapeString(commit.hash) + `" data-bgit-source="seed">`)
-	body.WriteString(s.headerHTML(firstNonEmpty(ref, commit.hash), "commit/"+shortHash(commit.hash)))
-	body.WriteString(`<section class="panel commit-detail">`)
-	body.WriteString(`<h2>` + html.EscapeString(firstNonEmpty(commit.subject, shortHash(commit.hash))) + `</h2>`)
-	if commit.body != "" {
-		body.WriteString(`<pre class="commit-message">` + html.EscapeString(commit.body) + `</pre>`)
-	}
-	body.WriteString(`<div class="metadata-grid">`)
-	body.WriteString(metadataItemHTML("Author", commit.author, commit.email, commit.timestamp))
-	body.WriteString(metadataItemHTML("Committer", firstNonEmpty(commit.committer, commit.author), firstNonEmpty(commit.committerEmail, commit.email), firstNonZero(commit.committerTimestamp, commit.timestamp)))
-	body.WriteString(`<div><span>Commit</span><code>` + html.EscapeString(commit.hash) + `</code></div>`)
-	body.WriteString(`<div><span>Tree</span><code>` + html.EscapeString(commit.tree) + `</code></div>`)
-	if len(commit.parents) > 0 {
-		var parentLinks []string
-		for _, parent := range commit.parents {
-			parentLinks = append(parentLinks, `<a href="`+html.EscapeString(webCommitURL(parent, ref))+`"><code>`+html.EscapeString(shortHash(parent))+`</code></a>`)
-		}
-		body.WriteString(`<div><span>Parents</span>` + strings.Join(parentLinks, " ") + `</div>`)
-	}
-	body.WriteString(`</div></section>`)
-	body.WriteString(diffFilesPanelHTML(files, additions, deletions))
-	body.WriteString(`</main>`)
-	s.renderPage(w, webPageTitle(s.title, shortHash(commit.hash)), body.String())
+	http.Redirect(w, r, webCommitURL(hash, ref), http.StatusFound)
 }
 
 func (s *webServer) handleBlob(ctx context.Context, w http.ResponseWriter, r *http.Request, repoPath string, raw bool) {
@@ -1971,7 +2153,7 @@ func (s *webServer) headerHTML(ref, repoPath string) string {
 	if codeActive != "" {
 		codeActions = ` data-code-actions="true"`
 	}
-	b.WriteString(`<div class="repo-action-control"` + codeActions + `><button class="repo-action-button pull" type="button" data-web-action="pull" data-repo-pull hidden>PULL</button><button class="repo-action-button uncommit" type="button" data-web-action="uncommit" data-repo-uncommit hidden>UNCOMMIT</button><button class="repo-action-button push" type="button" data-web-action="push" data-repo-push hidden>PUSH</button><button class="repo-action-button commit" type="button" data-web-action="commit" data-repo-commit hidden>COMMIT</button></div>`)
+	b.WriteString(`<div class="repo-action-control"` + codeActions + `><button class="repo-action-button pull" type="button" data-web-action="pull" data-repo-pull data-capability="read" hidden>PULL</button><button class="repo-action-button uncommit" type="button" data-web-action="uncommit" data-repo-uncommit hidden>UNCOMMIT</button><button class="repo-action-button push" type="button" data-web-action="push" data-repo-push data-capability="push" hidden>PUSH</button><button class="repo-action-button commit" type="button" data-web-action="commit" data-repo-commit hidden>COMMIT</button></div>`)
 	if location := s.repoLocationBadge(); location != "" {
 		b.WriteString(`<div class="repo-controls"><div class="repo-header-location">` + html.EscapeString(location) + `</div></div>`)
 	}
@@ -2307,6 +2489,7 @@ func (s *webServer) renderPage(w http.ResponseWriter, title, body string) {
 	page = strings.ReplaceAll(page, "{{CSS}}", webAssetString(webCSSPath))
 	page = strings.ReplaceAll(page, "{{SOURCE}}", source)
 	page = strings.ReplaceAll(page, "{{BODY}}", body)
+	page = strings.ReplaceAll(page, "{{WHOAMI}}", s.cachedWhoamiJSON())
 	page = strings.ReplaceAll(page, "{{JS}}", webAssetString(webJSPath))
 	fmt.Fprint(w, page)
 }
@@ -2529,6 +2712,8 @@ func webAPIPullRequests(prs []brokerPullRequest) []map[string]any {
 			"approvals": pr.Approvals,
 			"checks":    pr.Checks,
 			"head":      pr.Head,
+			"comments":  pr.Comments,
+			"reviews":   pr.Reviews,
 		})
 	}
 	return out
@@ -2543,7 +2728,8 @@ func pullRequestListHTML(prs []brokerPullRequest) string {
 	for _, pr := range prs {
 		status := firstNonEmpty(pr.Status, "open")
 		title := firstNonEmpty(pr.Title, "Untitled pull request")
-		b.WriteString(`<li class="pr-item"><div class="pr-main"><div><a class="pr-title" href="/prs/` + strconv.Itoa(pr.ID) + `"><span class="pr-id">#` + strconv.Itoa(pr.ID) + `</span> <strong>` + html.EscapeString(title) + `</strong></a></div><div class="muted">` + html.EscapeString(shortRefName(pr.Source)) + ` → ` + html.EscapeString(shortRefName(pr.Target)) + `</div></div><div class="pr-meta"><span class="pr-status">` + html.EscapeString(status) + `</span>`)
+		prURL := `/prs/` + strconv.Itoa(pr.ID)
+		b.WriteString(`<li class="pr-item" data-pr-href="` + prURL + `"><div class="pr-main"><div><a class="pr-title" href="` + prURL + `"><span class="pr-id">#` + strconv.Itoa(pr.ID) + `</span> <strong>` + html.EscapeString(title) + `</strong></a></div><div class="muted">` + html.EscapeString(shortRefName(pr.Source)) + ` → ` + html.EscapeString(shortRefName(pr.Target)) + `</div></div><div class="pr-meta"><span class="pr-status">` + html.EscapeString(status) + `</span>`)
 		if pr.Approvals > 0 {
 			b.WriteString(`<span class="pr-approvals">` + strconv.Itoa(pr.Approvals) + ` approval`)
 			if pr.Approvals != 1 {
@@ -2563,12 +2749,16 @@ func prHeaderHTML(pr brokerPullRequest, active string) string {
 	filesActive := ""
 	conversationActive := ` class="active"`
 	commitsActive := ""
+	reviewActive := ""
 	if active == "files" || active == "files-changed" || active == "diff" {
 		conversationActive = ""
 		filesActive = ` class="active"`
 	} else if active == "commits" {
 		conversationActive = ""
 		commitsActive = ` class="active"`
+	} else if active == "review" {
+		conversationActive = ""
+		reviewActive = ` class="active"`
 	}
 	id := strconv.Itoa(pr.ID)
 	var b strings.Builder
@@ -2579,12 +2769,13 @@ func prHeaderHTML(pr brokerPullRequest, active string) string {
 		b.WriteString(` by ` + html.EscapeString(pr.Author))
 	}
 	b.WriteString(`</div>`)
-	b.WriteString(`<div class="pr-nav-row"><nav class="pr-subtabs"><a` + conversationActive + ` href="/prs/` + id + `">Conversation</a><a` + filesActive + ` href="/prs/` + id + `/files">Files changed</a><a` + commitsActive + ` href="/prs/` + id + `/commits">Commits</a></nav><button type="button" class="inline-action" data-web-diff data-diff-url="/api/diff?pr=` + id + `" data-diff-title="Pull request #` + id + `" title="View diff">DIFF</button></div>`)
+	b.WriteString(`<div class="pr-nav-row"><nav class="pr-subtabs"><a` + conversationActive + ` href="/prs/` + id + `">Conversation</a><a` + filesActive + ` href="/prs/` + id + `/files">Files changed</a><a` + commitsActive + ` href="/prs/` + id + `/commits">Commits</a><a` + reviewActive + ` href="/prs/` + id + `/review">Review</a></nav></div>`)
 	b.WriteString(`</section>`)
 	return b.String()
 }
 
-func pullRequestConversationHTML(pr brokerPullRequest) string {
+func (s *webServer) pullRequestConversationHTML(ctx context.Context, pr brokerPullRequest) string {
+	contexts := s.prInlineCommentContexts(ctx, pr)
 	var b strings.Builder
 	b.WriteString(`<section class="panel pr-conversation" data-pr-id="` + strconv.Itoa(pr.ID) + `"><div class="panel-title">Conversation</div>`)
 	if strings.TrimSpace(pr.Body) != "" {
@@ -2594,7 +2785,7 @@ func pullRequestConversationHTML(pr brokerPullRequest) string {
 	}
 	b.WriteString(`<div class="pr-timeline">`)
 	for _, comment := range pr.Comments {
-		b.WriteString(prNoteHTML(comment, "commented"))
+		b.WriteString(prNoteHTML(comment, "commented", contexts))
 	}
 	for _, review := range pr.Reviews {
 		label := "reviewed"
@@ -2603,41 +2794,276 @@ func pullRequestConversationHTML(pr brokerPullRequest) string {
 		} else if review.State == "changes_requested" {
 			label = "requested changes"
 		}
-		b.WriteString(prNoteHTML(review, label))
+		b.WriteString(prNoteHTML(review, label, contexts))
 	}
 	if len(pr.Comments) == 0 && len(pr.Reviews) == 0 {
 		b.WriteString(`<div class="empty">No comments or reviews yet.</div>`)
 	}
 	b.WriteString(`</div>`)
 	if firstNonEmpty(pr.Status, "open") == "open" {
-		b.WriteString(`<form class="pr-review-form" data-pr-form><label for="pr-comment">Comment</label><textarea id="pr-comment" data-pr-comment rows="4" placeholder="Leave a comment or review note"></textarea><div class="pr-review-actions"><button type="button" class="button-link" data-pr-action="comment">Comment</button><button type="button" class="button-link" data-pr-action="approve">Approve</button><button type="button" class="button-link" data-pr-action="reject">Request changes</button><label class="pr-delete-branch"><input type="checkbox" data-pr-delete-branch> Delete source branch after merge</label><button type="button" class="button-link primary" data-pr-action="merge">Merge</button></div></form>`)
+		b.WriteString(`<div class="actions"><a class="button-link primary" href="/prs/` + strconv.Itoa(pr.ID) + `/review">Start review</a></div>`)
+		b.WriteString(`<form class="pr-review-form" data-pr-form><label for="pr-comment">Comment</label><textarea id="pr-comment" data-pr-comment rows="4" placeholder="Leave a comment or review note"></textarea><div class="pr-review-actions"><button type="button" class="button-link" data-pr-action="comment" data-capability="comment">Comment</button><button type="button" class="button-link" data-pr-action="approve" data-capability="approve">Approve</button><button type="button" class="button-link" data-pr-action="reject" data-capability="review">Request changes</button><button type="button" class="button-link" data-pr-action="close" data-capability="push">Close PR</button><label class="pr-delete-branch"><input type="checkbox" data-pr-delete-branch data-capability="merge"> Delete source branch after merge</label><button type="button" class="button-link primary" data-pr-action="merge" data-capability="merge">Merge</button></div></form>`)
 	} else {
-		b.WriteString(`<div class="pr-closed-note">This pull request is ` + html.EscapeString(firstNonEmpty(pr.Status, "closed")) + `.</div>`)
+		b.WriteString(`<div class="pr-closed-note">This pull request is ` + html.EscapeString(firstNonEmpty(pr.Status, "closed")) + `.<button type="button" class="button-link" data-pr-action="reopen" data-capability="reopen_pr">Reopen PR</button></div>`)
 	}
 	b.WriteString(`</section>`)
 	return b.String()
 }
 
-func prNoteHTML(note brokerPullRequestNote, action string) string {
+func (s *webServer) prInlineCommentContexts(ctx context.Context, pr brokerPullRequest) map[string][]webVisualDiffRow {
+	contexts := map[string][]webVisualDiffRow{}
+	if len(pr.Comments) == 0 && len(pr.Reviews) == 0 {
+		return contexts
+	}
+	files, _, _, err := s.pullRequestChangedFiles(ctx, pr)
+	if err != nil {
+		return contexts
+	}
+	filesByPath := map[string]webChangedFile{}
+	for _, file := range files {
+		filesByPath[file.path] = file
+	}
+	collect := func(note brokerPullRequestNote) {
+		for _, comment := range note.Comments {
+			if comment.Kind != "line" || comment.File == "" || comment.Line <= 0 {
+				continue
+			}
+			file, ok := filesByPath[comment.File]
+			if !ok {
+				continue
+			}
+			rows := file.visual
+			if len(rows) == 0 {
+				rows = webVisualDiffRows(file.diff)
+			}
+			context := prCommentAfterContextRows(rows, comment)
+			if len(context) > 0 {
+				contexts[prInlineCommentKey(comment)] = context
+			}
+		}
+	}
+	for _, note := range pr.Comments {
+		collect(note)
+	}
+	for _, note := range pr.Reviews {
+		collect(note)
+	}
+	return contexts
+}
+
+func prCommentAfterContextRows(rows []webVisualDiffRow, comment brokerPullRequestComment) []webVisualDiffRow {
+	target := -1
+	targetLine := strconv.Itoa(comment.Line)
+	for i, row := range rows {
+		if row.newLine == targetLine {
+			target = i
+			break
+		}
+		if target < 0 && comment.HunkIndex >= 0 && row.hunkIndex == comment.HunkIndex && row.offset == comment.Offset && row.newLine != "" {
+			target = i
+		}
+	}
+	if target < 0 {
+		return nil
+	}
+	hunkIndex := rows[target].hunkIndex
+	var context []webVisualDiffRow
+	for _, row := range rows {
+		if row.hidden || row.newLine == "" {
+			continue
+		}
+		if hunkIndex >= 0 && row.hunkIndex != hunkIndex {
+			continue
+		}
+		if row.kind == "hunk" || row.kind == "hunk-top" || row.kind == "hunk-bottom" || row.kind == "note" {
+			continue
+		}
+		context = append(context, row)
+	}
+	if len(context) == 0 {
+		context = append(context, rows[target])
+	}
+	return context
+}
+
+func prNoteHTML(note brokerPullRequestNote, action string, contexts map[string][]webVisualDiffRow) string {
 	user := firstNonEmpty(note.User, "unknown")
 	when := note.At
 	if parsed, err := time.Parse(time.RFC3339, note.At); err == nil {
 		when = relativeTime(parsed.Unix())
 	}
 	var b strings.Builder
-	b.WriteString(`<div class="pr-note"><div class="pr-note-meta"><strong>` + html.EscapeString(user) + `</strong> ` + html.EscapeString(action))
+	b.WriteString(`<div class="pr-note" id="pr-note-` + strconv.Itoa(note.ID) + `" data-pr-note-id="` + strconv.Itoa(note.ID) + `"><div class="pr-note-meta"><strong>` + html.EscapeString(user) + `</strong> ` + html.EscapeString(action))
 	if when != "" {
 		b.WriteString(` <span>` + html.EscapeString(when) + `</span>`)
 	}
-	b.WriteString(`</div>`)
+	b.WriteString(`<button type="button" class="review-comment-button pr-reply-button" data-pr-reply data-target-note-id="` + strconv.Itoa(note.ID) + `" aria-label="Reply" title="Reply">💬</button></div>`)
 	if strings.TrimSpace(note.Body) != "" {
 		b.WriteString(`<div class="pr-note-body">` + html.EscapeString(note.Body) + `</div>`)
+	}
+	if len(note.Replies) > 0 {
+		b.WriteString(prReplyThreadHTML(note.Replies, 1))
+	}
+	if len(note.Comments) > 0 {
+		b.WriteString(`<div class="pr-inline-comments">`)
+		for _, comment := range note.Comments {
+			b.WriteString(prInlineCommentHTML(note.ID, comment, contexts[prInlineCommentKey(comment)]))
+		}
+		b.WriteString(`</div>`)
 	}
 	b.WriteString(`</div>`)
 	return b.String()
 }
 
-func commitListHTML(commits []commitObject, ref string, compact bool) string {
+func prInlineCommentKey(comment brokerPullRequestComment) string {
+	return strings.Join([]string{
+		comment.File,
+		comment.Kind,
+		strconv.Itoa(comment.Line),
+		strconv.Itoa(comment.HunkIndex),
+		strconv.Itoa(comment.Offset),
+		comment.Head,
+		comment.Body,
+	}, "\x00")
+}
+
+func prInlineCommentHTML(noteID int, comment brokerPullRequestComment, context []webVisualDiffRow) string {
+	file := firstNonEmpty(comment.File, "Changed file")
+	line := ""
+	if comment.Kind == "line" && comment.Line > 0 {
+		line = strconv.Itoa(comment.Line)
+	}
+	var b strings.Builder
+	b.WriteString(`<div class="pr-inline-comment" id="pr-comment-` + strconv.Itoa(comment.ID) + `" data-pr-comment-id="` + strconv.Itoa(comment.ID) + `">`)
+	b.WriteString(`<div class="pr-inline-context-header"><span>` + html.EscapeString(file) + `</span>`)
+	if line != "" {
+		b.WriteString(`<span class="pr-inline-context-line">line ` + html.EscapeString(line) + `</span>`)
+	}
+	if comment.Outdated {
+		b.WriteString(`<span class="pr-inline-outdated">outdated</span>`)
+	}
+	b.WriteString(`<button type="button" class="review-comment-button pr-reply-button" data-pr-reply data-target-note-id="` + strconv.Itoa(noteID) + `" data-target-comment-id="` + strconv.Itoa(comment.ID) + `" aria-label="Reply" title="Reply">💬</button>`)
+	b.WriteString(`</div>`)
+	if comment.Kind == "line" {
+		if len(context) > 0 {
+			b.WriteString(`<div class="pr-inline-after-context">`)
+			targetRendered := false
+			for _, row := range context {
+				target := row.newLine == line
+				if target {
+					targetRendered = true
+				}
+				b.WriteString(prInlineAfterRowHTML(row, target))
+				if target {
+					b.WriteString(`<div></div>` + prInlineCommentBodyHTML(comment, prReplyAttrs(noteID, comment.ID)))
+					if len(comment.Replies) > 0 {
+						b.WriteString(`<div></div>` + prReplyThreadHTML(comment.Replies, 1))
+					}
+				}
+			}
+			if !targetRendered {
+				b.WriteString(`<div></div>` + prInlineCommentBodyHTML(comment, prReplyAttrs(noteID, comment.ID)))
+				if len(comment.Replies) > 0 {
+					b.WriteString(`<div></div>` + prReplyThreadHTML(comment.Replies, 1))
+				}
+			}
+			b.WriteString(`</div>`)
+		} else {
+			b.WriteString(`<div class="pr-inline-after-context">`)
+			b.WriteString(`<div class="pr-inline-line-number">` + html.EscapeString(line) + `</div>`)
+			lineText := comment.LineText
+			if strings.TrimSpace(lineText) == "" {
+				lineText = "(line context unavailable)"
+			}
+			b.WriteString(`<pre class="pr-inline-line-code pr-inline-target-line"><span class="diff-change added">` + html.EscapeString(lineText) + `</span></pre>`)
+			b.WriteString(`<div></div>` + prInlineCommentBodyHTML(comment, prReplyAttrs(noteID, comment.ID)))
+			if len(comment.Replies) > 0 {
+				b.WriteString(`<div></div>` + prReplyThreadHTML(comment.Replies, 1))
+			}
+			b.WriteString(`</div>`)
+		}
+	} else {
+		b.WriteString(`<div class="pr-inline-file-comment"><div class="pr-inline-file-target">File comment</div>` + prInlineCommentBodyHTML(comment, prReplyAttrs(noteID, comment.ID)) + `</div>`)
+		if len(comment.Replies) > 0 {
+			b.WriteString(prReplyThreadHTML(comment.Replies, 1))
+		}
+	}
+	b.WriteString(`</div>`)
+	return b.String()
+}
+
+func prReplyThreadHTML(replies []brokerPullRequestComment, depth int) string {
+	if len(replies) == 0 {
+		return ""
+	}
+	if depth > 5 {
+		depth = 5
+	}
+	var b strings.Builder
+	b.WriteString(`<div class="pr-reply-thread depth-` + strconv.Itoa(depth) + `">`)
+	for _, reply := range replies {
+		user := firstNonEmpty(reply.User, "unknown")
+		when := reply.At
+		if parsed, err := time.Parse(time.RFC3339, reply.At); err == nil {
+			when = relativeTime(parsed.Unix())
+		}
+		b.WriteString(`<div class="pr-reply" id="pr-comment-` + strconv.Itoa(reply.ID) + `" data-pr-comment-id="` + strconv.Itoa(reply.ID) + `"><div class="pr-reply-meta"><strong>` + html.EscapeString(user) + `</strong> commented`)
+		if when != "" {
+			b.WriteString(` <span>` + html.EscapeString(when) + `</span>`)
+		}
+		b.WriteString(`<button type="button" class="review-comment-button pr-reply-button" data-pr-reply data-target-comment-id="` + strconv.Itoa(reply.ID) + `" aria-label="Reply" title="Reply">💬</button></div>`)
+		b.WriteString(`<div>` + html.EscapeString(reply.Body) + `</div>`)
+		b.WriteString(`</div>`)
+		if len(reply.Replies) > 0 {
+			b.WriteString(prReplyThreadHTML(reply.Replies, depth+1))
+		}
+	}
+	b.WriteString(`</div>`)
+	return b.String()
+}
+
+func prReplyAttrs(noteID, commentID int) string {
+	attrs := ` data-pr-reply`
+	if noteID > 0 {
+		attrs += ` data-target-note-id="` + strconv.Itoa(noteID) + `"`
+	}
+	if commentID > 0 {
+		attrs += ` data-target-comment-id="` + strconv.Itoa(commentID) + `"`
+	}
+	return attrs
+}
+
+func prInlineCommentBodyHTML(comment brokerPullRequestComment, replyAttrs string) string {
+	reply := ""
+	if replyAttrs != "" {
+		reply = `<button type="button" class="review-comment-button pr-reply-button pr-inline-body-reply"` + replyAttrs + ` aria-label="Reply" title="Reply">💬</button>`
+	}
+	user := firstNonEmpty(comment.User, "unknown")
+	when := comment.At
+	if parsed, err := time.Parse(time.RFC3339, comment.At); err == nil {
+		when = relativeTime(parsed.Unix())
+	}
+	meta := `<div class="pr-reply-meta"><strong>` + html.EscapeString(user) + `</strong> commented`
+	if when != "" {
+		meta += ` <span>` + html.EscapeString(when) + `</span>`
+	}
+	meta += `</div>`
+	return `<div class="pr-inline-comment-body"><div>` + meta + `<div>` + html.EscapeString(comment.Body) + `</div></div>` + reply + `</div>`
+}
+
+func prInlineAfterRowHTML(row webVisualDiffRow, target bool) string {
+	right := webDiffCellHTML(row.right, false, row.kind == "add")
+	if row.kind == "change" {
+		_, right = webInlineChangedHTML(row.left, row.right)
+	}
+	targetClass := ""
+	if target {
+		targetClass = " pr-inline-target-line"
+	}
+	return `<div class="pr-inline-line-number">` + html.EscapeString(row.newLine) + `</div><pre class="pr-inline-line-code` + targetClass + `">` + right + `</pre>`
+}
+
+func (s *webServer) commitListHTML(ctx context.Context, commits []commitObject, ref string, compact bool, selectedHash string) string {
 	if len(commits) == 0 {
 		return `<div class="empty">No commits.</div>`
 	}
@@ -2648,17 +3074,57 @@ func commitListHTML(commits []commitObject, ref string, compact bool) string {
 		if commit.timestamp > 0 {
 			when = time.Unix(commit.timestamp, 0).Format("2006-01-02 15:04")
 		}
-		b.WriteString(`<li data-commit-row data-commit-hash="` + html.EscapeString(commit.hash) + `"><div><a class="commit-subject" href="` + html.EscapeString(webCommitURL(commit.hash, ref)) + `">` + html.EscapeString(displayCommitSubject(commit)) + `</a><span class="state-actions" data-commit-state><button type="button" class="inline-icon-action" data-web-diff data-diff-url="/api/diff?commit=` + urlQueryEscape(commit.hash) + `" data-diff-title="` + html.EscapeString(shortHash(commit.hash)) + `" data-diff-subtitle="` + html.EscapeString(displayCommitSubject(commit)) + `" title="View diff" aria-label="View diff">` + diffIconSVGHTML() + `</button></span><div class="meta">` + html.EscapeString(commit.author) + ` authored ` + html.EscapeString(when))
+		selected := selectedHash != "" && (commit.hash == selectedHash || strings.HasPrefix(commit.hash, selectedHash) || strings.HasPrefix(selectedHash, commit.hash))
+		selectedClass := ""
+		if selected {
+			selectedClass = ` class="is-selected-commit"`
+		}
+		commitURL := webCommitURL(commit.hash, ref)
+		b.WriteString(`<li` + selectedClass + ` data-commit-row data-commit-hash="` + html.EscapeString(commit.hash) + `" data-commit-href="` + html.EscapeString(commitURL) + `" id="commit-` + html.EscapeString(shortHash(commit.hash)) + `"><div class="commit-row-main"><a class="commit-subject" href="` + html.EscapeString(commitURL) + `">` + html.EscapeString(displayCommitSubject(commit)) + `</a><span class="state-actions" data-commit-state></span><div class="meta">` + html.EscapeString(commit.author) + ` authored ` + html.EscapeString(when))
 		if !compact && commit.committer != "" && (commit.committer != commit.author || commit.committerEmail != commit.email) {
 			b.WriteString(` · committed by ` + html.EscapeString(commit.committer))
 		}
-		b.WriteString(`</div></div><code>` + html.EscapeString(shortHash(commit.hash)) + `</code></li>`)
+		b.WriteString(`</div></div><div class="commit-row-meta"><a class="commit-hash-link" href="` + html.EscapeString(commitURL) + `"><code>` + html.EscapeString(shortHash(commit.hash)) + `</code></a></div>`)
+		if selected {
+			b.WriteString(s.commitInlineDetailHTML(ctx, commit, ref))
+		}
+		b.WriteString(`</li>`)
 	}
 	if compact {
 		b.WriteString(`</ol><div class="actions"><a class="button-link" href="` + html.EscapeString("/commits?ref="+urlQueryEscape(ref)) + `">View all commits</a></div>`)
 	} else {
 		b.WriteString(`</ol>`)
 	}
+	return b.String()
+}
+
+func (s *webServer) commitInlineDetailHTML(ctx context.Context, commit commitObject, ref string) string {
+	files, additions, deletions, err := s.changedFiles(ctx, commit)
+	if err != nil {
+		return `<div class="commit-inline-detail"><div class="empty">` + html.EscapeString(err.Error()) + `</div></div>`
+	}
+	var b strings.Builder
+	b.WriteString(`<div class="commit-inline-detail">`)
+	b.WriteString(`<section class="commit-detail">`)
+	b.WriteString(`<h2>` + html.EscapeString(firstNonEmpty(commit.subject, shortHash(commit.hash))) + `</h2>`)
+	if commit.body != "" {
+		b.WriteString(`<pre class="commit-message">` + html.EscapeString(commit.body) + `</pre>`)
+	}
+	b.WriteString(`<div class="metadata-grid">`)
+	b.WriteString(metadataItemHTML("Author", commit.author, commit.email, commit.timestamp))
+	b.WriteString(metadataItemHTML("Committer", firstNonEmpty(commit.committer, commit.author), firstNonEmpty(commit.committerEmail, commit.email), firstNonZero(commit.committerTimestamp, commit.timestamp)))
+	b.WriteString(`<div><span>Commit</span><code>` + html.EscapeString(commit.hash) + `</code></div>`)
+	b.WriteString(`<div><span>Tree</span><code>` + html.EscapeString(commit.tree) + `</code></div>`)
+	if len(commit.parents) > 0 {
+		var parentLinks []string
+		for _, parent := range commit.parents {
+			parentLinks = append(parentLinks, `<a href="`+html.EscapeString(webCommitURL(parent, ref))+`"><code>`+html.EscapeString(shortHash(parent))+`</code></a>`)
+		}
+		b.WriteString(`<div><span>Parents</span>` + strings.Join(parentLinks, " ") + `</div>`)
+	}
+	b.WriteString(`</div></section>`)
+	b.WriteString(diffFilesPanelHTML(files, additions, deletions))
+	b.WriteString(`</div>`)
 	return b.String()
 }
 
@@ -2735,9 +3201,9 @@ func urlQueryEscape(value string) string {
 }
 
 func webCommitURL(hash, ref string) string {
-	value := "/commit/" + hash
+	value := "/commits?commit=" + urlQueryEscape(hash)
 	if strings.TrimSpace(ref) != "" {
-		value += "?ref=" + urlQueryEscape(ref)
+		value += "&ref=" + urlQueryEscape(ref)
 	}
 	return value
 }
@@ -2872,25 +3338,29 @@ func (s *webServer) collectTreeFiles(ctx context.Context, treeHash, prefix strin
 }
 
 func (s *webServer) changedFile(ctx context.Context, path, oldHash, newHash string) (webChangedFile, error) {
-	file := webChangedFile{path: path, oldHash: oldHash, newHash: newHash}
 	var oldData, newData []byte
 	if oldHash != "" {
 		obj, err := s.repo.object(ctx, oldHash)
 		if err != nil {
-			return file, err
+			return webChangedFile{path: path, oldHash: oldHash, newHash: newHash}, err
 		}
 		oldData = obj.data
 	}
 	if newHash != "" {
 		obj, err := s.repo.object(ctx, newHash)
 		if err != nil {
-			return file, err
+			return webChangedFile{path: path, oldHash: oldHash, newHash: newHash}, err
 		}
 		newData = obj.data
 	}
+	return webChangedFileFromData(path, oldHash, newHash, oldData, newData), nil
+}
+
+func webChangedFileFromData(path, oldHash, newHash string, oldData, newData []byte) webChangedFile {
+	file := webChangedFile{path: path, oldHash: oldHash, newHash: newHash}
 	if !isTextBlob(oldData) || !isTextBlob(newData) {
 		file.binary = true
-		return file, nil
+		return file
 	}
 	file.visual = webVisualRowsFromText(string(oldData), string(newData), 3)
 	for _, line := range simpleLineDiff(string(oldData), string(newData)) {
@@ -2909,20 +3379,32 @@ func (s *webServer) changedFile(ctx context.Context, path, oldHash, newHash stri
 		}
 		file.diff = append(file.diff, diffLine)
 	}
-	return file, nil
+	return file
 }
 
 func diffFileHTML(file webChangedFile) string {
+	return diffFileHTMLWithOptions(file, webDiffRenderOptions{})
+}
+
+func diffFileHTMLWithOptions(file webChangedFile, opts webDiffRenderOptions) string {
 	var b strings.Builder
-	b.WriteString(`<section class="panel diff-file" id="diff-` + html.EscapeString(anchorID(file.path)) + `"><div class="diff-header"><div><strong>` + html.EscapeString(file.path) + `</strong><div class="muted">`)
-	if file.oldHash == "" {
+	reviewAttrs := ""
+	reviewButton := ""
+	if opts.Review {
+		reviewAttrs = ` data-review-file="` + html.EscapeString(file.path) + `"`
+		reviewButton = `<button type="button" class="review-comment-button file-comment" data-review-comment-file="` + html.EscapeString(file.path) + `" aria-label="Comment on file" title="Comment on file">💬</button>`
+	}
+	b.WriteString(`<section class="panel diff-file" id="diff-` + html.EscapeString(anchorID(file.path)) + `"` + reviewAttrs + `><div class="diff-header"><div><strong>` + html.EscapeString(file.path) + `</strong><div class="muted">`)
+	if file.oldHash == "" && file.newHash == "" {
+		b.WriteString(`local changes`)
+	} else if file.oldHash == "" {
 		b.WriteString(`added`)
 	} else if file.newHash == "" {
 		b.WriteString(`deleted`)
 	} else {
 		b.WriteString(shortHash(file.oldHash) + ` -> ` + shortHash(file.newHash))
 	}
-	b.WriteString(`</div></div><div><span class="additions">+` + strconv.Itoa(file.additions) + `</span> <span class="deletions">-` + strconv.Itoa(file.deletions) + `</span></div></div>`)
+	b.WriteString(`</div></div><div class="diff-header-actions">` + reviewButton + `<span class="additions">+` + strconv.Itoa(file.additions) + `</span> <span class="deletions">-` + strconv.Itoa(file.deletions) + `</span></div></div>`)
 	if file.binary {
 		b.WriteString(`<div class="empty">Binary file changed.</div>`)
 	} else if len(file.visual) > 0 {
@@ -2935,13 +3417,18 @@ func diffFileHTML(file webChangedFile) string {
 }
 
 type webVisualDiffRow struct {
-	kind    string
-	left    string
-	right   string
-	oldLine string
-	newLine string
-	control string
-	hidden  bool
+	kind      string
+	left      string
+	right     string
+	oldLine   string
+	newLine   string
+	control   string
+	hunk      string
+	hunkIndex int
+	oldStart  int
+	newStart  int
+	offset    int
+	hidden    bool
 }
 
 type webPendingDelete struct {
@@ -2998,10 +3485,18 @@ func webVisualRowsFromText(left, right string, context int) []webVisualDiffRow {
 			if hunkIndex > 0 && hunks[hunkIndex-1].end < hunk.start {
 				control = "up"
 			}
-			rows = append(rows, webVisualDiffRow{kind: "hunk-top", left: "Lines " + webLineRangeLabel(oldStart, oldCount) + " -> " + webLineRangeLabel(newStart, newCount), control: control})
+			hunkLabel := "Lines " + webLineRangeLabel(oldStart, oldCount) + " -> " + webLineRangeLabel(newStart, newCount)
+			rows = append(rows, webVisualDiffRow{kind: "hunk-top", left: hunkLabel, control: control, hunk: hunkLabel, hunkIndex: hunkIndex, oldStart: oldStart, newStart: newStart})
 		}
 		_, isVisible := visible[i]
 		hidden := !isVisible
+		hunkIndex := webHunkIndexForOp(hunks, i)
+		hunkLabel := ""
+		oldStart, newStart := 0, 0
+		if hunkIndex >= 0 {
+			oldStart, _, newStart, _ = simpleDiffHunkRange(ops[hunks[hunkIndex].start:hunks[hunkIndex].end])
+			hunkLabel = "Lines " + webLineRangeLabel(oldStart, 1) + " -> " + webLineRangeLabel(newStart, 1)
+		}
 		switch op.kind {
 		case '-':
 			pending = append(pending, webPendingDelete{text: op.text, line: op.oldLine})
@@ -3009,13 +3504,13 @@ func webVisualRowsFromText(left, right string, context int) []webVisualDiffRow {
 			if len(pending) > 0 {
 				deleted := pending[0]
 				pending = pending[1:]
-				rows = append(rows, webVisualDiffRow{kind: "change", left: deleted.text, right: op.text, oldLine: strconv.Itoa(deleted.line), newLine: strconv.Itoa(op.newLine), hidden: hidden})
+				rows = append(rows, webVisualDiffRow{kind: "change", left: deleted.text, right: op.text, oldLine: strconv.Itoa(deleted.line), newLine: strconv.Itoa(op.newLine), hidden: hidden, hunk: hunkLabel, hunkIndex: hunkIndex, oldStart: oldStart, newStart: newStart, offset: op.newLine - newStart})
 			} else {
-				rows = append(rows, webVisualDiffRow{kind: "add", right: op.text, newLine: strconv.Itoa(op.newLine), hidden: hidden})
+				rows = append(rows, webVisualDiffRow{kind: "add", right: op.text, newLine: strconv.Itoa(op.newLine), hidden: hidden, hunk: hunkLabel, hunkIndex: hunkIndex, oldStart: oldStart, newStart: newStart, offset: op.newLine - newStart})
 			}
 		default:
 			flushDeletes(hidden)
-			rows = append(rows, webVisualDiffRow{kind: "same", left: op.text, right: op.text, oldLine: strconv.Itoa(op.oldLine), newLine: strconv.Itoa(op.newLine), hidden: hidden})
+			rows = append(rows, webVisualDiffRow{kind: "same", left: op.text, right: op.text, oldLine: strconv.Itoa(op.oldLine), newLine: strconv.Itoa(op.newLine), hidden: hidden, hunk: hunkLabel, hunkIndex: hunkIndex, oldStart: oldStart, newStart: newStart, offset: op.newLine - newStart})
 		}
 		if hunkIndex, ok := hunkEnds[i+1]; ok {
 			hunk := hunks[hunkIndex]
@@ -3031,6 +3526,15 @@ func webVisualRowsFromText(left, right string, context int) []webVisualDiffRow {
 	}
 	flushDeletes(true)
 	return rows
+}
+
+func webHunkIndexForOp(hunks []simpleDiffHunk, opIndex int) int {
+	for i, hunk := range hunks {
+		if opIndex >= hunk.start && opIndex < hunk.end {
+			return i
+		}
+	}
+	return -1
 }
 
 func webVisualDiffRows(lines []webDiffLine) []webVisualDiffRow {
@@ -3098,7 +3602,8 @@ func webVisualDiffRowHTML(row webVisualDiffRow) string {
 	if row.hidden {
 		hidden = ` data-hidden-context="true" hidden`
 	}
-	return `<div class="visual-diff-row visual-diff-` + html.EscapeString(row.kind) + `"` + hidden + `><div class="visual-diff-line-number">` + html.EscapeString(row.oldLine) + `</div><pre>` + left + `</pre><div class="visual-diff-line-number">` + html.EscapeString(row.newLine) + `</div><pre>` + right + `</pre></div>`
+	attrs := ` data-hunk-index="` + strconv.Itoa(row.hunkIndex) + `" data-hunk="` + html.EscapeString(row.hunk) + `" data-old-start="` + strconv.Itoa(row.oldStart) + `" data-new-start="` + strconv.Itoa(row.newStart) + `" data-offset="` + strconv.Itoa(row.offset) + `"`
+	return `<div class="visual-diff-row visual-diff-` + html.EscapeString(row.kind) + `"` + attrs + hidden + `><div class="visual-diff-line-number">` + html.EscapeString(row.oldLine) + `</div><pre>` + left + `</pre><div class="visual-diff-line-number">` + html.EscapeString(row.newLine) + `</div><pre data-new-line="` + html.EscapeString(row.newLine) + `">` + right + `</pre></div>`
 }
 
 func webDiffContextControlHTML(control string) string {
@@ -3211,6 +3716,10 @@ func webLineRangeLabel(start, count int) string {
 }
 
 func diffFilesPanelHTML(files []webChangedFile, additions, deletions int) string {
+	return diffFilesPanelHTMLWithOptions(files, additions, deletions, webDiffRenderOptions{})
+}
+
+func diffFilesPanelHTMLWithOptions(files []webChangedFile, additions, deletions int, opts webDiffRenderOptions) string {
 	var b strings.Builder
 	b.WriteString(`<section class="panel"><div class="diff-summary"><strong>` + strconv.Itoa(len(files)) + ` changed file` + pluralSuffix(len(files)) + `</strong><span class="additions">+` + strconv.Itoa(additions) + `</span><span class="deletions">-` + strconv.Itoa(deletions) + `</span></div>`)
 	if len(files) == 0 {
@@ -3223,7 +3732,7 @@ func diffFilesPanelHTML(files []webChangedFile, additions, deletions int) string
 	}
 	b.WriteString(`</table></section>`)
 	for _, file := range files {
-		b.WriteString(diffFileHTML(file))
+		b.WriteString(diffFileHTMLWithOptions(file, opts))
 	}
 	return b.String()
 }
@@ -3348,6 +3857,22 @@ func (h *webEventHub) unsubscribe(ch chan string) {
 
 func (h *webEventHub) broadcast(name string) {
 	payload := fmt.Sprintf("event: %s\ndata: {\"time\":%d}\n\n", name, time.Now().UnixMilli())
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for ch := range h.clients {
+		select {
+		case ch <- payload:
+		default:
+		}
+	}
+}
+
+func (h *webEventHub) broadcastJSON(name string, value any) {
+	data, err := json.Marshal(value)
+	if err != nil {
+		return
+	}
+	payload := fmt.Sprintf("event: %s\ndata: %s\n\n", name, data)
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	for ch := range h.clients {

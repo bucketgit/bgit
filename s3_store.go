@@ -24,14 +24,18 @@ type s3GitStore struct {
 }
 
 func newS3Client(ctx context.Context, cfg config, anonymous bool) (*s3.Client, error) {
+	region := awsRegion(cfg)
 	if anonymous {
 		return s3.New(s3.Options{
-			Region:      defaultAWSRegion(),
+			Region:      region,
 			Credentials: aws.AnonymousCredentials{},
 		}), nil
 	}
 	opts := []func(*awsconfig.LoadOptions) error{
-		awsconfig.WithDefaultRegion(defaultAWSRegion()),
+		awsconfig.WithDefaultRegion(region),
+	}
+	if strings.TrimSpace(cfg.region) != "" {
+		opts = append(opts, awsconfig.WithRegion(region))
 	}
 	if strings.TrimSpace(cfg.gcloudConfiguration) != "" {
 		opts = append(opts, awsconfig.WithSharedConfigProfile(strings.TrimSpace(cfg.gcloudConfiguration)))
@@ -41,6 +45,13 @@ func newS3Client(ctx context.Context, cfg config, anonymous bool) (*s3.Client, e
 		return nil, err
 	}
 	return s3.NewFromConfig(awsCfg), nil
+}
+
+func awsRegion(cfg config) string {
+	if value := strings.TrimSpace(cfg.region); value != "" {
+		return value
+	}
+	return defaultAWSRegion()
 }
 
 func defaultAWSRegion() string {
@@ -130,7 +141,7 @@ func ensureS3Bucket(ctx context.Context, cfg config) error {
 		return fmt.Errorf("check bucket s3://%s: %w", cfg.bucket, err)
 	}
 	input := &s3.CreateBucketInput{Bucket: aws.String(cfg.bucket)}
-	region := defaultAWSRegion()
+	region := awsRegion(cfg)
 	if region != "" && region != "us-east-1" {
 		input.CreateBucketConfiguration = &types.CreateBucketConfiguration{
 			LocationConstraint: types.BucketLocationConstraint(region),

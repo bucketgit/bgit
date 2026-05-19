@@ -4,6 +4,46 @@ All notable changes to `bgit` are documented in this file.
 
 This project follows semantic versioning.
 
+## 1.0.0
+
+Breaking changes
+
+- BucketGit is now broker-first. Normal repository operations go through a
+  broker-backed repo model by default; legacy direct bucket and cloud IAM flows
+  moved under `bgit direct`.
+- `bgit admin` now manages broker-backed repository users, keys, protection,
+  issues, visibility, and danger-zone repository controls instead of cloud IAM.
+- Repository setup and selection now use broker profiles from
+  `~/.bgit/config.yaml`, including region-qualified profiles.
+
+Added
+
+- Broker-first setup and repository initialization, including cloud profile
+  discovery, owner SSH key import, multi-region broker provisioning, and
+  `~/.bgit/config.yaml`.
+- Broker-issued object-transfer capabilities, logical repo mapping, roles,
+  branch protection, pull requests, issues, and GitHub SSH key import.
+- Repository visibility, read-only mode, logical rename, destructive owner-only
+  delete controls, owner transfer, member invites, and repo-scoped invite
+  cancellation.
+- `bgit web` as a broker-aware repository browser with embedded assets,
+  pull-request review flows, issues, settings, capability-aware controls, and
+  local/remote state indicators.
+- `bgit direct` as the explicit low-level object-storage and cloud IAM recovery
+  path.
+- Local broker integration test mode for GCP and AWS runtimes, with coverage for
+  roles, branch protection, PRs, issues, native Git transport, public/private
+  access, identity selection, and danger-zone controls.
+
+Changed
+
+- Push/fetch/read paths use the broker by default, with region-qualified
+  profiles and `--profile NAME --region REGION` disambiguation.
+- Setup is more guided for GCP/AWS onboarding, project/billing/API checks, and
+  interactive profile, region, and SSH key selection.
+- BucketGit identity is configurable globally or per repo, with a clear prompt
+  before pushing with the default client identity.
+
 ## 0.4.0
 
 Added

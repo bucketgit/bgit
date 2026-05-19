@@ -1,0 +1,24 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{TITLE}}</title>
+  <link rel="icon" href="/favicon.ico">
+  <script>
+    (function () {
+      try {
+        var theme = localStorage.getItem('bgit.theme');
+        if (theme === 'light' || theme === 'dark') document.documentElement.dataset.theme = theme;
+      } catch (_) {}
+    }());
+  </script>
+  <style>{{CSS}}</style>
+</head>
+<body data-bgit-render-source="{{SOURCE}}">
+<div class="sync-status" data-sync-status>Checking remote…</div>
+{{BODY}}
+<script>window.BGIT_WHOAMI = {{WHOAMI}};</script>
+<script>{{JS}}</script>
+</body>
+</html>

@@ -1,0 +1,1 @@
+{"scripts":{"start":"functions-framework --target=broker"},"dependencies":{"@google-cloud/functions-framework":"^3.4.0","@google-cloud/firestore":"^7.10.0","@google-cloud/storage":"^7.16.0","google-auth-library":"^9.15.1"}}

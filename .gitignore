@@ -37,3 +37,7 @@ bgit
 coverage.txt
 .DS_Store
 attic/
+.broker-test/
+testsuite/local/repo/
+testsuite/gcp/repo/
+testsuite/aws/repo/

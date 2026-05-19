@@ -4,24 +4,31 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
+	"time"
 
 	"golang.org/x/crypto/ssh"
-	"golang.org/x/crypto/ssh/agent"
 )
 
 const defaultSSHHost = "git.bucketgit.com"
+
+var brokerIdentityPreference string
+
+func setBrokerIdentityPreference(value string) {
+	brokerIdentityPreference = strings.TrimSpace(value)
+}
 
 type sshSetupOptions struct {
 	broker            string
@@ -34,17 +41,9 @@ type sshSetupOptions struct {
 
 func sshCommand(base config, args []string, stdout, stderr io.Writer) error {
 	if len(args) == 0 {
-		return errors.New("usage: bgit ssh setup|scaffold [args]")
+		return errors.New("usage: bgit ssh git-upload-pack|git-receive-pack [args]")
 	}
 	switch args[0] {
-	case "setup":
-		return sshSetupCommand(base, args[1:], stdout, true)
-	case "scaffold":
-		return sshSetupCommand(base, args[1:], stdout, false)
-	case "repo":
-		return sshRepoCommand(base, args[1:], stdout)
-	case "keys":
-		return sshKeysCommand(base, args[1:], stdout)
 	case "git-upload-pack", "git-receive-pack", "git-upload-archive":
 		return sshGitServiceCommand(args, stdout)
 	default:
@@ -106,6 +105,11 @@ func configForSSHRepo(repo string) (config, error) {
 	repo = cleanGitServiceRepo(repo)
 	if repo == "" {
 		return config{}, errors.New("missing repository path")
+	}
+	if localCfg, err := readLocalConfig("."); err == nil && localCfg.logicalRepo != "" {
+		if strings.Trim(localCfg.logicalRepo, "/") == strings.Trim(repo, "/") {
+			return mergeSSHRepoAuth(localCfg), nil
+		}
 	}
 	if strings.Contains(repo, "://") {
 		cfg, _, err := parseRepoURI(repo)
@@ -214,89 +218,6 @@ func mergeSSHRepoAuth(cfg config) config {
 	return cfg
 }
 
-func sshSetupCommand(base config, args []string, stdout io.Writer, includeKeys bool) error {
-	opts, repoArg, err := parseSSHSetupArgs(args)
-	if err != nil {
-		return err
-	}
-	cfg, err := sshSetupConfig(base, repoArg)
-	if err != nil {
-		return err
-	}
-	worktree, err := requireWorktree(".")
-	if err != nil {
-		return err
-	}
-	if err := writeBucketGitConfig(worktree, cfg); err != nil {
-		return err
-	}
-	sshURL := sshRemoteURL(cfg)
-	if err := setGitOrigin(worktree, sshURL); err != nil {
-		return err
-	}
-	for _, pair := range [][]string{
-		{"core.sshCommand", "bgit ssh"},
-		{"bucketgit.sshHost", defaultSSHHost},
-		{"bucketgit.sshRemote", sshURL},
-	} {
-		if _, err := runGit(worktree, "config", "--local", pair[0], pair[1]); err != nil {
-			return err
-		}
-	}
-	brokerURL := ""
-	if strings.TrimSpace(opts.broker) != "" {
-		brokerURL = strings.TrimSpace(opts.broker)
-		if err := writeBrokerConfig(worktree, strings.TrimSpace(opts.broker), stdout); err != nil {
-			return err
-		}
-	} else if includeKeys {
-		discovered, err := discoverBrokerURL(cfg, opts)
-		if err != nil {
-			fmt.Fprintf(stdout, "broker not found; provisioning bgit-broker\n")
-			discovered, err = provisionBrokerURL(cfg, opts, stdout)
-			if err != nil {
-				return err
-			}
-		}
-		brokerURL = discovered
-		if err := writeBrokerConfig(worktree, brokerURL, stdout); err != nil {
-			return err
-		}
-	}
-
-	fmt.Fprintf(stdout, "configured SSH origin %s\n", sshURL)
-	fmt.Fprintf(stdout, "configured core.sshCommand=bgit ssh\n")
-	if includeKeys {
-		keys, err := collectSSHPublicKeys(opts)
-		if err != nil {
-			return err
-		}
-		if len(keys) == 0 {
-			fmt.Fprintf(stdout, "no public keys found; add one later with bgit ssh setup --key PATH\n")
-			return nil
-		}
-		if err := writeSSHKeyDefaults(worktree, keys); err != nil {
-			return err
-		}
-		fmt.Fprintf(stdout, "recorded %d SSH public key default(s) for broker setup\n", len(keys))
-		if brokerURL != "" {
-			if firstNonEmpty(cfg.provider, "gcs") == "gcs" && strings.TrimSpace(opts.broker) == "" {
-				if err := ensureGCPBrokerServices(cfg, stdout); err != nil {
-					return err
-				}
-				if err := ensureGCPBrokerFirestoreDatabase(cfg, opts, stdout); err != nil {
-					return err
-				}
-			}
-			if err := brokerUpsertRepo(brokerURL, cfg, "admin", keys); err != nil {
-				return err
-			}
-			fmt.Fprintf(stdout, "upserted repo %s with admin user admin\n", cfg.origin)
-		}
-	}
-	return nil
-}
-
 func parseSSHSetupArgs(args []string) (sshSetupOptions, string, error) {
 	var opts sshSetupOptions
 	var repoArg string
@@ -353,10 +274,10 @@ func parseSSHSetupArgs(args []string) (sshSetupOptions, string, error) {
 			opts.noAgent = true
 		default:
 			if strings.HasPrefix(arg, "-") {
-				return opts, "", fmt.Errorf("unsupported ssh setup option %s", arg)
+				return opts, "", fmt.Errorf("unsupported ssh option %s", arg)
 			}
 			if repoArg != "" {
-				return opts, "", errors.New("ssh setup accepts at most one repository URI")
+				return opts, "", errors.New("ssh commands accept at most one repository URI")
 			}
 			repoArg = arg
 		}
@@ -377,15 +298,24 @@ func sshSetupConfig(base config, repoArg string) (config, error) {
 		return cfg, nil
 	}
 	cfg := base
-	if cfg.bucket == "" {
+	if cfg.bucket == "" && cfg.logicalRepo == "" {
 		localCfg, err := readLocalConfig(".")
 		if err != nil {
-			return config{}, errors.New("ssh setup requires a repository URI or an existing bgit origin")
+			return config{}, errors.New("ssh command requires a repository URI or an existing bgit origin")
 		}
 		cfg = mergeConfig(cfg, localCfg)
 	}
+	if cfg.brokerURL != "" && cfg.logicalRepo != "" {
+		if cfg.branch == "" {
+			cfg.branch = defaultBranch
+		}
+		if cfg.origin == "" {
+			cfg.origin = fmt.Sprintf("git@%s:%s", defaultSSHHost, strings.Trim(cfg.logicalRepo, "/"))
+		}
+		return cfg, nil
+	}
 	if cfg.bucket == "" || cfg.prefix == "" {
-		return config{}, errors.New("ssh setup requires a repository URI or an existing bgit origin")
+		return config{}, errors.New("ssh command requires a repository URI or an existing bgit origin")
 	}
 	if cfg.branch == "" {
 		cfg.branch = defaultBranch
@@ -396,39 +326,9 @@ func sshSetupConfig(base config, repoArg string) (config, error) {
 	return cfg, nil
 }
 
-func sshRepoCommand(base config, args []string, stdout io.Writer) error {
-	if len(args) == 0 || args[0] != "add" {
-		return errors.New("usage: bgit ssh repo add [--broker URL] [--key PATH] [--no-agent] [repo]")
-	}
-	opts, repoArg, err := parseSSHSetupArgs(args[1:])
-	if err != nil {
-		return err
-	}
-	cfg, err := sshSetupConfig(base, repoArg)
-	if err != nil {
-		return err
-	}
-	brokerURL, err := brokerURLForCommand(opts)
-	if err != nil {
-		return err
-	}
-	keys, err := collectSSHPublicKeys(opts)
-	if err != nil {
-		return err
-	}
-	if err := brokerUpsertRepo(brokerURL, cfg, "admin", keys); err != nil {
-		return err
-	}
-	fmt.Fprintf(stdout, "upserted repo %s in broker %s\n", cfg.origin, brokerURL)
-	if len(keys) > 0 {
-		fmt.Fprintf(stdout, "added %d admin key(s) for user admin\n", len(keys))
-	}
-	return nil
-}
-
 func sshKeysCommand(base config, args []string, stdout io.Writer) error {
 	if len(args) == 0 {
-		return errors.New("usage: bgit ssh keys list|add|remove|suspend [args]")
+		return errors.New("usage: bgit admin keys list|add|remove|suspend [args]")
 	}
 	action := args[0]
 	opts, repoArg, err := parseSSHKeyArgs(args[1:])
@@ -463,7 +363,7 @@ func sshKeysCommand(base config, args []string, stdout io.Writer) error {
 			return err
 		}
 		if len(keys) == 0 {
-			return errors.New("ssh keys add requires --key or a key loaded in ssh-agent")
+			return errors.New("admin keys add requires --key or a key loaded in ssh-agent")
 		}
 		if err := brokerAddKeys(brokerURL, cfg, opts.user, opts.role, keys); err != nil {
 			return err
@@ -491,7 +391,7 @@ func sshKeysCommand(base config, args []string, stdout io.Writer) error {
 		fmt.Fprintf(stdout, "suspended key %s\n", identity)
 		return nil
 	default:
-		return fmt.Errorf("unknown ssh keys command %q", action)
+		return fmt.Errorf("unknown admin keys command %q", action)
 	}
 }
 
@@ -556,7 +456,7 @@ func parseSSHKeyArgs(args []string) (sshKeyOptions, string, error) {
 			opts.fingerprint = value
 		default:
 			if strings.HasPrefix(arg, "-") {
-				return opts, "", fmt.Errorf("unsupported ssh keys option %s", arg)
+				return opts, "", fmt.Errorf("unsupported admin keys option %s", arg)
 			}
 			if repoArg == "" && strings.Contains(arg, "://") {
 				repoArg = arg
@@ -570,7 +470,7 @@ func parseSSHKeyArgs(args []string) (sshKeyOptions, string, error) {
 				repoArg = arg
 				continue
 			}
-			return opts, "", errors.New("too many ssh keys arguments")
+			return opts, "", errors.New("too many admin keys arguments")
 		}
 	}
 	return opts, repoArg, nil
@@ -613,7 +513,7 @@ func brokerURLForCommand(opts sshSetupOptions) (string, error) {
 			return value, nil
 		}
 	}
-	return "", errors.New("broker URL is required; run bgit ssh setup or pass --broker URL")
+	return "", errors.New("broker URL is required; run bgit setup/init or pass --broker URL")
 }
 
 func sshRemoteURL(cfg config) string {
@@ -637,12 +537,14 @@ type brokerRepo struct {
 	Bucket   string `json:"bucket"`
 	Prefix   string `json:"prefix"`
 	Origin   string `json:"origin"`
+	Logical  string `json:"logical,omitempty"`
 }
 
 type brokerKey struct {
 	User      string `json:"user"`
 	Role      string `json:"role"`
 	PublicKey string `json:"public_key"`
+	Source    string `json:"source,omitempty"`
 	Suspended bool   `json:"suspended,omitempty"`
 }
 
@@ -659,6 +561,7 @@ type brokerKeyRequest struct {
 	Role       string     `json:"role,omitempty"`
 	PublicKeys []string   `json:"public_keys,omitempty"`
 	Key        string     `json:"key,omitempty"`
+	Source     string     `json:"source,omitempty"`
 }
 
 type brokerAuthRequest struct {
@@ -673,23 +576,25 @@ type brokerAuthResponse struct {
 }
 
 type brokerRefUpdateRequest struct {
-	Repo brokerRepo `json:"repo"`
-	Ref  string     `json:"ref"`
-	Old  string     `json:"old"`
-	New  string     `json:"new"`
+	Repo     brokerRepo `json:"repo"`
+	Ref      string     `json:"ref"`
+	Old      string     `json:"old"`
+	New      string     `json:"new"`
+	Override bool       `json:"override,omitempty"`
 }
 
 type brokerKeysResponse struct {
 	Keys []brokerKey `json:"keys"`
 }
 
-func brokerUpsertRepo(brokerURL string, cfg config, adminUser string, publicKeys []string) error {
-	req := brokerRepoRequest{
-		Repo:       repoForBroker(cfg),
-		AdminUser:  adminUser,
-		PublicKeys: publicKeys,
-		Role:       "admin",
+func brokerUpsertLogicalRepo(brokerURL, provider, logicalRepo string) error {
+	cfg := config{
+		provider:    provider,
+		prefix:      strings.Trim(logicalRepo, "/"),
+		logicalRepo: strings.Trim(logicalRepo, "/"),
+		origin:      fmt.Sprintf("git@%s:%s", defaultSSHHost, strings.Trim(logicalRepo, "/")),
 	}
+	req := brokerRepoRequest{Repo: repoForBroker(cfg)}
 	return brokerPost(brokerURL, "/repos/upsert", req, nil)
 }
 
@@ -702,11 +607,20 @@ func brokerListKeys(brokerURL string, cfg config) ([]brokerKey, error) {
 }
 
 func brokerAddKeys(brokerURL string, cfg config, user, role string, publicKeys []string) error {
+	return brokerAddKeysWithSource(brokerURL, cfg, user, role, "", publicKeys)
+}
+
+func brokerAddKeysWithSource(brokerURL string, cfg config, user, role, source string, publicKeys []string) error {
+	role = normalizeBrokerRole(role)
+	if !validBrokerRole(role) {
+		return fmt.Errorf("invalid broker role %q", role)
+	}
 	req := brokerKeyRequest{
 		Repo:       repoForBroker(cfg),
 		User:       user,
 		Role:       role,
 		PublicKeys: publicKeys,
+		Source:     source,
 	}
 	return brokerPost(brokerURL, "/keys/add", req, nil)
 }
@@ -715,12 +629,35 @@ func brokerMutateKey(brokerURL, path string, cfg config, key string) error {
 	return brokerPost(brokerURL, path, brokerKeyRequest{Repo: repoForBroker(cfg), Key: key}, nil)
 }
 
+func validBrokerRole(role string) bool {
+	switch strings.TrimSpace(role) {
+	case "owner", "admin", "maintainer", "developer", "triage", "read":
+		return true
+	default:
+		return false
+	}
+}
+
+func normalizeBrokerRole(role string) string {
+	switch strings.TrimSpace(role) {
+	case "write":
+		return "developer"
+	default:
+		return strings.TrimSpace(role)
+	}
+}
+
 func brokerUpdateRef(brokerURL string, cfg config, ref, oldHash, newHash string) error {
+	return brokerUpdateRefWithOverride(brokerURL, cfg, ref, oldHash, newHash, false)
+}
+
+func brokerUpdateRefWithOverride(brokerURL string, cfg config, ref, oldHash, newHash string, override bool) error {
 	req := brokerRefUpdateRequest{
-		Repo: repoForBroker(cfg),
-		Ref:  ref,
-		Old:  firstNonEmpty(strings.TrimSpace(oldHash), zeroObjectID()),
-		New:  firstNonEmpty(strings.TrimSpace(newHash), zeroObjectID()),
+		Repo:     repoForBroker(cfg),
+		Ref:      ref,
+		Old:      firstNonEmpty(strings.TrimSpace(oldHash), zeroObjectID()),
+		New:      firstNonEmpty(strings.TrimSpace(newHash), zeroObjectID()),
+		Override: override,
 	}
 	return brokerPost(brokerURL, "/refs/update", req, nil)
 }
@@ -776,7 +713,7 @@ func brokerURLForSSHService(cfg config) (string, error) {
 	}
 	url, err := discoverBrokerURL(cfg, sshSetupOptions{})
 	if err != nil {
-		return "", fmt.Errorf("broker URL is required for SSH Git access; run bgit ssh setup: %w", err)
+		return "", fmt.Errorf("broker URL is required for SSH Git access; run bgit init: %w", err)
 	}
 	return url, nil
 }
@@ -785,11 +722,13 @@ func repoForBroker(cfg config) brokerRepo {
 	if cfg.origin == "" {
 		cfg.origin = originForConfig(cfg)
 	}
+	logical := strings.Trim(firstNonEmpty(cfg.logicalRepo, cfg.prefix), "/")
 	return brokerRepo{
 		Provider: firstNonEmpty(cfg.provider, "gcs"),
 		Bucket:   cfg.bucket,
 		Prefix:   strings.Trim(cfg.prefix, "/"),
 		Origin:   cfg.origin,
+		Logical:  logical,
 	}
 }
 
@@ -803,62 +742,156 @@ func brokerPostContext(ctx context.Context, brokerURL, path string, req any, res
 	if err != nil {
 		return err
 	}
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(data))
-	if err != nil {
-		return err
+	headerSets := brokerSignatureHeaderSetsForBroker(brokerURL, data)
+	if len(headerSets) == 0 {
+		headerSets = []map[string]string{{}}
+	} else {
+		headerSets = append(headerSets, map[string]string{})
 	}
-	httpReq.Header.Set("content-type", "application/json")
-	for key, value := range brokerSignatureHeaders(data) {
-		httpReq.Header.Set(key, value)
-	}
-	httpResp, err := http.DefaultClient.Do(httpReq)
-	if err != nil {
-		return err
-	}
-	defer httpResp.Body.Close()
-	body, readErr := io.ReadAll(httpResp.Body)
-	if readErr != nil {
-		return readErr
-	}
-	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
+	var lastErr error
+	for i, headers := range headerSets {
+		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(data))
+		if err != nil {
+			return err
+		}
+		httpReq.Header.Set("content-type", "application/json")
+		for key, value := range headers {
+			httpReq.Header.Set(key, value)
+		}
+		httpResp, err := http.DefaultClient.Do(httpReq)
+		if err != nil {
+			return err
+		}
+		body, readErr := io.ReadAll(httpResp.Body)
+		_ = httpResp.Body.Close()
+		if readErr != nil {
+			return readErr
+		}
+		if httpResp.StatusCode >= 200 && httpResp.StatusCode < 300 {
+			if fingerprint := headers["X-Bgit-Key-Fingerprint"]; fingerprint != "" {
+				_ = writeRepoAuthCache(brokerURL, data, fingerprint)
+			}
+			if resp != nil && len(body) > 0 {
+				if err := json.Unmarshal(body, resp); err != nil {
+					return err
+				}
+			}
+			return nil
+		}
 		msg := strings.TrimSpace(string(body))
 		if msg == "" {
 			msg = httpResp.Status
 		}
-		return fmt.Errorf("broker %s: %s", path, msg)
-	}
-	if resp != nil && len(body) > 0 {
-		if err := json.Unmarshal(body, resp); err != nil {
-			return err
+		lastErr = fmt.Errorf("broker %s: %s", path, msg)
+		if httpResp.StatusCode != http.StatusForbidden || i == len(headerSets)-1 || !brokerForbiddenAllowsSignatureRetry(msg) {
+			return lastErr
 		}
 	}
-	return nil
+	return lastErr
+}
+
+func brokerForbiddenAllowsSignatureRetry(msg string) bool {
+	msg = strings.ToLower(strings.TrimSpace(msg))
+	if msg == "" {
+		return false
+	}
+	return strings.Contains(msg, "ssh signature required")
 }
 
 func brokerSignatureHeaders(payload []byte) map[string]string {
-	headers := map[string]string{}
-	sock := strings.TrimSpace(os.Getenv("SSH_AUTH_SOCK"))
-	if sock == "" {
-		return headers
+	sets := brokerSignatureHeaderSetsForBroker("", payload)
+	if len(sets) == 0 {
+		return map[string]string{}
 	}
-	conn, err := net.Dial("unix", sock)
-	if err != nil {
-		return headers
+	return sets[0]
+}
+
+func brokerSignatureHeaderSets(payload []byte) []map[string]string {
+	return brokerSignatureHeaderSetsForBroker("", payload)
+}
+
+func brokerSignatureHeaderSetsForBroker(brokerURL string, payload []byte) []map[string]string {
+	signers := explicitBrokerSigners()
+	agentSigners, cleanup, err := sshAgentSigners()
+	if err == nil && len(agentSigners) > 0 {
+		signers = append(signers, agentSigners...)
 	}
-	defer conn.Close()
-	signers, err := agent.NewClient(conn).Signers()
-	if err != nil || len(signers) == 0 {
-		return headers
+	if len(signers) == 0 {
+		return nil
+	}
+	if cleanup != nil {
+		defer cleanup()
 	}
 	message := brokerSignatureMessage(payload)
-	sig, err := signers[0].Sign(nil, message)
-	if err != nil {
-		return headers
+	preferred := preferredBrokerKeyFingerprints(brokerURL, payload)
+	type signedHeaders struct {
+		fingerprint string
+		headers     map[string]string
 	}
-	headers["X-Bgit-Key"] = strings.TrimSpace(string(ssh.MarshalAuthorizedKey(signers[0].PublicKey())))
-	headers["X-Bgit-Signature"] = base64.StdEncoding.EncodeToString(ssh.Marshal(sig))
-	headers["X-Bgit-Signature-Message"] = base64.StdEncoding.EncodeToString(message)
-	return headers
+	var signed []signedHeaders
+	for _, signer := range signers {
+		sig, err := signer.Sign(rand.Reader, message)
+		if err != nil {
+			continue
+		}
+		fingerprint := ssh.FingerprintSHA256(signer.PublicKey())
+		signed = append(signed, signedHeaders{fingerprint: fingerprint, headers: map[string]string{
+			"X-Bgit-Key":               strings.TrimSpace(string(ssh.MarshalAuthorizedKey(signer.PublicKey()))),
+			"X-Bgit-Key-Fingerprint":   fingerprint,
+			"X-Bgit-Signature":         base64.StdEncoding.EncodeToString(ssh.Marshal(sig)),
+			"X-Bgit-Signature-Message": base64.StdEncoding.EncodeToString(message),
+		}})
+	}
+	sort.SliceStable(signed, func(i, j int) bool {
+		return preferredBrokerKeyRank(signed[i].fingerprint, preferred) < preferredBrokerKeyRank(signed[j].fingerprint, preferred)
+	})
+	var sets []map[string]string
+	for _, item := range signed {
+		sets = append(sets, item.headers)
+	}
+	return sets
+}
+
+func explicitBrokerSigners() []ssh.Signer {
+	var paths []string
+	for _, envName := range []string{"BGIT_SSH_KEY", "BGIT_SSH_KEYS"} {
+		for _, value := range filepath.SplitList(os.Getenv(envName)) {
+			if value = strings.TrimSpace(value); value != "" {
+				paths = append(paths, value)
+			}
+		}
+	}
+	if value := strings.TrimSpace(brokerIdentityPreference); value != "" && !strings.HasPrefix(value, "SHA256:") {
+		paths = append(paths, value)
+	}
+	seen := map[string]struct{}{}
+	var signers []ssh.Signer
+	for _, path := range paths {
+		path = expandHome(path)
+		if _, ok := seen[path]; ok {
+			continue
+		}
+		seen[path] = struct{}{}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		signer, err := ssh.ParsePrivateKey(data)
+		if err != nil {
+			continue
+		}
+		signers = append(signers, signer)
+	}
+	return signers
+}
+
+func preferredBrokerKeyRank(fingerprint string, preferred []string) int {
+	for i, value := range preferred {
+		if strings.EqualFold(strings.TrimSpace(value), strings.TrimSpace(fingerprint)) {
+			return i
+		}
+	}
+	return len(preferred) + 1
 }
 
 func brokerSignatureMessage(payload []byte) []byte {
@@ -915,15 +948,13 @@ func discoverAWSBrokerURL(cfg config, opts sshSetupOptions) (string, error) {
 	region := firstNonEmpty(strings.TrimSpace(opts.region), defaultAWSRegion())
 	profile := strings.TrimSpace(cfg.gcloudConfiguration)
 	args := []string{"cloudformation", "describe-stacks", "--stack-name", "bgit-broker", "--region", region, "--query", "Stacks[0].Outputs[?OutputKey=='BrokerUrl'].OutputValue | [0]", "--output", "text"}
-	args = appendAWSProfile(args, profile)
-	if out, err := exec.Command("aws", args...).Output(); err == nil {
+	if out, err := awsCommand(context.Background(), profile, args...).Output(); err == nil {
 		if url := cleanBrokerURL(string(out)); url != "" {
 			return url, nil
 		}
 	}
 	args = []string{"ssm", "get-parameter", "--name", "/bgit/broker/default/url", "--region", region, "--query", "Parameter.Value", "--output", "text"}
-	args = appendAWSProfile(args, profile)
-	if out, err := exec.Command("aws", args...).Output(); err == nil {
+	if out, err := awsCommand(context.Background(), profile, args...).Output(); err == nil {
 		if url := cleanBrokerURL(string(out)); url != "" {
 			return url, nil
 		}
@@ -950,6 +981,16 @@ func provisionGCPBrokerURL(cfg config, opts sshSetupOptions, stdout io.Writer) (
 	if err := ensureGCPBrokerFirestoreDatabase(cfg, opts, stdout); err != nil {
 		return "", err
 	}
+	serviceAccount, err := ensureGCPBrokerServiceAccount(cfg, stdout)
+	if err != nil {
+		return "", err
+	}
+	if err := ensureGCPBrokerRuntimePermissions(cfg, serviceAccount, stdout); err != nil {
+		return "", err
+	}
+	if err := ensureGCPBrokerDeployerPermission(cfg, serviceAccount, stdout); err != nil {
+		return "", err
+	}
 	sourceDir, err := os.MkdirTemp("", "bgit-gcp-broker-*")
 	if err != nil {
 		return "", err
@@ -968,32 +1009,310 @@ func provisionGCPBrokerURL(cfg config, opts sshSetupOptions, stdout io.Writer) (
 		"--entry-point", "broker",
 		"--trigger-http",
 		"--allow-unauthenticated",
-		"--set-env-vars", "FIRESTORE_DATABASE="+gcpBrokerFirestoreDatabase(opts),
+		"--service-account", serviceAccount,
+		"--set-env-vars", "FIRESTORE_DATABASE="+gcpBrokerFirestoreDatabase(opts)+",BROKER_VERSION="+brokerVersion+",BGIT_SIGNING_SERVICE_ACCOUNT="+serviceAccount,
 		"--quiet",
 	)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return "", fmt.Errorf("deploy GCP bgit broker: %w\n%s", err, strings.TrimSpace(string(out)))
 	}
+	if err := ensureGCPBrokerSigningPermission(cfg, serviceAccount, stdout); err != nil {
+		return "", err
+	}
 	return discoverGCPBrokerURL(cfg, opts)
 }
 
 func ensureGCPBrokerServices(cfg config, stdout io.Writer) error {
+	project := gcloudProject(cfg)
+	if project == "" {
+		return errors.New("GCP project is not configured")
+	}
 	services := []string{
+		"serviceusage.googleapis.com",
+		"cloudresourcemanager.googleapis.com",
 		"cloudfunctions.googleapis.com",
 		"run.googleapis.com",
 		"cloudbuild.googleapis.com",
 		"artifactregistry.googleapis.com",
 		"firestore.googleapis.com",
+		"iamcredentials.googleapis.com",
 	}
 	fmt.Fprintf(stdout, "ensuring GCP broker APIs are enabled\n")
 	args := append([]string{"services", "enable"}, services...)
+	args = append(args, "--project="+project, "--quiet")
 	cmd := gcloudCommand(cfg.gcloudConfiguration, args...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
+		if gcpBrokerServicesNeedBilling(string(out)) {
+			return fmt.Errorf("enable GCP broker APIs: project %s does not have billing enabled; link a billing account with `gcloud billing projects link %s --billing-account BILLING_ACCOUNT` and rerun setup\n%s", project, project, strings.TrimSpace(string(out)))
+		}
 		return fmt.Errorf("enable GCP broker APIs: %w\n%s", err, strings.TrimSpace(string(out)))
 	}
+	if err := waitForGCPBrokerServices(cfg, project, services, stdout); err != nil {
+		return err
+	}
 	return nil
+}
+
+func gcpBrokerServicesNeedBilling(message string) bool {
+	message = strings.ToLower(message)
+	return strings.Contains(message, "billing account") && strings.Contains(message, "not found") ||
+		strings.Contains(message, "billing must be enabled") ||
+		strings.Contains(message, "ureq_project_billing_not_found") ||
+		strings.Contains(message, "billing-enabled")
+}
+
+func waitForGCPBrokerServices(cfg config, project string, services []string, stdout io.Writer) error {
+	return waitForGCPServicesEnabled(cfg, project, services, stdout, "GCP broker APIs")
+}
+
+func waitForGCPServicesEnabled(cfg config, project string, services []string, stdout io.Writer, label string) error {
+	want := map[string]struct{}{}
+	for _, service := range services {
+		want[service] = struct{}{}
+	}
+	var lastMissing []string
+	for i := 0; i < 24; i++ {
+		enabled, err := gcpEnabledServices(cfg, project)
+		if err == nil {
+			missing := missingGCPServices(want, enabled)
+			if len(missing) == 0 {
+				return nil
+			}
+			lastMissing = missing
+		}
+		if i == 0 {
+			fmt.Fprintf(stdout, "waiting for %s to become enabled\n", label)
+		}
+		time.Sleep(5 * time.Second)
+	}
+	if len(lastMissing) == 0 {
+		return fmt.Errorf("%s were not visible as enabled before timeout", label)
+	}
+	return fmt.Errorf("%s were not visible as enabled before timeout: %s", label, strings.Join(lastMissing, ", "))
+}
+
+func gcpEnabledServices(cfg config, project string) (map[string]struct{}, error) {
+	cmd := gcloudCommand(cfg.gcloudConfiguration,
+		"services", "list",
+		"--enabled",
+		"--project="+project,
+		"--format=value(config.name)",
+	)
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, err
+	}
+	enabled := map[string]struct{}{}
+	scanner := bufio.NewScanner(bytes.NewReader(out))
+	for scanner.Scan() {
+		for _, service := range strings.Fields(scanner.Text()) {
+			enabled[service] = struct{}{}
+		}
+	}
+	return enabled, scanner.Err()
+}
+
+func missingGCPServices(want map[string]struct{}, enabled map[string]struct{}) []string {
+	var missing []string
+	for service := range want {
+		if _, ok := enabled[service]; !ok {
+			missing = append(missing, service)
+		}
+	}
+	sort.Strings(missing)
+	return missing
+}
+
+func ensureGCPBrokerServiceAccount(cfg config, stdout io.Writer) (string, error) {
+	project := gcloudProject(cfg)
+	if project == "" {
+		return "", errors.New("GCP project is not configured")
+	}
+	email := gcpBrokerServiceAccountEmail(project)
+	describe := gcloudCommand(cfg.gcloudConfiguration,
+		"iam", "service-accounts", "describe", email,
+		"--format=value(email)",
+	)
+	if out, err := describe.Output(); err == nil && strings.TrimSpace(string(out)) != "" {
+		fmt.Fprintf(stdout, "using GCP broker service account %s\n", email)
+		return email, nil
+	}
+	fmt.Fprintf(stdout, "creating GCP broker service account %s\n", email)
+	create := gcloudCommand(cfg.gcloudConfiguration,
+		"iam", "service-accounts", "create", "bgit-broker",
+		"--display-name=BucketGit Broker",
+		"--project="+project,
+		"--quiet",
+	)
+	out, err := create.CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("create GCP broker service account %s: %w\n%s", email, err, strings.TrimSpace(string(out)))
+	}
+	return email, nil
+}
+
+func gcpBrokerServiceAccountEmail(project string) string {
+	return "bgit-broker@" + project + ".iam.gserviceaccount.com"
+}
+
+func ensureGCPBrokerRuntimePermissions(cfg config, serviceAccount string, stdout io.Writer) error {
+	project := gcloudProject(cfg)
+	if project == "" {
+		return errors.New("GCP project is not configured")
+	}
+	for _, role := range []string{"roles/datastore.user", "roles/storage.admin"} {
+		fmt.Fprintf(stdout, "granting GCP broker %s to %s\n", role, serviceAccount)
+		cmd := gcloudCommand(cfg.gcloudConfiguration,
+			"projects", "add-iam-policy-binding", project,
+			"--member=serviceAccount:"+serviceAccount,
+			"--role="+role,
+			"--quiet",
+		)
+		out, err := runGcloudIAMBindingWithRetry(cmd)
+		if err != nil {
+			return fmt.Errorf("grant GCP broker %s: %w\n%s", role, err, strings.TrimSpace(string(out)))
+		}
+	}
+	return nil
+}
+
+func ensureGCPBrokerDeployerPermission(cfg config, serviceAccount string, stdout io.Writer) error {
+	account := gcloudAccount(cfg)
+	if account == "" {
+		return nil
+	}
+	member := "user:" + account
+	if strings.HasSuffix(account, ".gserviceaccount.com") {
+		member = "serviceAccount:" + account
+	}
+	fmt.Fprintf(stdout, "granting GCP broker deploy permission to %s\n", member)
+	cmd := gcloudCommand(cfg.gcloudConfiguration,
+		"iam", "service-accounts", "add-iam-policy-binding", serviceAccount,
+		"--member="+member,
+		"--role=roles/iam.serviceAccountUser",
+		"--quiet",
+	)
+	out, err := runGcloudIAMBindingWithRetry(cmd)
+	if err != nil {
+		if fallbackErr := ensureGCPBrokerProjectDeployerPermission(cfg, member); fallbackErr != nil {
+			return fmt.Errorf("grant GCP broker deploy permission: %w\n%s", err, strings.TrimSpace(string(out)))
+		}
+	}
+	return nil
+}
+
+func ensureGCPBrokerProjectDeployerPermission(cfg config, member string) error {
+	project := gcloudProject(cfg)
+	if project == "" {
+		return errors.New("GCP project is not configured")
+	}
+	cmd := gcloudCommand(cfg.gcloudConfiguration,
+		"projects", "add-iam-policy-binding", project,
+		"--member="+member,
+		"--role=roles/iam.serviceAccountUser",
+		"--quiet",
+	)
+	out, err := runGcloudIAMBindingWithRetry(cmd)
+	if err != nil {
+		return fmt.Errorf("grant project-level deploy permission: %w\n%s", err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+func ensureGCPBrokerSigningPermission(cfg config, serviceAccount string, stdout io.Writer) error {
+	fmt.Fprintf(stdout, "granting GCP broker signBlob permission to %s\n", serviceAccount)
+	args := []string{
+		"iam", "service-accounts", "add-iam-policy-binding", serviceAccount,
+		"--member=serviceAccount:" + serviceAccount,
+		"--role=roles/iam.serviceAccountTokenCreator",
+		"--quiet",
+	}
+	if project := gcloudProject(cfg); project != "" {
+		args = append(args, "--project="+project)
+	}
+	cmd := gcloudCommand(cfg.gcloudConfiguration, args...)
+	bindOut, bindErr := runGcloudIAMBindingWithRetry(cmd)
+	if bindErr != nil {
+		if err := ensureGCPBrokerProjectSigningPermission(cfg, serviceAccount); err != nil {
+			return fmt.Errorf("grant GCP broker signBlob permission: %w\n%s", bindErr, strings.TrimSpace(string(bindOut)))
+		}
+	}
+	return nil
+}
+
+func ensureGCPBrokerProjectSigningPermission(cfg config, serviceAccount string) error {
+	project := gcloudProject(cfg)
+	if project == "" {
+		return errors.New("GCP project is not configured")
+	}
+	cmd := gcloudCommand(cfg.gcloudConfiguration,
+		"projects", "add-iam-policy-binding", project,
+		"--member=serviceAccount:"+serviceAccount,
+		"--role=roles/iam.serviceAccountTokenCreator",
+		"--quiet",
+	)
+	out, err := runGcloudIAMBindingWithRetry(cmd)
+	if err != nil {
+		return fmt.Errorf("grant project-level signBlob permission: %w\n%s", err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+func runGcloudIAMBindingWithRetry(cmd *exec.Cmd) ([]byte, error) {
+	out, err := cmd.CombinedOutput()
+	if err == nil || !gcloudIAMBindingRetryable(string(out), err) {
+		return out, err
+	}
+	var lastOut []byte
+	var lastErr error
+	for attempt := 0; attempt < 8; attempt++ {
+		time.Sleep(time.Duration(attempt+1) * time.Second)
+		retry := exec.Command(cmd.Path, cmd.Args[1:]...)
+		retry.Env = cmd.Env
+		retry.Dir = cmd.Dir
+		lastOut, lastErr = retry.CombinedOutput()
+		if lastErr == nil || !gcloudIAMBindingRetryable(string(lastOut), lastErr) {
+			return lastOut, lastErr
+		}
+	}
+	return lastOut, lastErr
+}
+
+func gcloudIAMBindingRetryable(out string, err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(out + "\n" + err.Error())
+	return strings.Contains(message, "service account") &&
+		(strings.Contains(message, "does not exist") ||
+			strings.Contains(message, "not found") ||
+			strings.Contains(message, "principal") && strings.Contains(message, "not found"))
+}
+
+func gcloudAccount(cfg config) string {
+	out, err := gcloudCommand(cfg.gcloudConfiguration, "config", "get-value", "account", "--quiet").Output()
+	if err != nil {
+		return ""
+	}
+	value := strings.TrimSpace(string(out))
+	if value == "(unset)" {
+		return ""
+	}
+	return value
+}
+
+func gcloudProject(cfg config) string {
+	out, err := gcloudCommand(cfg.gcloudConfiguration, "config", "get-value", "project", "--quiet").Output()
+	if err != nil {
+		return ""
+	}
+	value := strings.TrimSpace(string(out))
+	if value == "(unset)" {
+		return ""
+	}
+	return value
 }
 
 func ensureGCPBrokerFirestoreDatabase(cfg config, opts sshSetupOptions, stdout io.Writer) error {
@@ -1027,281 +1346,6 @@ func gcpBrokerFirestoreDatabase(opts sshSetupOptions) string {
 	return firstNonEmpty(strings.TrimSpace(opts.firestoreDatabase), os.Getenv("BGIT_FIRESTORE_DATABASE"), "bgit")
 }
 
-func writeGCPBrokerSource(dir string) error {
-	files := map[string]string{
-		"package.json": `{"scripts":{"start":"functions-framework --target=broker"},"dependencies":{"@google-cloud/functions-framework":"^3.4.0","@google-cloud/firestore":"^7.10.0","@google-cloud/storage":"^7.16.0"}}
-`,
-		"index.js": `'use strict';
-
-const crypto = require('crypto');
-const {Firestore} = require('@google-cloud/firestore');
-const {Storage} = require('@google-cloud/storage');
-const db = new Firestore({databaseId: process.env.FIRESTORE_DATABASE || 'bgit'});
-const repos = db.collection('bgit_broker_repos');
-const storage = new Storage();
-
-function repoID(repo) {
-  return [repo.provider || 'gcs', repo.bucket, repo.prefix].join(':');
-}
-
-function docID(repo) {
-  return Buffer.from(repoID(repo)).toString('base64url');
-}
-
-async function loadRepo(repo) {
-  const ref = repos.doc(docID(repo));
-  const snap = await ref.get();
-  if (!snap.exists) return {ref, data: {repo, keys: []}};
-  const data = snap.data() || {};
-  data.repo = data.repo || repo;
-  data.keys = data.keys || [];
-  return {ref, data};
-}
-
-async function saveRepo(entry) {
-  await entry.ref.set(entry.data, {merge: true});
-}
-
-function readSSHString(buf, offset) {
-  const len = buf.readUInt32BE(offset);
-  const start = offset + 4;
-  return {value: buf.subarray(start, start + len), offset: start + len};
-}
-
-function rawBody(req) {
-  if (req.rawBody) return Buffer.from(req.rawBody);
-  return Buffer.from(JSON.stringify(req.body || {}));
-}
-
-function expectedMessage(req) {
-  const digest = crypto.createHash('sha256').update(rawBody(req)).digest('base64');
-  return Buffer.from('bgit-broker-v1\n' + digest).toString('base64');
-}
-
-function normalizeKey(key) {
-  return String(key || '').trim().split(/\s+/).slice(0, 2).join(' ');
-}
-
-function publicKeyObject(publicKey) {
-  const parts = normalizeKey(publicKey).split(/\s+/);
-  if (parts[0] !== 'ssh-ed25519') return crypto.createPublicKey(publicKey);
-  const blob = Buffer.from(parts[1], 'base64');
-  let parsed = readSSHString(blob, 0);
-  const alg = parsed.value.toString();
-  if (alg !== 'ssh-ed25519') throw new Error('unsupported SSH key algorithm');
-  parsed = readSSHString(blob, parsed.offset);
-  const derPrefix = Buffer.from('302a300506032b6570032100', 'hex');
-  return crypto.createPublicKey({key: Buffer.concat([derPrefix, parsed.value]), format: 'der', type: 'spki'});
-}
-
-function verifySignature(req, entry) {
-  const adminKeys = (entry.data.keys || []).filter((k) => k.role === 'admin' && !k.suspended);
-  if (adminKeys.length === 0) return true;
-  const key = signedKey(req, entry);
-  return !!key && key.role === 'admin';
-}
-
-function signedKey(req, entry) {
-  const keys = (entry.data.keys || []).filter((k) => !k.suspended);
-  const publicKey = normalizeKey(req.get('x-bgit-key'));
-  const message = String(req.get('x-bgit-signature-message') || '');
-  const signature = String(req.get('x-bgit-signature') || '');
-  if (!publicKey || !message || !signature || message !== expectedMessage(req)) return null;
-  const key = keys.find((k) => normalizeKey(k.public_key) === publicKey);
-  if (!key) return null;
-  const parsed = readSSHString(Buffer.from(signature, 'base64'), 0);
-  const alg = parsed.value.toString();
-  const sig = readSSHString(Buffer.from(signature, 'base64'), parsed.offset).value;
-  const verifyAlg = alg === 'ssh-ed25519' ? null : 'sha256';
-  if (!crypto.verify(verifyAlg, Buffer.from(message, 'base64'), publicKeyObject(publicKey), sig)) return null;
-  return key;
-}
-
-function roleAllows(role, operation) {
-  if (role === 'admin') return true;
-  if (operation === 'read') return role === 'read' || role === 'write';
-  if (operation === 'write') return role === 'write';
-  return false;
-}
-
-function cleanObjectPath(value) {
-  const path = String(value || '').replace(/^\/+/, '');
-  if (path.includes('\0')) throw new Error('invalid object path');
-  return path;
-}
-
-function objectName(repo, objectPath) {
-  const prefix = String(repo.prefix || '').replace(/^\/+|\/+$/g, '');
-  const path = cleanObjectPath(objectPath);
-  return prefix ? prefix + '/' + path : path;
-}
-
-function requireRead(req, entry) {
-  const key = signedKey(req, entry);
-  if (!key || !roleAllows(key.role, 'read')) {
-    const err = new Error('read SSH signature required');
-    err.status = 403;
-    throw err;
-  }
-}
-
-async function readObject(repo, objectPath) {
-  const [data] = await storage.bucket(repo.bucket).file(objectName(repo, objectPath)).download();
-  return data.toString('base64');
-}
-
-async function listObjects(repo, prefix) {
-  const repoPrefix = String(repo.prefix || '').replace(/^\/+|\/+$/g, '');
-  const queryPrefix = objectName(repo, prefix);
-  const [files] = await storage.bucket(repo.bucket).getFiles({prefix: queryPrefix});
-  const strip = repoPrefix ? repoPrefix + '/' : '';
-  return files.map((file) => file.name.startsWith(strip) ? file.name.slice(strip.length) : file.name);
-}
-
-async function updateRefCAS(repo, ref, oldHash, newHash) {
-  const id = docID(repo);
-  const refDoc = repos.doc(id);
-  await db.runTransaction(async (tx) => {
-    const snap = await tx.get(refDoc);
-    const data = snap.exists ? (snap.data() || {}) : {repo, keys: [], refs: {}};
-    data.repo = data.repo || repo;
-    data.keys = data.keys || [];
-    data.refs = data.refs || {};
-    const zero = '0000000000000000000000000000000000000000';
-    const current = Object.prototype.hasOwnProperty.call(data.refs, ref) ? data.refs[ref] : oldHash;
-    if (current !== oldHash) {
-      const err = new Error('stale ref');
-      err.status = 409;
-      throw err;
-    }
-    if (newHash === zero) {
-      delete data.refs[ref];
-    } else {
-      data.refs[ref] = newHash;
-    }
-    tx.set(refDoc, data, {merge: true});
-  });
-}
-
-async function ensureRepo(repo) {
-  const id = repoID(repo);
-  if (!repo || !repo.bucket || !repo.prefix) throw new Error('repo is required');
-  return loadRepo(repo);
-}
-
-function requireAdmin(req, entry) {
-  if (!verifySignature(req, entry)) {
-    const err = new Error('admin SSH signature required');
-    err.status = 403;
-    throw err;
-  }
-}
-
-exports.broker = async (req, res) => {
-  res.set('content-type', 'application/json');
-  if (req.path === '/health' || req.path === '/') {
-    res.status(200).send(JSON.stringify({ok: true, service: 'bgit-broker'}));
-    return;
-  }
-  try {
-    const body = req.body || {};
-    if (req.path === '/repos/upsert' && req.method === 'POST') {
-      const entry = await ensureRepo(body.repo);
-      requireAdmin(req, entry);
-      const user = body.admin_user || 'admin';
-      const role = body.role || 'admin';
-      for (const publicKey of body.public_keys || []) {
-        if (!entry.data.keys.find((k) => normalizeKey(k.public_key) === normalizeKey(publicKey))) {
-          entry.data.keys.push({user, role, public_key: publicKey, suspended: false});
-        }
-      }
-      await saveRepo(entry);
-      res.status(200).send(JSON.stringify({ok: true}));
-      return;
-    }
-    if (req.path === '/keys/list' && req.method === 'POST') {
-      const entry = await ensureRepo(body.repo);
-      requireAdmin(req, entry);
-      res.status(200).send(JSON.stringify({keys: entry.data.keys}));
-      return;
-    }
-    if (req.path === '/keys/add' && req.method === 'POST') {
-      const entry = await ensureRepo(body.repo);
-      requireAdmin(req, entry);
-      const user = body.user || 'admin';
-      const role = body.role || 'read';
-      for (const publicKey of body.public_keys || []) {
-        if (!entry.data.keys.find((k) => normalizeKey(k.public_key) === normalizeKey(publicKey))) {
-          entry.data.keys.push({user, role, public_key: publicKey, suspended: false});
-        }
-      }
-      await saveRepo(entry);
-      res.status(200).send(JSON.stringify({ok: true}));
-      return;
-    }
-    if ((req.path === '/keys/remove' || req.path === '/keys/suspend') && req.method === 'POST') {
-      const entry = await ensureRepo(body.repo);
-      requireAdmin(req, entry);
-      const key = String(body.key || '').trim();
-      const normalized = normalizeKey(key);
-      const match = (k) => normalizeKey(k.public_key) === normalized || k.public_key.includes(key);
-      if (req.path === '/keys/remove') {
-        entry.data.keys = entry.data.keys.filter((k) => !match(k));
-      } else {
-        for (const item of entry.data.keys) if (match(item)) item.suspended = true;
-      }
-      await saveRepo(entry);
-      res.status(200).send(JSON.stringify({ok: true}));
-      return;
-    }
-    if (req.path === '/auth/check' && req.method === 'POST') {
-      const entry = await ensureRepo(body.repo);
-      const key = signedKey(req, entry);
-      const operation = body.operation || '';
-      const allowed = !!key && roleAllows(key.role, operation);
-      res.status(200).send(JSON.stringify({allowed, user: key && key.user, role: key && key.role}));
-      return;
-    }
-    if (req.path === '/objects/read' && req.method === 'POST') {
-      const entry = await ensureRepo(body.repo);
-      requireRead(req, entry);
-      const data = await readObject(body.repo, body.path);
-      res.status(200).send(JSON.stringify({data}));
-      return;
-    }
-    if (req.path === '/objects/list' && req.method === 'POST') {
-      const entry = await ensureRepo(body.repo);
-      requireRead(req, entry);
-      const paths = await listObjects(body.repo, body.prefix);
-      res.status(200).send(JSON.stringify({paths}));
-      return;
-    }
-    if (req.path === '/refs/update' && req.method === 'POST') {
-      const entry = await ensureRepo(body.repo);
-      const key = signedKey(req, entry);
-      if (!key || !roleAllows(key.role, 'write')) {
-        res.status(403).send(JSON.stringify({error: 'write SSH signature required'}));
-        return;
-      }
-      await updateRefCAS(body.repo, body.ref, body.old, body.new);
-      res.status(200).send(JSON.stringify({ok: true}));
-      return;
-    }
-    res.status(404).send(JSON.stringify({error: 'unknown broker endpoint'}));
-  } catch (err) {
-    res.status(err.status || 500).send(JSON.stringify({error: err.message || String(err)}));
-  }
-};
-`,
-	}
-	for name, body := range files {
-		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o644); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
 func provisionAWSBrokerURL(cfg config, opts sshSetupOptions, stdout io.Writer) (string, error) {
 	region := firstNonEmpty(strings.TrimSpace(opts.region), defaultAWSRegion())
 	template, err := os.CreateTemp("", "bgit-aws-broker-*.yaml")
@@ -1317,354 +1361,54 @@ func provisionAWSBrokerURL(cfg config, opts sshSetupOptions, stdout io.Writer) (
 	if err := template.Close(); err != nil {
 		return "", err
 	}
-	fmt.Fprintf(stdout, "deploying AWS CloudFormation stack bgit-broker in %s\n", region)
+	fmt.Fprintf(stdout, "deploying AWS CloudFormation stack bgit-broker in %s", region)
+	if strings.TrimSpace(cfg.gcloudConfiguration) != "" {
+		fmt.Fprintf(stdout, " with profile %s", strings.TrimSpace(cfg.gcloudConfiguration))
+	}
+	fmt.Fprintln(stdout)
+	s3Bucket, err := ensureAWSBrokerDeploymentBucket(cfg, region, stdout)
+	if err != nil {
+		return "", err
+	}
 	args := []string{
 		"cloudformation", "deploy",
 		"--stack-name", "bgit-broker",
 		"--template-file", templatePath,
+		"--s3-bucket", s3Bucket,
 		"--capabilities", "CAPABILITY_NAMED_IAM",
 		"--region", region,
 	}
-	args = appendAWSProfile(args, strings.TrimSpace(cfg.gcloudConfiguration))
-	out, err := exec.Command("aws", args...).CombinedOutput()
+	out, err := awsCommand(context.Background(), strings.TrimSpace(cfg.gcloudConfiguration), args...).CombinedOutput()
 	if err != nil {
 		return "", fmt.Errorf("deploy AWS bgit broker: %w\n%s", err, strings.TrimSpace(string(out)))
 	}
 	return discoverAWSBrokerURL(cfg, opts)
 }
 
-func awsBrokerCloudFormationTemplate() string {
-	return `AWSTemplateFormatVersion: '2010-09-09'
-Description: Minimal bgit SSH broker control-plane endpoint.
-Resources:
-  BrokerRole:
-    Type: AWS::IAM::Role
-    Properties:
-      RoleName: !Sub bgit-broker-${AWS::Region}
-      AssumeRolePolicyDocument:
-        Version: '2012-10-17'
-        Statement:
-          - Effect: Allow
-            Principal:
-              Service: lambda.amazonaws.com
-            Action: sts:AssumeRole
-      ManagedPolicyArns:
-        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
-      Policies:
-        - PolicyName: bgit-broker-table
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - Effect: Allow
-                Action:
-                  - dynamodb:GetItem
-                  - dynamodb:PutItem
-                Resource: !GetAtt BrokerTable.Arn
-              - Effect: Allow
-                Action:
-                  - s3:GetObject
-                Resource: arn:aws:s3:::*/*
-              - Effect: Allow
-                Action:
-                  - s3:ListBucket
-                Resource: arn:aws:s3:::*
-  BrokerTable:
-    Type: AWS::DynamoDB::Table
-    Properties:
-      TableName: bgit-broker-repos
-      BillingMode: PAY_PER_REQUEST
-      AttributeDefinitions:
-        - AttributeName: id
-          AttributeType: S
-      KeySchema:
-        - AttributeName: id
-          KeyType: HASH
-  BrokerFunction:
-    Type: AWS::Lambda::Function
-    Properties:
-      FunctionName: bgit-broker
-      Runtime: nodejs22.x
-      Handler: index.handler
-      Role: !GetAtt BrokerRole.Arn
-      Environment:
-        Variables:
-          TABLE_NAME: !Ref BrokerTable
-      Code:
-        ZipFile: |
-          const crypto = require("crypto");
-          const {DynamoDBClient, GetItemCommand, PutItemCommand} = require("@aws-sdk/client-dynamodb");
-          const {S3Client, GetObjectCommand, ListObjectsV2Command} = require("@aws-sdk/client-s3");
-          const db = new DynamoDBClient({});
-          const s3 = new S3Client({});
-          const table = process.env.TABLE_NAME;
-          function repoID(repo) {
-            return [repo.provider || "s3", repo.bucket, repo.prefix].join(":");
-          }
-          function docID(repo) {
-            return Buffer.from(repoID(repo)).toString("base64url");
-          }
-          async function loadRepo(repo) {
-            if (!repo || !repo.bucket || !repo.prefix) throw new Error("repo is required");
-            const id = docID(repo);
-            const out = await db.send(new GetItemCommand({TableName: table, Key: {id: {S: id}}}));
-            if (!out.Item) return {id, data: {repo, keys: []}};
-            const data = JSON.parse(out.Item.data.S || "{}");
-            data.repo = data.repo || repo;
-            data.keys = data.keys || [];
-            return {id, data};
-          }
-          async function saveRepo(entry) {
-            await db.send(new PutItemCommand({TableName: table, Item: {id: {S: entry.id}, data: {S: JSON.stringify(entry.data)}}}));
-          }
-          function readSSHString(buf, offset) {
-            const len = buf.readUInt32BE(offset);
-            const start = offset + 4;
-            return {value: buf.subarray(start, start + len), offset: start + len};
-          }
-          function expectedMessage(rawBody) {
-            const digest = crypto.createHash("sha256").update(Buffer.from(rawBody || "{}")).digest("base64");
-            return Buffer.from("bgit-broker-v1\n" + digest).toString("base64");
-          }
-          function normalizeKey(key) {
-            return String(key || "").trim().split(/\s+/).slice(0, 2).join(" ");
-          }
-          function publicKeyObject(publicKey) {
-            const parts = normalizeKey(publicKey).split(/\s+/);
-            if (parts[0] !== "ssh-ed25519") return crypto.createPublicKey(publicKey);
-            const blob = Buffer.from(parts[1], "base64");
-            let parsed = readSSHString(blob, 0);
-            const alg = parsed.value.toString();
-            if (alg !== "ssh-ed25519") throw new Error("unsupported SSH key algorithm");
-            parsed = readSSHString(blob, parsed.offset);
-            const derPrefix = Buffer.from("302a300506032b6570032100", "hex");
-            return crypto.createPublicKey({key: Buffer.concat([derPrefix, parsed.value]), format: "der", type: "spki"});
-          }
-          function header(event, name) {
-            const headers = event.headers || {};
-            return headers[name] || headers[name.toLowerCase()] || "";
-          }
-          function verifySignature(event, entry) {
-            const adminKeys = (entry.data.keys || []).filter((k) => k.role === "admin" && !k.suspended);
-            if (adminKeys.length === 0) return true;
-            const key = signedKey(event, entry);
-            return !!key && key.role === "admin";
-          }
-          function signedKey(event, entry) {
-            const keys = (entry.data.keys || []).filter((k) => !k.suspended);
-            const publicKey = normalizeKey(header(event, "x-bgit-key"));
-            const message = String(header(event, "x-bgit-signature-message"));
-            const signature = String(header(event, "x-bgit-signature"));
-            if (!publicKey || !message || !signature || message !== expectedMessage(event.body)) return null;
-            const key = keys.find((k) => normalizeKey(k.public_key) === publicKey);
-            if (!key) return null;
-            const parsed = readSSHString(Buffer.from(signature, "base64"), 0);
-            const alg = parsed.value.toString();
-            const sig = readSSHString(Buffer.from(signature, "base64"), parsed.offset).value;
-            const verifyAlg = alg === "ssh-ed25519" ? null : "sha256";
-            if (!crypto.verify(verifyAlg, Buffer.from(message, "base64"), publicKeyObject(publicKey), sig)) return null;
-            return key;
-          }
-          function roleAllows(role, operation) {
-            if (role === "admin") return true;
-            if (operation === "read") return role === "read" || role === "write";
-            if (operation === "write") return role === "write";
-            return false;
-          }
-          function cleanObjectPath(value) {
-            const path = String(value || "").replace(/^\/+/, "");
-            if (path.includes("\0")) throw new Error("invalid object path");
-            return path;
-          }
-          function objectName(repo, objectPath) {
-            const prefix = String(repo.prefix || "").replace(/^\/+|\/+$/g, "");
-            const path = cleanObjectPath(objectPath);
-            return prefix ? prefix + "/" + path : path;
-          }
-          function requireRead(event, entry) {
-            const key = signedKey(event, entry);
-            if (!key || !roleAllows(key.role, "read")) {
-              const err = new Error("read SSH signature required");
-              err.statusCode = 403;
-              throw err;
-            }
-          }
-          async function streamToBuffer(stream) {
-            const chunks = [];
-            for await (const chunk of stream) chunks.push(Buffer.from(chunk));
-            return Buffer.concat(chunks);
-          }
-          async function readObject(repo, objectPath) {
-            const out = await s3.send(new GetObjectCommand({Bucket: repo.bucket, Key: objectName(repo, objectPath)}));
-            const data = await streamToBuffer(out.Body);
-            return data.toString("base64");
-          }
-          async function listObjects(repo, prefix) {
-            const repoPrefix = String(repo.prefix || "").replace(/^\/+|\/+$/g, "");
-            const queryPrefix = objectName(repo, prefix);
-            const paths = [];
-            let token = undefined;
-            do {
-              const out = await s3.send(new ListObjectsV2Command({Bucket: repo.bucket, Prefix: queryPrefix, ContinuationToken: token}));
-              for (const item of out.Contents || []) {
-                const strip = repoPrefix ? repoPrefix + "/" : "";
-                paths.push(item.Key.startsWith(strip) ? item.Key.slice(strip.length) : item.Key);
-              }
-              token = out.NextContinuationToken;
-            } while (token);
-            return paths;
-          }
-          async function updateRefCAS(repo, ref, oldHash, newHash) {
-            const id = docID(repo);
-            const out = await db.send(new GetItemCommand({TableName: table, Key: {id: {S: id}}}));
-            const oldData = out.Item && out.Item.data ? out.Item.data.S : "";
-            const data = oldData ? JSON.parse(oldData || "{}") : {repo, keys: [], refs: {}};
-            data.repo = data.repo || repo;
-            data.keys = data.keys || [];
-            data.refs = data.refs || {};
-            const zero = "0000000000000000000000000000000000000000";
-            const current = Object.prototype.hasOwnProperty.call(data.refs, ref) ? data.refs[ref] : oldHash;
-            if (current !== oldHash) {
-              const err = new Error("stale ref");
-              err.statusCode = 409;
-              throw err;
-            }
-            if (newHash === zero) {
-              delete data.refs[ref];
-            } else {
-              data.refs[ref] = newHash;
-            }
-            const item = {id: {S: id}, data: {S: JSON.stringify(data)}};
-            const input = {TableName: table, Item: item};
-            if (oldData) {
-              input.ConditionExpression = "#data = :old";
-              input.ExpressionAttributeNames = {"#data": "data"};
-              input.ExpressionAttributeValues = {":old": {S: oldData}};
-            } else {
-              input.ConditionExpression = "attribute_not_exists(id)";
-            }
-            try {
-              await db.send(new PutItemCommand(input));
-            } catch (err) {
-              if (err.name === "ConditionalCheckFailedException") {
-                const stale = new Error("stale ref");
-                stale.statusCode = 409;
-                throw stale;
-              }
-              throw err;
-            }
-          }
-          function requireAdmin(event, entry) {
-            if (!verifySignature(event, entry)) {
-              const err = new Error("admin SSH signature required");
-              err.statusCode = 403;
-              throw err;
-            }
-          }
-          exports.handler = async (event) => {
-            const path = event.rawPath || "/";
-            const method = event.requestContext && event.requestContext.http ? event.requestContext.http.method : "GET";
-            const body = event.body ? JSON.parse(event.body) : {};
-            try {
-              if (path === "/" || path === "/health") {
-                return { statusCode: 200, headers: {"content-type": "application/json"}, body: JSON.stringify({ok: true, service: "bgit-broker"}) };
-              }
-              if (path === "/repos/upsert" && method === "POST") {
-                const entry = await loadRepo(body.repo);
-                requireAdmin(event, entry);
-                const user = body.admin_user || "admin";
-                const role = body.role || "admin";
-                for (const publicKey of body.public_keys || []) {
-                  if (!entry.data.keys.find((k) => normalizeKey(k.public_key) === normalizeKey(publicKey))) entry.data.keys.push({user, role, public_key: publicKey, suspended: false});
-                }
-                await saveRepo(entry);
-                return { statusCode: 200, headers: {"content-type": "application/json"}, body: JSON.stringify({ok: true}) };
-              }
-              if (path === "/keys/list" && method === "POST") {
-                const entry = await loadRepo(body.repo);
-                requireAdmin(event, entry);
-                return { statusCode: 200, headers: {"content-type": "application/json"}, body: JSON.stringify({keys: entry.data.keys}) };
-              }
-              if (path === "/keys/add" && method === "POST") {
-                const entry = await loadRepo(body.repo);
-                requireAdmin(event, entry);
-                const user = body.user || "admin";
-                const role = body.role || "read";
-                for (const publicKey of body.public_keys || []) {
-                  if (!entry.data.keys.find((k) => normalizeKey(k.public_key) === normalizeKey(publicKey))) entry.data.keys.push({user, role, public_key: publicKey, suspended: false});
-                }
-                await saveRepo(entry);
-                return { statusCode: 200, headers: {"content-type": "application/json"}, body: JSON.stringify({ok: true}) };
-              }
-              if ((path === "/keys/remove" || path === "/keys/suspend") && method === "POST") {
-                const entry = await loadRepo(body.repo);
-                requireAdmin(event, entry);
-                const key = String(body.key || "").trim();
-                const normalized = normalizeKey(key);
-                const match = (k) => normalizeKey(k.public_key) === normalized || k.public_key.includes(key);
-                if (path === "/keys/remove") {
-                  entry.data.keys = entry.data.keys.filter((k) => !match(k));
-                } else {
-                  for (const item of entry.data.keys) if (match(item)) item.suspended = true;
-                }
-                await saveRepo(entry);
-                return { statusCode: 200, headers: {"content-type": "application/json"}, body: JSON.stringify({ok: true}) };
-              }
-              if (path === "/auth/check" && method === "POST") {
-                const entry = await loadRepo(body.repo);
-                const key = signedKey(event, entry);
-                const operation = body.operation || "";
-                const allowed = !!key && roleAllows(key.role, operation);
-                return { statusCode: 200, headers: {"content-type": "application/json"}, body: JSON.stringify({allowed, user: key && key.user, role: key && key.role}) };
-              }
-              if (path === "/objects/read" && method === "POST") {
-                const entry = await loadRepo(body.repo);
-                requireRead(event, entry);
-                const data = await readObject(body.repo, body.path);
-                return { statusCode: 200, headers: {"content-type": "application/json"}, body: JSON.stringify({data}) };
-              }
-              if (path === "/objects/list" && method === "POST") {
-                const entry = await loadRepo(body.repo);
-                requireRead(event, entry);
-                const paths = await listObjects(body.repo, body.prefix);
-                return { statusCode: 200, headers: {"content-type": "application/json"}, body: JSON.stringify({paths}) };
-              }
-              if (path === "/refs/update" && method === "POST") {
-                const entry = await loadRepo(body.repo);
-                const key = signedKey(event, entry);
-                if (!key || !roleAllows(key.role, "write")) {
-                  return { statusCode: 403, headers: {"content-type": "application/json"}, body: JSON.stringify({error: "write SSH signature required"}) };
-                }
-                await updateRefCAS(body.repo, body.ref, body.old, body.new);
-                return { statusCode: 200, headers: {"content-type": "application/json"}, body: JSON.stringify({ok: true}) };
-              }
-              return { statusCode: 404, headers: {"content-type": "application/json"}, body: JSON.stringify({error: "unknown broker endpoint"}) };
-            } catch (err) {
-              return { statusCode: err.statusCode || 500, headers: {"content-type": "application/json"}, body: JSON.stringify({error: err.message || String(err)}) };
-            }
-          };
-  BrokerFunctionUrl:
-    Type: AWS::Lambda::Url
-    Properties:
-      TargetFunctionArn: !Ref BrokerFunction
-      AuthType: NONE
-  BrokerFunctionUrlPermission:
-    Type: AWS::Lambda::Permission
-    Properties:
-      FunctionName: !Ref BrokerFunction
-      Action: lambda:InvokeFunctionUrl
-      Principal: '*'
-      FunctionUrlAuthType: NONE
-  BrokerFunctionInvokePermission:
-    Type: AWS::Lambda::Permission
-    Properties:
-      FunctionName: !Ref BrokerFunction
-      Action: lambda:InvokeFunction
-      Principal: '*'
-      InvokedViaFunctionUrl: true
-Outputs:
-  BrokerUrl:
-    Value: !GetAtt BrokerFunctionUrl.FunctionUrl
-`
+func ensureAWSBrokerDeploymentBucket(cfg config, region string, stdout io.Writer) (string, error) {
+	accountID, _ := awsCallerIdentity(context.Background(), strings.TrimSpace(cfg.gcloudConfiguration))
+	if accountID == "" {
+		return "", errors.New("discover AWS account id for broker deployment bucket")
+	}
+	bucket := fmt.Sprintf("bgit-broker-artifacts-%s-%s", accountID, region)
+	headArgs := []string{"s3api", "head-bucket", "--bucket", bucket, "--region", region}
+	if err := awsCommand(context.Background(), strings.TrimSpace(cfg.gcloudConfiguration), headArgs...).Run(); err == nil {
+		return bucket, nil
+	}
+	fmt.Fprintf(stdout, "creating AWS broker deployment bucket %s in %s\n", bucket, region)
+	createArgs := []string{"s3api", "create-bucket", "--bucket", bucket, "--region", region}
+	if region != "us-east-1" {
+		createArgs = append(createArgs, "--create-bucket-configuration", "LocationConstraint="+region)
+	}
+	out, err := awsCommand(context.Background(), strings.TrimSpace(cfg.gcloudConfiguration), createArgs...).CombinedOutput()
+	if err != nil {
+		text := strings.TrimSpace(string(out))
+		if strings.Contains(text, "BucketAlreadyOwnedByYou") || strings.Contains(text, "BucketAlreadyExists") {
+			return bucket, nil
+		}
+		return "", fmt.Errorf("create AWS broker deployment bucket %s: %w\n%s", bucket, err, text)
+	}
+	return bucket, nil
 }
 
 func appendAWSProfile(args []string, profile string) []string {
@@ -1672,6 +1416,17 @@ func appendAWSProfile(args []string, profile string) []string {
 		return args
 	}
 	return append(args, "--profile", strings.TrimSpace(profile))
+}
+
+func awsCommand(ctx context.Context, profile string, args ...string) *exec.Cmd {
+	cmd := exec.CommandContext(ctx, "aws", args...)
+	if strings.TrimSpace(profile) != "" {
+		cmd.Env = append(os.Environ(),
+			"AWS_PROFILE="+strings.TrimSpace(profile),
+			"AWS_SDK_LOAD_CONFIG=1",
+		)
+	}
+	return cmd
 }
 
 func cleanBrokerURL(out string) string {

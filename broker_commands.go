@@ -2006,10 +2006,7 @@ func initBrokerWorktree(target, repoName string, profile brokerProfile, identity
 		repoName += ".git"
 	}
 	remoteURL := fmt.Sprintf("git@%s:%s", defaultSSHHost, repoName)
-	sshCommand := "bgit ssh"
-	if exe, err := os.Executable(); err == nil && strings.TrimSpace(exe) != "" {
-		sshCommand = exe + " ssh"
-	}
+	sshCommand := gitSSHCommandForExecutable()
 	pairs := [][]string{
 		{"bucketgit.broker", profile.BrokerURL},
 		{"bucketgit.profile", profile.QualifiedName},
@@ -2041,6 +2038,21 @@ func initBrokerWorktree(target, repoName string, profile brokerProfile, identity
 	fmt.Fprintf(stdout, "Initialized broker-backed BucketGit repository in %s/\n", filepath.Join(absTarget, ".git"))
 	fmt.Fprintf(stdout, "configured origin %s\n", remoteURL)
 	return nil
+}
+
+func gitSSHCommandForExecutable() string {
+	exe, err := os.Executable()
+	if err != nil || strings.TrimSpace(exe) == "" {
+		return "bgit ssh"
+	}
+	return shellQuoteForGitSSHCommand(exe) + " ssh"
+}
+
+func shellQuoteForGitSSHCommand(value string) string {
+	if value == "" {
+		return "''"
+	}
+	return "'" + strings.ReplaceAll(value, "'", "'\\''") + "'"
 }
 
 func writeLocalIdentityConfig(target, name, email string) error {

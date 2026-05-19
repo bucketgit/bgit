@@ -58,12 +58,30 @@ func TestBrokerInitWritesBrokerGitConfig(t *testing.T) {
 	if got := strings.TrimSpace(string(out)); !strings.HasSuffix(got, " ssh") {
 		t.Fatalf("core.sshCommand = %q", got)
 	}
+	if got := strings.TrimSpace(string(out)); !strings.HasPrefix(got, "'") {
+		t.Fatalf("core.sshCommand should quote executable path, got %q", got)
+	}
 	remote, err := runGit(target, "remote", "get-url", "origin")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if strings.TrimSpace(string(remote)) != "git@git.bucketgit.com:team/app.git" {
 		t.Fatalf("origin = %q", strings.TrimSpace(string(remote)))
+	}
+}
+
+func TestShellQuoteForGitSSHCommand(t *testing.T) {
+	got := shellQuoteForGitSSHCommand(`D:\a\bgit\bgit\bgit.exe`)
+	if got != `'D:\a\bgit\bgit\bgit.exe'` {
+		t.Fatalf("quoted windows path = %q", got)
+	}
+	got = shellQuoteForGitSSHCommand(`/tmp/BucketGit Test/bin/bgit`)
+	if got != `'/tmp/BucketGit Test/bin/bgit'` {
+		t.Fatalf("quoted unix path = %q", got)
+	}
+	got = shellQuoteForGitSSHCommand(`/tmp/dennis' test/bgit`)
+	if got != `'/tmp/dennis'\'' test/bgit'` {
+		t.Fatalf("quoted apostrophe path = %q", got)
 	}
 }
 

@@ -219,13 +219,27 @@ jobs:
       - name: Prepare Built Binary
         shell: bash
         run: |
-          if [[ "${{ matrix.binary }}" == *.exe ]]; then
-            cp "dist/${{ matrix.binary }}" ./bgit.exe
+          ls -la dist
+          binary="${{ matrix.binary }}"
+          if [[ "${{ github.ref }}" == "refs/heads/develop" ]]; then
+            if [[ "$binary" == *.exe ]]; then
+              binary="${binary%.exe}-dev.exe"
+            else
+              binary="${binary}-dev"
+            fi
+          fi
+          artifact="dist/$binary"
+          if [[ ! -f "$artifact" ]]; then
+            echo "Missing expected artifact $binary" >&2
+            exit 1
+          fi
+          if [[ "$binary" == *.exe ]]; then
+            cp "$artifact" ./bgit.exe
             chmod +x ./bgit.exe
             printf 'BGIT_PATH=%s/bgit.exe\n' "$GITHUB_WORKSPACE" >> "$GITHUB_ENV"
             ./bgit.exe --version
           else
-            cp "dist/${{ matrix.binary }}" ./bgit
+            cp "$artifact" ./bgit
             chmod +x ./bgit
             printf 'BGIT_PATH=%s/bgit\n' "$GITHUB_WORKSPACE" >> "$GITHUB_ENV"
             ./bgit --version

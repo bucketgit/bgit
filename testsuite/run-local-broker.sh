@@ -25,6 +25,13 @@ native_path() {
   fi
 }
 
+remove_test_artifacts_best_effort() {
+  local path="$1"
+  if [[ -e "$path" ]]; then
+    rm -rf "$path" >/dev/null 2>&1 || true
+  fi
+}
+
 for key in "$ROOT"/testsuite/sshkeys/*; do
   tmp="${key}.tmp"
   tr -d '\r' < "$key" > "$tmp"
@@ -36,6 +43,9 @@ tmp_root="${TMPDIR:-${TMP:-/tmp}}"
 test_root="${BGIT_TEST_LOCAL_BROKER_ROOT:-${tmp_root%/}/bgit-local-broker-${runtime}-${run_id}}"
 broker_url="http://127.0.0.1:${port}"
 config_path="${test_root}/home/.bgit/config.yaml"
+remove_test_artifacts_best_effort "$test_root"
+remove_test_artifacts_best_effort "$ROOT/testsuite/local/repo"
+remove_test_artifacts_best_effort "$ROOT/testsuite/${provider}/repo"
 mkdir -p "$(dirname "$config_path")"
 export HOME="${test_root}/home"
 export USERPROFILE="$(native_path "$HOME")"
@@ -67,14 +77,9 @@ status=0
 cleanup() {
   status=$?
   kill "$broker_pid" >/dev/null 2>&1 || true
+  wait "$broker_pid" >/dev/null 2>&1 || true
   if [[ -n "${SSH_AGENT_PID:-}" ]]; then ssh-agent -k >/dev/null 2>&1 || true; fi
-  if [[ "$status" -eq 0 && "${BGIT_TEST_KEEP_ARTIFACTS:-}" != "1" ]]; then
-    rm -rf "$test_root"
-    rm -rf "$ROOT/testsuite/local/repo"
-    rm -rf "$ROOT/testsuite/${provider}/repo"
-  else
-    printf 'kept test artifacts in %s and %s\n' "$test_root" "$ROOT/testsuite/${provider}/repo" >&2
-  fi
+  printf 'kept test artifacts in %s and %s\n' "$test_root" "$ROOT/testsuite/${provider}/repo" >&2
   exit "$status"
 }
 trap cleanup EXIT

@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
@@ -829,7 +830,7 @@ func brokerSignatureHeaderSetsForBroker(brokerURL string, payload []byte) []map[
 	}
 	var signed []signedHeaders
 	for _, signer := range signers {
-		sig, err := signer.Sign(nil, message)
+		sig, err := signer.Sign(rand.Reader, message)
 		if err != nil {
 			continue
 		}

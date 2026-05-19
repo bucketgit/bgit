@@ -119,6 +119,22 @@ key_fingerprint() {
   ssh-keygen -lf "$(key_path "$1.pub")" | awk '{print $2}'
 }
 
+native_path() {
+  if command -v cygpath >/dev/null 2>&1; then
+    cygpath -w "$1"
+  else
+    printf '%s' "$1"
+  fi
+}
+
+path_list_separator() {
+  if command -v cygpath >/dev/null 2>&1; then
+    printf ';'
+  else
+    printf ':'
+  fi
+}
+
 add_test_key() {
   local key="$1"
   chmod 600 "$key" >/dev/null 2>&1 || true
@@ -131,7 +147,44 @@ with_agent_key() {
   (
     eval "$(ssh-agent -s)" >/dev/null
     trap 'ssh-agent -k >/dev/null 2>&1 || true' EXIT
-    add_test_key "$(key_path "$key")"
+    local path
+    path="$(key_path "$key")"
+    add_test_key "$path"
+    export BGIT_SSH_KEY="$(native_path "$path")"
+    unset BGIT_SSH_KEYS
+    "$@"
+  )
+}
+
+with_agent_keys() {
+  local keys_csv="$1"
+  shift
+  (
+    eval "$(ssh-agent -s)" >/dev/null
+    trap 'ssh-agent -k >/dev/null 2>&1 || true' EXIT
+    unset BGIT_SSH_KEY
+    local sep paths key path
+    sep="$(path_list_separator)"
+    paths=""
+    IFS=',' read -r -a keys <<< "$keys_csv"
+    for key in "${keys[@]}"; do
+      path="$(key_path "$key")"
+      add_test_key "$path"
+      if [[ -n "$paths" ]]; then
+        paths="${paths}${sep}"
+      fi
+      paths="${paths}$(native_path "$path")"
+    done
+    export BGIT_SSH_KEYS="$paths"
+    "$@"
+  )
+}
+
+without_ssh_identity() {
+  (
+    unset SSH_AUTH_SOCK
+    unset BGIT_SSH_KEY
+    unset BGIT_SSH_KEYS
     "$@"
   )
 }
@@ -146,13 +199,13 @@ run_in_as() {
 run_in_no_agent() {
   local dir="$1"
   shift
-  (cd "$dir" && SSH_AUTH_SOCK= "$BGIT" "$@")
+  (cd "$dir" && without_ssh_identity "$BGIT" "$@")
 }
 
 expect_failure_no_agent() {
   local dir="$1"
   shift
-  (cd "$dir" && SSH_AUTH_SOCK= expect_failure "$BGIT" "$@")
+  (cd "$dir" && without_ssh_identity expect_failure "$BGIT" "$@")
 }
 
 expect_failure_in_as() {

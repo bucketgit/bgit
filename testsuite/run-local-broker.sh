@@ -90,6 +90,7 @@ curl -sS "${broker_url}/health" >/dev/null
 eval "$(ssh-agent -s)" >/dev/null
 chmod 600 "$ROOT"/testsuite/sshkeys/* >/dev/null 2>&1 || true
 ssh-add "$ROOT/testsuite/sshkeys/owner" >/dev/null
+export BGIT_SSH_KEY="$(native_path "$ROOT/testsuite/sshkeys/owner")"
 
 owner_key="$(cat "$ROOT/testsuite/sshkeys/owner.pub")"
 curl -sS -X POST "${broker_url}/owners/upsert" \

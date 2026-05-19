@@ -16,12 +16,7 @@ assert_contains "$out" "role: developer"
 assert_contains "$out" "selected identity: $developer_fp"
 
 out="$(
-  eval "$(ssh-agent -s)" >/dev/null
-  trap 'ssh-agent -k >/dev/null 2>&1 || true' EXIT
-  add_test_key "$(key_path outsider)"
-  add_test_key "$(key_path developer)"
-  cd "$dir"
-  "$BGIT" --identity "$developer_fp" whoami --refresh
+  with_agent_keys outsider,developer bash -c 'cd "$1" && "$2" --identity "$3" whoami --refresh' _ "$dir" "$BGIT" "$developer_fp"
 )"
 assert_contains "$out" "role: developer"
 
@@ -37,22 +32,13 @@ out="$(with_agent_key developer bash -c 'cd "$1" && "$2" whoami --json' _ "$dir"
 assert_contains "$out" '"role": "developer"'
 
 out="$(
-  eval "$(ssh-agent -s)" >/dev/null
-  trap 'ssh-agent -k >/dev/null 2>&1 || true' EXIT
-  add_test_key "$(key_path developer)"
-  add_test_key "$(key_path read)"
-  cd "$dir"
-  "$BGIT" whoami --all
+  with_agent_keys developer,read bash -c 'cd "$1" && "$2" whoami --all' _ "$dir" "$BGIT"
 )"
 assert_contains "$out" "developer"
 assert_contains "$out" "reader"
 assert_contains "$out" "warning:"
 out="$(
-  eval "$(ssh-agent -s)" >/dev/null
-  trap 'ssh-agent -k >/dev/null 2>&1 || true' EXIT
-  add_test_key "$(key_path developer)"
-  cd "$dir"
-  "$BGIT" repos mine --json
+  with_agent_key developer bash -c 'cd "$1" && "$2" repos mine --json' _ "$dir" "$BGIT"
 )"
 assert_contains "$out" '"repos"'
 assert_contains "$out" '"role": "developer"'

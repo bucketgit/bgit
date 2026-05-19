@@ -810,9 +810,16 @@ func brokerSignatureHeaderSets(payload []byte) []map[string]string {
 }
 
 func brokerSignatureHeaderSetsForBroker(brokerURL string, payload []byte) []map[string]string {
-	signers, err := sshAgentSigners()
-	if err != nil || len(signers) == 0 {
+	signers := explicitBrokerSigners()
+	agentSigners, cleanup, err := sshAgentSigners()
+	if err == nil && len(agentSigners) > 0 {
+		signers = append(signers, agentSigners...)
+	}
+	if len(signers) == 0 {
 		return nil
+	}
+	if cleanup != nil {
+		defer cleanup()
 	}
 	message := brokerSignatureMessage(payload)
 	preferred := preferredBrokerKeyFingerprints(brokerURL, payload)
@@ -842,6 +849,39 @@ func brokerSignatureHeaderSetsForBroker(brokerURL string, payload []byte) []map[
 		sets = append(sets, item.headers)
 	}
 	return sets
+}
+
+func explicitBrokerSigners() []ssh.Signer {
+	var paths []string
+	for _, envName := range []string{"BGIT_SSH_KEY", "BGIT_SSH_KEYS"} {
+		for _, value := range filepath.SplitList(os.Getenv(envName)) {
+			if value = strings.TrimSpace(value); value != "" {
+				paths = append(paths, value)
+			}
+		}
+	}
+	if value := strings.TrimSpace(brokerIdentityPreference); value != "" && !strings.HasPrefix(value, "SHA256:") {
+		paths = append(paths, value)
+	}
+	seen := map[string]struct{}{}
+	var signers []ssh.Signer
+	for _, path := range paths {
+		path = expandHome(path)
+		if _, ok := seen[path]; ok {
+			continue
+		}
+		seen[path] = struct{}{}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		signer, err := ssh.ParsePrivateKey(data)
+		if err != nil {
+			continue
+		}
+		signers = append(signers, signer)
+	}
+	return signers
 }
 
 func preferredBrokerKeyRank(fingerprint string, preferred []string) int {

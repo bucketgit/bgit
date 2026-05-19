@@ -15,7 +15,7 @@ import (
 
 const windowsOpenSSHAgentPipe = `\\.\pipe\openssh-ssh-agent`
 
-func sshAgentSigners() ([]ssh.Signer, error) {
+func sshAgentSigners() ([]ssh.Signer, func(), error) {
 	sock := strings.TrimSpace(os.Getenv("SSH_AUTH_SOCK"))
 	var conn net.Conn
 	var err error
@@ -26,8 +26,12 @@ func sshAgentSigners() ([]ssh.Signer, error) {
 		conn, err = winio.DialPipe(windowsOpenSSHAgentPipe, &timeout)
 	}
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	defer conn.Close()
-	return agent.NewClient(conn).Signers()
+	signers, err := agent.NewClient(conn).Signers()
+	if err != nil {
+		_ = conn.Close()
+		return nil, nil, err
+	}
+	return signers, func() { _ = conn.Close() }, nil
 }

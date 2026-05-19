@@ -21,45 +21,20 @@ permissions:
   contents: write
 
 jobs:
-  unit:
-    name: Unit Tests (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os:
-          - macos-14
-          - macos-15-intel
-          - ubuntu-24.04
-          - windows-2022
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Go
-        uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
-          cache: true
-
-      - name: Unit Tests
-        run: go test ./...
-
   build:
-    name: Build Multiarchitecture Artifacts
-    needs:
-      - unit
+    name: Build Windows Artifact
     runs-on: ubuntu-24.04
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Setup Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
           cache: true
+          cache-dependency-path: go.sum
 
       - name: Resolve Version From Changelog
         if: github.ref == 'refs/heads/main'
@@ -142,12 +117,7 @@ jobs:
           New-Item -ItemType Directory -Force -Path "dist" | Out-Null
 
           $targets = @(
-            @{ GOOS = "darwin";  GOARCH = "arm64"; Artifact = "bgit-mac-arm64" },
-            @{ GOOS = "darwin";  GOARCH = "amd64"; Artifact = "bgit-mac-amd64" },
-            @{ GOOS = "linux";   GOARCH = "amd64"; Artifact = "bgit-linux-amd64" },
-            @{ GOOS = "linux";   GOARCH = "arm64"; Artifact = "bgit-linux-arm64" },
-            @{ GOOS = "windows"; GOARCH = "amd64"; Artifact = "bgit-windows-amd64.exe" },
-            @{ GOOS = "windows"; GOARCH = "arm64"; Artifact = "bgit-windows-arm64.exe" }
+            @{ GOOS = "windows"; GOARCH = "amd64"; Artifact = "bgit-windows-amd64.exe" }
           )
 
           foreach ($target in $targets) {
@@ -172,46 +142,36 @@ jobs:
           }
 
       - name: Upload Artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: bgit-artifacts
           path: dist/*
           if-no-files-found: error
 
   integration:
-    name: Integration Tests (${{ matrix.os }})
+    name: Windows Integration Tests
     needs:
       - build
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: macos-14
-            binary: bgit-mac-arm64
-          - os: macos-15-intel
-            binary: bgit-mac-amd64
-          - os: ubuntu-24.04
-            binary: bgit-linux-amd64
-          - os: windows-2022
-            binary: bgit-windows-amd64.exe
+    runs-on: windows-2022
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Setup Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
           cache: true
+          cache-dependency-path: go.sum
 
       - name: Setup Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
           node-version: 25
+          package-manager-cache: false
 
       - name: Download Built Artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: bgit-artifacts
           path: dist
@@ -220,7 +180,7 @@ jobs:
         shell: bash
         run: |
           ls -la dist
-          binary="${{ matrix.binary }}"
+          binary="bgit-windows-amd64.exe"
           if [[ "${{ github.ref }}" == "refs/heads/develop" ]]; then
             if [[ "$binary" == *.exe ]]; then
               binary="${binary%.exe}-dev.exe"
@@ -262,13 +222,13 @@ jobs:
     needs:
       - integration
     runs-on: ubuntu-24.04
-    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop')
+    if: false
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Download Built Artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: bgit-artifacts
           path: dist

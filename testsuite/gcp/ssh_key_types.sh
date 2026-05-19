@@ -16,6 +16,7 @@ accept_with_key() {
     eval "$(ssh-agent -s)" >/dev/null
     trap 'ssh-agent -k >/dev/null 2>&1 || true' EXIT
     add_test_key "$key_path"
+    export BGIT_SSH_KEY="$(native_path "$key_path")"
     cd "$dir"
     "$BGIT" admin accept-invite "$code" >/dev/null
   )

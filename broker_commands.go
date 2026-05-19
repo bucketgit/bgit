@@ -114,7 +114,10 @@ func brokerAdminRepoCommand(cfg config, args []string, stdout io.Writer) error {
 		if len(args) != 2 {
 			return errors.New("usage: bgit admin repo rename NEW_LOGICAL_NAME")
 		}
-		logical := logicalRepoWithGit(args[1])
+		logical, err := normalizeLogicalRepoName(args[1])
+		if err != nil {
+			return err
+		}
 		if err := brokerPost(cfg.brokerURL, "/repo/rename", brokerRepoAdminRequest{Repo: repoForBroker(cfg), Logical: logical}, nil); err != nil {
 			return err
 		}
@@ -281,7 +284,7 @@ func brokerCloneCommand(args []string, stdin io.Reader, stdout io.Writer) error 
 		}
 	}
 	if strings.TrimSpace(repoName) == "" {
-		return errors.New("usage: bgit clone <repo> [directory] [--profile PROFILE]\n       bgit clone https://broker.example.com/team/app.git [directory]\n       bgit clone --broker https://broker.example.com team/app.git [directory]")
+		return errors.New("usage: bgit clone <repo> [directory] [--profile PROFILE]\n       bgit clone https://broker.example.com/app.git [directory]\n       bgit clone --broker https://broker.example.com app.git [directory]")
 	}
 	if opts.brokerURL != "" {
 		profile, err := brokerProfileForCloneURL(opts.brokerURL)
@@ -455,8 +458,18 @@ func configForBrokerCommand(base config) (config, error) {
 	}
 	if strings.TrimSpace(cfg.logicalRepo) == "" {
 		if out, err := runGit(".", "config", "--get", "bucketgit.logicalRepo"); err == nil {
-			cfg.logicalRepo = strings.Trim(strings.TrimSpace(string(out)), "/")
+			logical, normalizeErr := normalizeLogicalRepoName(string(out))
+			if normalizeErr != nil {
+				return config{}, normalizeErr
+			}
+			cfg.logicalRepo = logical
 		}
+	} else {
+		logical, normalizeErr := normalizeLogicalRepoName(cfg.logicalRepo)
+		if normalizeErr != nil {
+			return config{}, normalizeErr
+		}
+		cfg.logicalRepo = logical
 	}
 	if cfg.origin == "" {
 		cfg.origin = originForConfig(cfg)
@@ -510,7 +523,11 @@ func brokerConfirmOwnershipTransferCommand(cfg config, args []string, stdout io.
 	if err != nil {
 		return err
 	}
-	repo := brokerRepo{Provider: "gcs", Logical: logicalRepoWithGit(repoName), Origin: "git@" + defaultSSHHost + ":" + logicalRepoWithGit(repoName)}
+	logical, err := normalizeLogicalRepoName(repoName)
+	if err != nil {
+		return err
+	}
+	repo := brokerRepo{Provider: "gcs", Logical: logical, Origin: "git@" + defaultSSHHost + ":" + logical}
 	var resp brokerOwnerTransferResponse
 	if err := brokerPost(brokerURL, "/owners/transfer/confirm", brokerOwnerTransferRequest{Repo: repo, BrokerURL: brokerURL}, &resp); err != nil {
 		return err
@@ -540,7 +557,11 @@ func brokerCancelOwnershipTransferCommand(cfg config, args []string, stdout io.W
 	if err != nil {
 		return err
 	}
-	repo := brokerRepo{Provider: "gcs", Logical: logicalRepoWithGit(repoName), Origin: "git@" + defaultSSHHost + ":" + logicalRepoWithGit(repoName)}
+	logical, err := normalizeLogicalRepoName(repoName)
+	if err != nil {
+		return err
+	}
+	repo := brokerRepo{Provider: "gcs", Logical: logical, Origin: "git@" + defaultSSHHost + ":" + logical}
 	if err := brokerPost(brokerURL, "/owners/transfer/cancel", brokerOwnerTransferRequest{Repo: repo}, nil); err != nil {
 		return err
 	}
@@ -653,7 +674,11 @@ func brokerInviteUserCommand(cfg config, args []string, stdout io.Writer) error 
 	if !validBrokerRole(role) || role == "owner" {
 		return fmt.Errorf("invalid role %q", role)
 	}
-	repo := brokerRepo{Provider: "gcs", Logical: logicalRepoWithGit(repoName), Origin: "git@" + defaultSSHHost + ":" + logicalRepoWithGit(repoName)}
+	logical, err := normalizeLogicalRepoName(repoName)
+	if err != nil {
+		return err
+	}
+	repo := brokerRepo{Provider: "gcs", Logical: logical, Origin: "git@" + defaultSSHHost + ":" + logical}
 	var resp brokerOwnerTransferResponse
 	if err := brokerPost(brokerURL, "/keys/invite/create", brokerOwnerTransferRequest{Repo: repo, BrokerURL: brokerURL, User: user, Role: role}, &resp); err != nil {
 		return err
@@ -683,7 +708,11 @@ func brokerCancelInviteCommand(cfg config, args []string, stdout io.Writer) erro
 	if err != nil {
 		return err
 	}
-	repo := brokerRepo{Provider: "gcs", Logical: logicalRepoWithGit(repoName), Origin: "git@" + defaultSSHHost + ":" + logicalRepoWithGit(repoName)}
+	logical, err := normalizeLogicalRepoName(repoName)
+	if err != nil {
+		return err
+	}
+	repo := brokerRepo{Provider: "gcs", Logical: logical, Origin: "git@" + defaultSSHHost + ":" + logical}
 	if err := brokerPost(brokerURL, "/keys/invite/cancel", brokerOwnerTransferRequest{Repo: repo, User: user}, nil); err != nil {
 		return err
 	}
@@ -1359,7 +1388,11 @@ func parseBrokerCloneURL(raw string) (string, string, bool, error) {
 	if repoName == "" {
 		return "", "", true, errors.New("broker clone URL must include a logical repository path")
 	}
-	return parsed.Scheme + "://" + parsed.Host, repoName, true, nil
+	logical, err := normalizeLogicalRepoName(repoName)
+	if err != nil {
+		return "", "", true, err
+	}
+	return parsed.Scheme + "://" + parsed.Host, logical, true, nil
 }
 
 func brokerProfileForCloneURL(brokerURL string) (brokerProfile, error) {
@@ -1660,14 +1693,26 @@ func defaultInitRepoName() string {
 }
 
 func logicalRepoWithGit(name string) string {
-	name = strings.Trim(strings.TrimSpace(name), "/")
-	if name == "" {
+	logical, err := normalizeLogicalRepoName(name)
+	if err != nil {
 		return "repo.git"
 	}
-	if !strings.HasSuffix(name, ".git") {
-		name += ".git"
+	return logical
+}
+
+func normalizeLogicalRepoName(name string) (string, error) {
+	name = strings.TrimSpace(name)
+	name = strings.TrimSuffix(name, ".git")
+	if name == "" {
+		return "", errors.New("logical repo name is required")
 	}
-	return name
+	if strings.ContainsAny(name, `/\`) {
+		return "", fmt.Errorf("logical repo names must be flat; use %q instead of a path", filepath.Base(name))
+	}
+	if name == "." || name == ".." {
+		return "", errors.New("logical repo name is invalid")
+	}
+	return name + ".git", nil
 }
 
 func logicalRepoDisplayName(name string) string {
@@ -2001,9 +2046,9 @@ func initBrokerWorktree(target, repoName string, profile brokerProfile, identity
 			return err
 		}
 	}
-	repoName = strings.Trim(repoName, "/")
-	if !strings.HasSuffix(repoName, ".git") {
-		repoName += ".git"
+	repoName, err = normalizeLogicalRepoName(repoName)
+	if err != nil {
+		return err
 	}
 	remoteURL := fmt.Sprintf("git@%s:%s", defaultSSHHost, repoName)
 	sshCommand := gitSSHCommandForExecutable()

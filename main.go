@@ -21,7 +21,7 @@ import (
 
 const defaultBranch = "main"
 const defaultAuthMode = "gcloud"
-const brokerVersion = "1.0.0-dev"
+const brokerVersion = "1.0.1-dev"
 
 var version = "dev"
 
@@ -592,7 +592,11 @@ func readLocalConfig(dir string) (config, error) {
 	}
 	logicalRepo := ""
 	if logicalOut, logicalErr := runGit(dir, "config", "--get", "bucketgit.logicalRepo"); logicalErr == nil {
-		logicalRepo = strings.Trim(strings.TrimSpace(string(logicalOut)), "/")
+		var err error
+		logicalRepo, err = normalizeLogicalRepoName(string(logicalOut))
+		if err != nil {
+			return config{}, err
+		}
 	}
 	localRegion := ""
 	if regionOut, regionErr := runGit(dir, "config", "--get", "bucketgit.region"); regionErr == nil {
@@ -756,7 +760,11 @@ func newRemoteStore(ctx context.Context, cfg config, publicFallback bool) (gitRe
 		}
 		if cfg.logicalRepo == "" {
 			if out, err := runGit(".", "config", "--get", "bucketgit.logicalRepo"); err == nil {
-				cfg.logicalRepo = strings.Trim(strings.TrimSpace(string(out)), "/")
+				logical, normalizeErr := normalizeLogicalRepoName(string(out))
+				if normalizeErr != nil {
+					return nil, nil, normalizeErr
+				}
+				cfg.logicalRepo = logical
 			}
 		}
 		if cfg.brokerURL != "" {
@@ -954,16 +962,16 @@ func helpPages() map[string]string {
 	return map[string]string{
 		"clone": `usage:
   bgit clone <broker-repo> [directory]
-  bgit clone https://broker.example.com/team/app.git [directory]
-  bgit clone --broker https://broker.example.com team/app.git [directory]
+  bgit clone https://broker.example.com/app.git [directory]
+  bgit clone --broker https://broker.example.com app.git [directory]
 
 Clone a BucketGit repository by logical repo name. Passing a broker URL makes
 the checkout self-contained and does not require a local profile. Direct
 object-storage clone moved to bgit direct clone.
 
 examples:
-  bgit clone team/app.git
-  bgit clone https://bgit-broker.example.com/team/app.git
+  bgit clone app.git
+  bgit clone https://bgit-broker.example.com/app.git
   bgit direct clone gs://my-bucket/repositories/app.git
   bgit direct clone s3://my-bucket/repositories/app.git --profile aws-profile
 `,

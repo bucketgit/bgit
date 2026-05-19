@@ -31,7 +31,7 @@ func TestBrokerInitWritesBrokerGitConfig(t *testing.T) {
 	}
 	target := filepath.Join(root, "app")
 	var stdout bytes.Buffer
-	err := brokerInitCommand([]string{"--noninteractive", "--repo", "team/app", target, "--profile", "gcp:work/europe-west1", "--config", configPath}, strings.NewReader(""), &stdout)
+	err := brokerInitCommand([]string{"--noninteractive", "--repo", "app", target, "--profile", "gcp:work/europe-west1", "--config", configPath}, strings.NewReader(""), &stdout)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -39,7 +39,7 @@ func TestBrokerInitWritesBrokerGitConfig(t *testing.T) {
 		"bucketgit.broker":      "https://broker.example.test",
 		"bucketgit.profile":     "gcp:work/europe-west1",
 		"bucketgit.region":      "europe-west1",
-		"bucketgit.logicalRepo": "team/app.git",
+		"bucketgit.logicalRepo": "app.git",
 		"branch.main.remote":    "origin",
 		"branch.main.merge":     "refs/heads/main",
 		"core.autocrlf":         "false",
@@ -67,7 +67,7 @@ func TestBrokerInitWritesBrokerGitConfig(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.TrimSpace(string(remote)) != "git@git.bucketgit.com:team/app.git" {
+	if strings.TrimSpace(string(remote)) != "git@git.bucketgit.com:app.git" {
 		t.Fatalf("origin = %q", strings.TrimSpace(string(remote)))
 	}
 }
@@ -89,7 +89,7 @@ func TestShellQuoteForGitSSHCommand(t *testing.T) {
 
 func TestInitBrokerWorktreeOmitsIdentityWhenUnset(t *testing.T) {
 	target := filepath.Join(t.TempDir(), "app")
-	err := initBrokerWorktree(target, "team/app", brokerProfile{
+	err := initBrokerWorktree(target, "app", brokerProfile{
 		Provider:      "gcs",
 		QualifiedName: "broker:https://broker.example.test",
 		BrokerURL:     "",
@@ -106,7 +106,7 @@ func TestInitBrokerWorktreeOmitsIdentityWhenUnset(t *testing.T) {
 }
 
 func TestBrokerInitNoninteractiveRequiresProfileAndRepo(t *testing.T) {
-	err := brokerInitCommand([]string{"--noninteractive", "--repo", "team/app"}, strings.NewReader(""), ioDiscard{})
+	err := brokerInitCommand([]string{"--noninteractive", "--repo", "app"}, strings.NewReader(""), ioDiscard{})
 	if err == nil || !strings.Contains(err.Error(), "requires --profile") {
 		t.Fatalf("err = %v", err)
 	}
@@ -125,7 +125,7 @@ func TestAdminKeysListUsesLogicalBrokerRepo(t *testing.T) {
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			t.Fatal(err)
 		}
-		if req.Repo.Logical != "team/app.git" {
+		if req.Repo.Logical != "app.git" {
 			t.Fatalf("logical repo = %q", req.Repo.Logical)
 		}
 		_, _ = w.Write([]byte(`{"keys":[{"user":"owner","role":"owner","public_key":"ssh-ed25519 AAAA owner"}]}`))
@@ -176,7 +176,7 @@ func TestTopLevelBrokerInitForwardsGlobalProfile(t *testing.T) {
 	}
 	target := filepath.Join(root, "app")
 	var stdout bytes.Buffer
-	err := run([]string{"init", "--noninteractive", "--repo", "team/app", target, "--config", configPath, "--profile", "gcp:work/europe-west1"}, strings.NewReader(""), &stdout, ioDiscard{})
+	err := run([]string{"init", "--noninteractive", "--repo", "app", target, "--config", configPath, "--profile", "gcp:work/europe-west1"}, strings.NewReader(""), &stdout, ioDiscard{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -319,12 +319,23 @@ func TestBrokerProfileDotRegionSelectsProfile(t *testing.T) {
 }
 
 func TestParseBrokerCloneURL(t *testing.T) {
-	brokerURL, repo, ok, err := parseBrokerCloneURL("https://broker.example.test/team/app.git")
+	brokerURL, repo, ok, err := parseBrokerCloneURL("https://broker.example.test/app.git")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !ok || brokerURL != "https://broker.example.test" || repo != "team/app.git" {
+	if !ok || brokerURL != "https://broker.example.test" || repo != "app.git" {
 		t.Fatalf("brokerURL=%q repo=%q ok=%v", brokerURL, repo, ok)
+	}
+}
+
+func TestLogicalRepoNamesMustBeFlat(t *testing.T) {
+	for _, name := range []string{"team/app", "team/app.git", `team\app`} {
+		if _, err := normalizeLogicalRepoName(name); err == nil {
+			t.Fatalf("normalizeLogicalRepoName(%q) succeeded", name)
+		}
+	}
+	if _, _, _, err := parseBrokerCloneURL("https://broker.example.test/team/app.git"); err == nil {
+		t.Fatal("parseBrokerCloneURL accepted path-shaped logical repo")
 	}
 }
 
@@ -392,7 +403,7 @@ func TestBrokerInitInteractiveIdentityOnlyUpdatesRepoConfig(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, args := range [][]string{
-		{"config", "bucketgit.logicalRepo", "team/app.git"},
+		{"config", "bucketgit.logicalRepo", "app.git"},
 		{"config", "bucketgit.profile", "gcp:work/europe-west1"},
 		{"config", "user.name", "Repo User"},
 		{"config", "user.email", "old@example.com"},
@@ -403,7 +414,7 @@ func TestBrokerInitInteractiveIdentityOnlyUpdatesRepoConfig(t *testing.T) {
 	}
 	var stdout bytes.Buffer
 	input := strings.NewReader("\x1b[B\x1b[B\n" + strings.Repeat("\x7f", len("old@example.com")) + "new@example.com\n\x04")
-	err := brokerInitCommand([]string{"--config", configPath, "--repo", "team/app.git", target}, input, &stdout)
+	err := brokerInitCommand([]string{"--config", configPath, "--repo", "app.git", target}, input, &stdout)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -531,7 +542,7 @@ func TestInitDialogInitialStateUsesRepoThenGlobalIdentity(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, args := range [][]string{
-		{"config", "bucketgit.logicalRepo", "team/app.git"},
+		{"config", "bucketgit.logicalRepo", "app.git"},
 		{"config", "bucketgit.profile", "gcp:work/europe-west1"},
 		{"config", "user.name", "Repo User"},
 		{"config", "user.email", "repo@example.com"},
@@ -541,7 +552,7 @@ func TestInitDialogInitialStateUsesRepoThenGlobalIdentity(t *testing.T) {
 		}
 	}
 	initial := initDialogInitialState(target, globalConfig{Identity: globalIdentityConfig{Name: "Global User", Email: "global@example.com"}}, "", "")
-	if !initial.Existing || initial.RepoName != "team/app.git" || initial.ProfileName != "gcp:work/europe-west1" ||
+	if !initial.Existing || initial.RepoName != "app.git" || initial.ProfileName != "gcp:work/europe-west1" ||
 		initial.IdentityName != "Repo User" || initial.IdentityEmail != "repo@example.com" {
 		t.Fatalf("initial = %#v", initial)
 	}
@@ -739,7 +750,7 @@ func setupBrokerCommandTestRepo(t *testing.T, handler http.HandlerFunc) (string,
 	}))
 	for key, value := range map[string]string{
 		"bucketgit.broker":      server.URL,
-		"bucketgit.logicalRepo": "team/app.git",
+		"bucketgit.logicalRepo": "app.git",
 		"bucketgit.provider":    "gcs",
 		"bucketgit.branch":      "main",
 	} {

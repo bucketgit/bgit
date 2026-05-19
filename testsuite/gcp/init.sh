@@ -8,3 +8,7 @@ out="$(git -C "$dir" config --get bucketgit.logicalRepo)"
 assert_contains "$out" "$repo"
 out="$(git -C "$dir" config --get bucketgit.broker)"
 assert_contains "$out" "http"
+
+bad_dir="$(new_workdir gcp init-path-rejected)"
+out="$(expect_failure "$BGIT" init --noninteractive --repo team/app --profile "$GCP_PROFILE" "${CONFIG_ARGS[@]}" "$bad_dir")"
+assert_contains "$out" "logical repo names must be flat"

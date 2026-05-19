@@ -40,7 +40,7 @@ func TestGlobalConfigRoundTrip(t *testing.T) {
 			}},
 		}},
 		Repos: []globalRepoConfig{{
-			Name:      "team/app.git",
+			Name:      "app.git",
 			Profile:   "gcp:work",
 			BrokerURL: "https://gcp.example.test",
 		}},

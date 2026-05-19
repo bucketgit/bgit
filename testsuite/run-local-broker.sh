@@ -17,6 +17,12 @@ if [[ "${BGIT_TEST_USE_EXISTING_BINARY:-}" != "1" ]]; then
   go build -o bgit .
 fi
 
+for key in "$ROOT"/testsuite/sshkeys/*; do
+  tmp="${key}.tmp"
+  tr -d '\r' < "$key" > "$tmp"
+  mv "$tmp" "$key"
+done
+
 run_id="${BGIT_TEST_RUN_ID:-$(date +%Y%m%d%H%M%S)}"
 tmp_root="${TMPDIR:-${TMP:-/tmp}}"
 test_root="${BGIT_TEST_LOCAL_BROKER_ROOT:-${tmp_root%/}/bgit-local-broker-${runtime}-${run_id}}"
@@ -73,7 +79,7 @@ done
 curl -sS "${broker_url}/health" >/dev/null
 
 eval "$(ssh-agent -s)" >/dev/null
-chmod 600 "$ROOT/testsuite/sshkeys/owner" >/dev/null 2>&1 || true
+chmod 600 "$ROOT"/testsuite/sshkeys/* >/dev/null 2>&1 || true
 ssh-add "$ROOT/testsuite/sshkeys/owner" >/dev/null
 
 owner_key="$(cat "$ROOT/testsuite/sshkeys/owner.pub")"

@@ -119,14 +119,19 @@ key_fingerprint() {
   ssh-keygen -lf "$(key_path "$1.pub")" | awk '{print $2}'
 }
 
+add_test_key() {
+  local key="$1"
+  chmod 600 "$key" >/dev/null 2>&1 || true
+  ssh-add "$key" >/dev/null
+}
+
 with_agent_key() {
   local key="$1"
   shift
   (
     eval "$(ssh-agent -s)" >/dev/null
     trap 'ssh-agent -k >/dev/null 2>&1 || true' EXIT
-    chmod 600 "$(key_path "$key")" >/dev/null 2>&1 || true
-    ssh-add "$(key_path "$key")" >/dev/null
+    add_test_key "$(key_path "$key")"
     "$@"
   )
 }

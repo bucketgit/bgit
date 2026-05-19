@@ -18,8 +18,8 @@ assert_contains "$out" "selected identity: $developer_fp"
 out="$(
   eval "$(ssh-agent -s)" >/dev/null
   trap 'ssh-agent -k >/dev/null 2>&1 || true' EXIT
-  ssh-add "$(key_path outsider)" >/dev/null
-  ssh-add "$(key_path developer)" >/dev/null
+  add_test_key "$(key_path outsider)"
+  add_test_key "$(key_path developer)"
   cd "$dir"
   "$BGIT" --identity "$developer_fp" whoami --refresh
 )"
@@ -39,8 +39,8 @@ assert_contains "$out" '"role": "developer"'
 out="$(
   eval "$(ssh-agent -s)" >/dev/null
   trap 'ssh-agent -k >/dev/null 2>&1 || true' EXIT
-  ssh-add "$(key_path developer)" >/dev/null
-  ssh-add "$(key_path read)" >/dev/null
+  add_test_key "$(key_path developer)"
+  add_test_key "$(key_path read)"
   cd "$dir"
   "$BGIT" whoami --all
 )"
@@ -50,7 +50,7 @@ assert_contains "$out" "warning:"
 out="$(
   eval "$(ssh-agent -s)" >/dev/null
   trap 'ssh-agent -k >/dev/null 2>&1 || true' EXIT
-  ssh-add "$(key_path developer)" >/dev/null
+  add_test_key "$(key_path developer)"
   cd "$dir"
   "$BGIT" repos mine --json
 )"
@@ -59,4 +59,3 @@ assert_contains "$out" '"role": "developer"'
 
 out="$(with_agent_key outsider bash -c 'cd "$1" && "$2" --identity "$3" whoami --refresh' _ "$dir" "$BGIT" "$outsider_fp" 2>&1 || true)"
 assert_contains "$out" "SSH signature required"
-

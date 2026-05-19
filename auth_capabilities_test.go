@@ -13,7 +13,7 @@ import (
 
 func TestWhoamiCommandWritesGlobalCache(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	setTestHome(t, home)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/auth/status" {
 			t.Fatalf("path = %s", r.URL.Path)
@@ -82,7 +82,7 @@ func TestRepoMembershipWarningsShowAmbiguousKeys(t *testing.T) {
 
 func TestExplicitProfileSelectionAppliesToRepositoryDiscovery(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	setTestHome(t, home)
 	path := filepath.Join(home, ".bgit", "config.yaml")
 	if err := writeGlobalConfig(path, globalConfig{
 		Version: globalConfigVersion,

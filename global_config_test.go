@@ -88,7 +88,7 @@ func TestGlobalConfigRoundTrip(t *testing.T) {
 
 func TestDefaultGlobalConfigPathUsesYAML(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	setTestHome(t, home)
 	got, err := defaultGlobalConfigPath()
 	if err != nil {
 		t.Fatal(err)

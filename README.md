@@ -52,6 +52,8 @@ clone, fetch, pull, push, review, or web browsing flows.
 Direct bucket access still exists under `bgit direct` for recovery, migration,
 and low-level inspection. It is not the normal user workflow.
 
+![BucketGit serverless architecture](architecture/bucketgit-serverless-architecture.png)
+
 ## Quickstart
 
 Set up BucketGit for one or more cloud profiles:

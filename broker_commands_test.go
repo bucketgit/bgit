@@ -219,7 +219,7 @@ func TestBrokerProfileBareNameWithRegionSelectsProfile(t *testing.T) {
 
 func TestExplicitBrokerProfileSelectionUsesRegionForDataPlaneCommand(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	setTestHome(t, home)
 	configPath := filepath.Join(home, ".bgit", "config.yaml")
 	if err := writeGlobalConfig(configPath, globalConfig{
 		Version: globalConfigVersion,
@@ -247,7 +247,7 @@ func TestExplicitBrokerProfileSelectionUsesRegionForDataPlaneCommand(t *testing.
 
 func TestExplicitBrokerProfileSelectionRejectsAmbiguousDataPlaneProfile(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	setTestHome(t, home)
 	configPath := filepath.Join(home, ".bgit", "config.yaml")
 	if err := writeGlobalConfig(configPath, globalConfig{
 		Version: globalConfigVersion,

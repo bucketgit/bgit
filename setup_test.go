@@ -398,7 +398,7 @@ func TestSetupDialogCtrlCCancels(t *testing.T) {
 
 func TestSetupSSHKeyDiscoveryDedupesKeys(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	setTestHome(t, home)
 	sshDir := filepath.Join(home, ".ssh")
 	if err := os.MkdirAll(sshDir, 0o755); err != nil {
 		t.Fatal(err)
@@ -425,7 +425,7 @@ func TestSetupSSHKeyDiscoveryDedupesKeys(t *testing.T) {
 
 func TestSetupCommandProvisionsGCPAndWritesGlobalConfig(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	setTestHome(t, home)
 	pubKey := filepath.Join(home, "owner.pub")
 	if err := os.WriteFile(pubKey, []byte("ssh-ed25519 AAAAOWNER owner@example\n"), 0o644); err != nil {
 		t.Fatal(err)
@@ -492,7 +492,7 @@ func TestSetupCommandProvisionsGCPAndWritesGlobalConfig(t *testing.T) {
 
 func TestSetupCommandOffersGCPProfileCreationWhenNoneExist(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	setTestHome(t, home)
 	pubKey := filepath.Join(home, "owner.pub")
 	if err := os.WriteFile(pubKey, []byte("ssh-ed25519 AAAAOWNER owner@example\n"), 0o644); err != nil {
 		t.Fatal(err)
@@ -859,7 +859,7 @@ func TestBrokerDeleteAWSDeletesStackAndClearsConfig(t *testing.T) {
 
 func TestBrokerDeleteGCPDeletesFunctionAndOptionalData(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	setTestHome(t, home)
 	configPath := filepath.Join(home, ".bgit", "config")
 	bin := t.TempDir()
 	writeFakeCLI(t, bin, "gcloud", []fakeCLIAction{

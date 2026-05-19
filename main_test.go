@@ -52,6 +52,18 @@ func TestParseGlobalFlags(t *testing.T) {
 	}
 }
 
+func setTestHome(t *testing.T, home string) {
+	t.Helper()
+	t.Setenv("HOME", home)
+	if runtime.GOOS == "windows" {
+		t.Setenv("USERPROFILE", home)
+		if volume := filepath.VolumeName(home); volume != "" {
+			t.Setenv("HOMEDRIVE", volume)
+			t.Setenv("HOMEPATH", strings.TrimPrefix(home, volume))
+		}
+	}
+}
+
 func TestParseGlobalBucketURLInfersProviderAndPrefix(t *testing.T) {
 	cfg, rest, err := parseGlobalFlags([]string{
 		"admin",
@@ -1082,100 +1094,131 @@ type fakeCLIAction struct {
 	onlyIfFile    string
 }
 
+type fakeCLIActionJSON struct {
+	Match         string `json:"match,omitempty"`
+	Stdout        string `json:"stdout,omitempty"`
+	MissingStdout string `json:"missing_stdout,omitempty"`
+	ExitCode      int    `json:"exit_code,omitempty"`
+	Touch         string `json:"touch,omitempty"`
+	RequireFile   string `json:"require_file,omitempty"`
+	OnlyIfFile    string `json:"only_if_file,omitempty"`
+}
+
+func (a fakeCLIAction) MarshalJSON() ([]byte, error) {
+	return json.Marshal(fakeCLIActionJSON{
+		Match:         a.match,
+		Stdout:        a.stdout,
+		MissingStdout: a.missingStdout,
+		ExitCode:      a.exitCode,
+		Touch:         a.touch,
+		RequireFile:   a.requireFile,
+		OnlyIfFile:    a.onlyIfFile,
+	})
+}
+
+func (a *fakeCLIAction) UnmarshalJSON(data []byte) error {
+	var raw fakeCLIActionJSON
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	*a = fakeCLIAction{
+		match:         raw.Match,
+		stdout:        raw.Stdout,
+		missingStdout: raw.MissingStdout,
+		exitCode:      raw.ExitCode,
+		touch:         raw.Touch,
+		requireFile:   raw.RequireFile,
+		onlyIfFile:    raw.OnlyIfFile,
+	}
+	return nil
+}
+
 func writeFakeCLI(t *testing.T, dir, name string, actions []fakeCLIAction) {
 	t.Helper()
 	path := filepath.Join(dir, name)
 	if runtime.GOOS == "windows" {
-		path += ".bat"
+		path += ".exe"
 	}
-	var script strings.Builder
-	if runtime.GOOS == "windows" {
-		script.WriteString("@echo off\r\n")
-		script.WriteString("set ARGS=%*\r\n")
-		for _, action := range actions {
-			finalExitCode := fakeCLIFinalExitCode(action)
-			script.WriteString("echo %ARGS% | findstr /C:\"")
-			script.WriteString(escapeBatch(action.match))
-			script.WriteString("\" >nul\r\n")
-			script.WriteString("if not errorlevel 1 (\r\n")
-			if action.requireFile != "" {
-				script.WriteString("  if not exist \"")
-				script.WriteString(escapeBatch(action.requireFile))
-				script.WriteString("\" (\r\n")
-				if action.missingStdout != "" {
-					script.WriteString("    echo ")
-					script.WriteString(action.missingStdout)
-					script.WriteString("\r\n")
-				}
-				script.WriteString("    exit /b ")
-				script.WriteString(strconv.Itoa(firstNonZeroInt(action.exitCode, 1)))
-				script.WriteString("\r\n  )\r\n")
-			}
-			if action.touch != "" {
-				script.WriteString("  type nul > \"")
-				script.WriteString(escapeBatch(action.touch))
-				script.WriteString("\"\r\n")
-			}
-			if action.stdout != "" {
-				script.WriteString("  echo ")
-				script.WriteString(action.stdout)
-				script.WriteString("\r\n")
-			}
-			script.WriteString("  exit /b ")
-			script.WriteString(strconv.Itoa(finalExitCode))
-			script.WriteString("\r\n)\r\n")
-		}
-		script.WriteString("exit /b 1\r\n")
-	} else {
-		script.WriteString("#!/bin/sh\n")
-		script.WriteString("ARGS=\"$*\"\n")
-		for _, action := range actions {
-			finalExitCode := fakeCLIFinalExitCode(action)
-			script.WriteString("case \"$ARGS\" in *\"")
-			script.WriteString(strings.ReplaceAll(action.match, `"`, `\"`))
-			script.WriteString("\"*) ")
-			if action.onlyIfFile != "" {
-				script.WriteString("if [ -f '")
-				script.WriteString(strings.ReplaceAll(action.onlyIfFile, `'`, `'\''`))
-				script.WriteString("' ]; then ")
-			}
-			if action.requireFile != "" {
-				script.WriteString("[ -f '")
-				script.WriteString(strings.ReplaceAll(action.requireFile, `'`, `'\''`))
-				script.WriteString("' ] || { ")
-				if action.missingStdout != "" {
-					script.WriteString("printf '%s\\n' '")
-					script.WriteString(strings.ReplaceAll(action.missingStdout, `'`, `'\''`))
-					script.WriteString("'")
-					script.WriteString(" ; ")
-				}
-				script.WriteString("exit ")
-				script.WriteString(strconv.Itoa(firstNonZeroInt(action.exitCode, 1)))
-				script.WriteString(" ; } ; ")
-			}
-			if action.touch != "" {
-				script.WriteString("touch '")
-				script.WriteString(strings.ReplaceAll(action.touch, `'`, `'\''`))
-				script.WriteString("' ; ")
-			}
-			if action.stdout != "" {
-				script.WriteString("printf '%s\\n' '")
-				script.WriteString(strings.ReplaceAll(action.stdout, `'`, `'\''`))
-				script.WriteString("'")
-				script.WriteString(" ; ")
-			}
-			script.WriteString("exit ")
-			script.WriteString(strconv.Itoa(finalExitCode))
-			if action.onlyIfFile != "" {
-				script.WriteString(" ; fi")
-			}
-			script.WriteString(" ;; esac\n")
-		}
-		script.WriteString("exit 1\n")
-	}
-	if err := os.WriteFile(path, []byte(script.String()), 0o755); err != nil {
+	exe, err := os.Executable()
+	if err != nil {
 		t.Fatal(err)
 	}
+	data, err := os.ReadFile(exe)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, data, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	actionsData, err := json.Marshal(actions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path+".json", actionsData, 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestMain(m *testing.M) {
+	if path, ok := fakeCLIActionPath(); ok {
+		os.Exit(runFakeCLI(path, os.Args[1:]))
+	}
+	os.Exit(m.Run())
+}
+
+func fakeCLIActionPath() (string, bool) {
+	exe, err := os.Executable()
+	if err != nil {
+		return "", false
+	}
+	path := exe + ".json"
+	if _, err := os.Stat(path); err == nil {
+		return path, true
+	}
+	return "", false
+}
+
+func runFakeCLI(path string, args []string) int {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	var actions []fakeCLIAction
+	if err := json.Unmarshal(data, &actions); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	joined := strings.Join(args, " ")
+	for _, action := range actions {
+		if !strings.Contains(joined, action.match) {
+			continue
+		}
+		if action.onlyIfFile != "" {
+			if _, err := os.Stat(action.onlyIfFile); err != nil {
+				continue
+			}
+		}
+		if action.requireFile != "" {
+			if _, err := os.Stat(action.requireFile); err != nil {
+				if action.missingStdout != "" {
+					fmt.Fprintln(os.Stdout, action.missingStdout)
+				}
+				return firstNonZeroInt(action.exitCode, 1)
+			}
+		}
+		if action.touch != "" {
+			if err := os.WriteFile(action.touch, nil, 0o644); err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				return 1
+			}
+		}
+		if action.stdout != "" {
+			fmt.Fprintln(os.Stdout, action.stdout)
+		}
+		return fakeCLIFinalExitCode(action)
+	}
+	return 1
 }
 
 func fakeCLIFinalExitCode(action fakeCLIAction) int {
@@ -1192,12 +1235,6 @@ func firstNonZeroInt(values ...int) int {
 		}
 	}
 	return 0
-}
-
-func escapeBatch(value string) string {
-	value = strings.ReplaceAll(value, `\`, `\\`)
-	value = strings.ReplaceAll(value, `"`, `\"`)
-	return value
 }
 
 func TestAWSBrokerCloudFormationTemplateHasBrokerOutput(t *testing.T) {
@@ -2505,7 +2542,7 @@ func TestNativeConfigCommand(t *testing.T) {
 
 func TestGlobalIdentityConfigCommand(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	setTestHome(t, home)
 	if err := globalConfigCommand([]string{"--global", "user.name", "Dennis Example"}, ioDiscard{}); err != nil {
 		t.Fatal(err)
 	}

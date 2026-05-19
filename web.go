@@ -40,6 +40,7 @@ const (
 	webCSSPath          = "www/app.css"
 	webJSPath           = "www/app.js"
 	webLogoPath         = "www/bgit-mark.png"
+	webFaviconPath      = "www/favicon.ico"
 )
 
 type webOptions struct {
@@ -392,6 +393,8 @@ func (s *webServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	case route == "assets/bgit-mark.png":
 		s.handleWebAsset(w, webLogoPath)
+	case route == "favicon.ico":
+		s.handleWebAsset(w, webFaviconPath)
 	case route == "events":
 		s.handleEvents(w, r)
 	case route == "api/state":

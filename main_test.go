@@ -1272,6 +1272,29 @@ func TestBrokerSignatureMessageIsStable(t *testing.T) {
 	}
 }
 
+func TestBrokerForbiddenAllowsSignatureRetryOnlyForAuthFailures(t *testing.T) {
+	for _, msg := range []string{
+		`{"error":"write SSH signature required"}`,
+		`{"error":"owner SSH signature required"}`,
+		`admin SSH signature required`,
+	} {
+		if !brokerForbiddenAllowsSignatureRetry(msg) {
+			t.Fatalf("expected auth retry for %q", msg)
+		}
+	}
+	for _, msg := range []string{
+		`{"error":"protected branch refs/heads/main requires a pull request"}`,
+		`{"error":"repository is read-only"}`,
+		`{"error":"owners cannot be removed or suspended"}`,
+		`forbidden`,
+		``,
+	} {
+		if brokerForbiddenAllowsSignatureRetry(msg) {
+			t.Fatalf("did not expect auth retry for %q", msg)
+		}
+	}
+}
+
 func TestMergeConfigUsesRepoAuthUnlessExplicit(t *testing.T) {
 	local := config{auth: "adc", gcloudConfiguration: "test-profile"}
 	merged := mergeConfig(config{auth: "gcloud"}, local)
@@ -1281,6 +1304,18 @@ func TestMergeConfigUsesRepoAuthUnlessExplicit(t *testing.T) {
 	merged = mergeConfig(config{auth: "gcloud", authExplicit: true, gcloudConfiguration: "default", gcloudConfigurationExplicit: true}, local)
 	if merged.auth != "gcloud" || merged.gcloudConfiguration != "default" {
 		t.Fatalf("explicit merged = %#v", merged)
+	}
+}
+
+func TestMergeConfigUsesRepoRegion(t *testing.T) {
+	local := config{region: "eu-west-1"}
+	merged := mergeConfig(config{}, local)
+	if merged.region != "eu-west-1" {
+		t.Fatalf("merged region = %q", merged.region)
+	}
+	merged = mergeConfig(config{region: "us-west-2"}, local)
+	if merged.region != "us-west-2" {
+		t.Fatalf("explicit region = %q", merged.region)
 	}
 }
 
@@ -1297,6 +1332,27 @@ func TestDefaultAWSRegion(t *testing.T) {
 	t.Setenv("AWS_REGION", "eu-central-1")
 	if got := defaultAWSRegion(); got != "eu-central-1" {
 		t.Fatalf("default region env = %q", got)
+	}
+}
+
+func TestAWSRegionPrefersExplicitConfig(t *testing.T) {
+	t.Setenv("AWS_REGION", "eu-central-1")
+	t.Setenv("AWS_DEFAULT_REGION", "eu-west-1")
+	if got := awsRegion(config{region: "ap-southeast-2"}); got != "ap-southeast-2" {
+		t.Fatalf("explicit region = %q", got)
+	}
+	if got := awsRegion(config{}); got != "eu-central-1" {
+		t.Fatalf("fallback region = %q", got)
+	}
+}
+
+func TestAnonymousS3ClientUsesExplicitRegion(t *testing.T) {
+	client, err := newS3Client(context.Background(), config{region: "ap-southeast-2"}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := client.Options().Region; got != "ap-southeast-2" {
+		t.Fatalf("client region = %q", got)
 	}
 }
 

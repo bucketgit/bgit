@@ -577,10 +577,11 @@ type brokerAuthResponse struct {
 }
 
 type brokerRefUpdateRequest struct {
-	Repo brokerRepo `json:"repo"`
-	Ref  string     `json:"ref"`
-	Old  string     `json:"old"`
-	New  string     `json:"new"`
+	Repo     brokerRepo `json:"repo"`
+	Ref      string     `json:"ref"`
+	Old      string     `json:"old"`
+	New      string     `json:"new"`
+	Override bool       `json:"override,omitempty"`
 }
 
 type brokerKeysResponse struct {
@@ -648,11 +649,16 @@ func normalizeBrokerRole(role string) string {
 }
 
 func brokerUpdateRef(brokerURL string, cfg config, ref, oldHash, newHash string) error {
+	return brokerUpdateRefWithOverride(brokerURL, cfg, ref, oldHash, newHash, false)
+}
+
+func brokerUpdateRefWithOverride(brokerURL string, cfg config, ref, oldHash, newHash string, override bool) error {
 	req := brokerRefUpdateRequest{
-		Repo: repoForBroker(cfg),
-		Ref:  ref,
-		Old:  firstNonEmpty(strings.TrimSpace(oldHash), zeroObjectID()),
-		New:  firstNonEmpty(strings.TrimSpace(newHash), zeroObjectID()),
+		Repo:     repoForBroker(cfg),
+		Ref:      ref,
+		Old:      firstNonEmpty(strings.TrimSpace(oldHash), zeroObjectID()),
+		New:      firstNonEmpty(strings.TrimSpace(newHash), zeroObjectID()),
+		Override: override,
 	}
 	return brokerPost(brokerURL, "/refs/update", req, nil)
 }
@@ -778,11 +784,19 @@ func brokerPostContext(ctx context.Context, brokerURL, path string, req any, res
 			msg = httpResp.Status
 		}
 		lastErr = fmt.Errorf("broker %s: %s", path, msg)
-		if httpResp.StatusCode != http.StatusForbidden || i == len(headerSets)-1 {
+		if httpResp.StatusCode != http.StatusForbidden || i == len(headerSets)-1 || !brokerForbiddenAllowsSignatureRetry(msg) {
 			return lastErr
 		}
 	}
 	return lastErr
+}
+
+func brokerForbiddenAllowsSignatureRetry(msg string) bool {
+	msg = strings.ToLower(strings.TrimSpace(msg))
+	if msg == "" {
+		return false
+	}
+	return strings.Contains(msg, "ssh signature required")
 }
 
 func brokerSignatureHeaders(payload []byte) map[string]string {

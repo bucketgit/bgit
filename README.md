@@ -1,11 +1,11 @@
 # bgit
 
-`bgit` is a Git CLI for repositories stored directly in object storage. It
-keeps a normal `.git` checkout on disk, so developers can use familiar Git
-commands locally, while `bgit` syncs Git objects, branches, and tags to a
-`gs://` or `s3://` repository.
+`bgit` is a Git CLI for repositories stored directly in cloud buckets. It keeps
+normal `.git` checkouts on disk, so developers can use familiar local Git
+workflows, while BucketGit stores repository objects and refs in GCS or S3 and
+coordinates access through a lightweight broker.
 
-Use it when you want a lightweight Git backend in GCS or S3 without running a
+Use it when you want Git repositories in cloud object storage without running a
 Git server.
 
 ## Project
@@ -37,501 +37,358 @@ Check the installed version:
 bgit --version
 ```
 
-## Build
+## How BucketGit Works
 
-```bash
-go build -o bgit .
-```
+BucketGit has two layers:
 
-## Features
+- A normal local Git checkout on your machine.
+- A broker-backed repository stored directly in GCS or S3.
 
-- Clone, initialize, fetch, pull, and push repositories backed by GCS or S3.
-- Store a repository at any `gs://bucket/path/to/repo.git` or
-  `s3://bucket/path/to/repo.git` prefix.
-- Work in a normal Git checkout with a standard `.git` directory.
-- Use native local workflows for status, add, commit, checkout, branch, merge,
-  tag, diff, log, show, reset, restore, stash, revert, grep, blame,
-  cherry-pick, clean, describe, ls-files, ls-tree, archive, config, rev-parse,
-  rm, and mv.
-- Push branches and tags back to object storage with `bgit push`.
-- Configure an origin with `bgit origin` or `bgit remote add origin`.
-- Grant read, write, admin, public, or private bucket access with `bgit admin`.
-- Create and save gcloud profiles with `bgit create-gcloud-profile`.
-- Configure native Git fetch/push over SSH with `bgit ssh setup` and the
-  serverless broker.
-- Browse remote or local repositories with `bgit web`.
-- Create the target GCS or S3 bucket automatically when permissions allow it.
-- Run direct bucket inspection commands for scripts and automation.
+The broker handles repository mapping, roles, SSH-key authorization, pull
+requests, issues, branch protection, and short-lived object-transfer
+capabilities. Developers do not need long-lived bucket credentials for everyday
+clone, fetch, pull, push, review, or web browsing flows.
 
-## Requirements
-
-- Go 1.22 or newer to build from source.
-- The `git` executable available on `PATH` for repository initialization,
-  checkout setup, and compatibility config/remote metadata.
-- Google Cloud Storage access through `gcloud` or Application Default
-  Credentials for `gs://` repositories.
-- AWS credentials through the AWS SDK credential chain for `s3://`
-  repositories.
-
-By default, `bgit` asks `gcloud` for an OAuth access token and uses that token
-for GCS API calls:
-
-```bash
-gcloud auth login
-gcloud auth print-access-token
-```
-
-This follows the active gcloud configuration. To use a named gcloud profile:
-
-```bash
-bgit --profile test-profile clone gs://my-bucket/repositories/demo.git
-bgit --profile test-profile push
-```
-
-Internally, bgit runs `gcloud auth print-access-token`. When a profile is set,
-bgit runs that subprocess with `CLOUDSDK_ACTIVE_CONFIG_NAME` set to the profile
-name so it matches gcloud's named configuration behavior.
-Global flags such as `--profile` and `--auth` can be placed before or after the
-command.
-
-### Gcloud Profiles
-
-Use an existing gcloud configuration for one command:
-
-```bash
-bgit push --profile test-profile
-```
-
-You can also save auth defaults in the checkout:
-
-```bash
-bgit config bucketgit.auth gcloud
-bgit config bucketgit.profile test-profile
-```
-
-Check the saved profile:
-
-```bash
-bgit config bucketgit.profile
-```
-
-Use `bucketgit.auth adc` to make that checkout use ADC by default. If no auth
-config is set, bgit defaults to `gcloud`; if no profile/configuration is set,
-bgit uses the active gcloud configuration.
-
-To create a new gcloud profile and save it in the current checkout:
-
-```bash
-bgit create-gcloud-profile my-profile
-```
-
-This runs `gcloud config configurations create my-profile`, then
-`gcloud auth login --configuration my-profile`. Use `--yes` to skip bgit's
-confirmation prompt. The gcloud browser login still runs.
-
-```bash
-bgit create-gcloud-profile --yes my-profile
-```
-
-For CI, service accounts, or environments where ADC is preferred, opt in
-explicitly:
-
-```bash
-bgit --auth adc push
-```
-
-When `bgit put` or `bgit --bucket ... init` targets a GCS bucket that does not
-exist, `bgit` attempts to create it in the active Google Cloud project. The
-project is read from `GOOGLE_CLOUD_PROJECT`, `GCLOUD_PROJECT`, `GCP_PROJECT`,
-or `gcloud config get-value project` using the selected configuration. The
-environment variables take precedence, which is useful when a gcloud profile has
-an account but no project set.
-
-For S3 repositories, `bgit push` creates the bucket when it does not exist and
-the selected AWS credentials have permission. Region selection follows
-`AWS_REGION`, then `AWS_DEFAULT_REGION`, then `us-east-1`.
-
-If Google returns an auth error, first check that the selected gcloud
-configuration has the expected account and project:
-
-```bash
-gcloud config configurations list
-CLOUDSDK_ACTIVE_CONFIG_NAME=test-profile gcloud auth print-access-token
-CLOUDSDK_ACTIVE_CONFIG_NAME=test-profile gcloud config get-value project
-```
-
-### AWS Profiles
-
-For `s3://` origins, bgit uses the AWS SDK credential chain. It supports
-`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, temporary credentials through
-`AWS_SESSION_TOKEN`, IAM roles, SSO-backed profiles, and the credentials/config
-files written by the AWS CLI.
-
-Region selection follows `AWS_REGION`, then `AWS_DEFAULT_REGION`, and defaults
-to `us-east-1` when neither is set.
-
-Use an AWS CLI profile for one command:
-
-```bash
-bgit clone s3://my-bucket/repositories/demo.git --profile work
-bgit push --profile work
-```
-
-Save the profile in a checkout:
-
-```bash
-bgit config bucketgit.profile work
-```
+Direct bucket access still exists under `bgit direct` for recovery, migration,
+and low-level inspection. It is not the normal user workflow.
 
 ## Quickstart
 
-Clone an existing object-storage-backed repository:
+Set up BucketGit for one or more cloud profiles:
 
 ```bash
-bgit clone gs://my-bucket/repositories/demo.git ./demo
-bgit clone s3://my-bucket/repositories/demo.git ./demo-s3 --profile work
-cd demo
-
-git status
-git log --oneline
+bgit setup
 ```
 
-For read-only remote operations such as `clone`, `fetch`, `pull`, and
-`ls-remote`, `bgit` first tries an anonymous public read. If the repository is
-private, it automatically retries with the configured GCS or AWS credentials.
+`bgit setup` discovers GCP and AWS profiles, lets you choose regions, imports
+owner SSH keys, deploys or updates the broker, and writes global configuration to
+`~/.bgit/config.yaml`.
 
-Make a change and push it:
-
-```bash
-echo "hello" > README.md
-bgit add README.md
-bgit commit -m "Add README"
-bgit push
-```
-
-Create a new repository from an existing directory:
+Create a new repository:
 
 ```bash
 mkdir demo
 cd demo
-
 bgit init
+
 echo "hello" > README.md
 bgit add README.md
 bgit commit -m "Initial commit"
-
-bgit origin gs://my-bucket/repositories/demo.git
-# or:
-bgit origin s3://my-bucket/repositories/demo.git
 bgit push
 ```
 
+Clone an existing broker-backed repository:
+
+```bash
+bgit clone https://broker.example.com/team/demo.git ./demo
+```
+
+Inside an initialized checkout, normal Git commands also work for fetch and push
+through the `core.sshCommand` written by `bgit init`:
+
+```bash
+git fetch
+git push
+```
+
+## Common Commands
+
+```bash
+bgit setup
+bgit setup profile create --provider gcp work
+bgit setup profile create --provider aws work
+
+bgit init
+bgit init --noninteractive --repo team/demo --profile work.europe-west1
+bgit clone https://broker.example.com/team/demo.git ./demo
+bgit web
+
+bgit status
+bgit add -A
+bgit commit -m "Update"
+bgit checkout -b feature/docs
+bgit diff
+bgit log --oneline
+
+bgit fetch
+bgit pull
+bgit push
+bgit push --tags
+bgit push --delete feature/docs
+bgit ls-remote
+
+bgit pr create --title "Add docs" --source feature/docs --target main
+bgit pr list
+bgit pr view 1
+bgit pr diff 1
+bgit pr merge 1
+
+bgit issue create "Bug report" --body "Details"
+bgit issue list
+bgit issue view 1
+
+bgit whoami
+bgit repos mine
+```
+
+## Setup And Profiles
+
+Global configuration is stored in `~/.bgit/config.yaml`. Profiles are
+provider- and region-aware, so the same cloud account can have brokers in
+multiple regions.
+
+Examples:
+
+```bash
+bgit init --noninteractive --repo app --profile work.europe-west1
+bgit push --profile work --region europe-west1
+```
+
+If a profile has multiple configured regions, pass the region explicitly:
+
+```bash
+bgit push --profile work --region eu-west-1
+```
+
+or use a region-qualified profile name:
+
+```bash
+bgit push --profile work.eu-west-1
+```
+
+`bgit setup` can also create cloud CLI profiles:
+
+```bash
+bgit setup profile create --provider gcp work
+bgit setup profile create --provider aws work
+```
+
+GCP setup uses `gcloud` configurations. AWS setup reads AWS config/credentials
+files and can use the AWS CLI when profile creation is requested.
+
+## Identity
+
+BucketGit supports a global name and email in `~/.bgit/config.yaml` and per-repo
+identity in `.git/config`, matching the way Git users expect identity to work.
+The repo-local identity overrides the global one.
+
+If no identity is configured, BucketGit falls back to a default client identity
+and warns before pushing.
+
+## Access Control
+
+Repository access is broker-backed and SSH-key based. Roles are:
+
+- `owner`
+- `admin`
+- `maintainer`
+- `developer`
+- `triage`
+- `read`
+
+Owners cannot be deleted or suspended. Ownership transfer uses a two-step flow:
+the current owner creates a transfer command, and the new owner accepts it with
+an SSH signature.
+
+Useful admin commands:
+
+```bash
+bgit admin keys list
+bgit admin keys add --user ada --role developer --key ~/.ssh/ada.pub
+bgit admin keys import-github octocat --role triage
+bgit admin keys suspend KEY_OR_FINGERPRINT
+bgit admin keys remove KEY_OR_FINGERPRINT
+
+bgit admin invite-user --broker https://broker.example.com --user ada --role developer team/demo.git
+bgit admin accept-invite CODE
+bgit admin cancel-invite --broker https://broker.example.com --user ada team/demo.git
+
+bgit admin confirm-ownership-transfer --broker https://broker.example.com team/demo.git
+bgit admin accept-ownership-transfer CODE
+bgit admin cancel-ownership-transfer --broker https://broker.example.com team/demo.git
+
+bgit admin protect add main
+bgit admin protect list
+bgit admin protect remove main
+```
+
+A repo can have at most one active pending invite per username. Invite
+cancellation is repo-scoped.
+
+## Repository Settings
+
+Broker-backed repositories support public/private visibility, read-only mode,
+issues, branch protection, logical rename, and owner-only destructive delete.
+
+```bash
+bgit admin repo visibility public
+bgit admin repo visibility private
+bgit admin repo readonly on
+bgit admin repo readonly off
+bgit admin repo issues on
+bgit admin repo issues off
+bgit admin repo rename new-name
+bgit admin repo delete --yes
+```
+
+Public repositories can be cloned and browsed without an SSH key. Private
+repositories require a recognized broker SSH key.
+
+## Pull Requests And Issues
+
+Pull requests and issues are broker metadata, not part of the Git protocol.
+BucketGit implements them on top of repository refs and broker-side metadata.
+
+```bash
+bgit pr create --title "Add docs" --source feature/docs --target main
+bgit pr list
+bgit pr view 1
+bgit pr diff 1
+bgit pr comment 1 "Looks good"
+bgit pr approve 1 "Approved"
+bgit pr reject 1 "Please change this"
+bgit pr merge 1 --delete-branch
+bgit pr close 1
+
+bgit issue create "Missing docs" --body "The setup page needs examples."
+bgit issue list
+bgit issue comment 1 "I can take this."
+bgit issue close 1
+bgit issue reopen 1
+```
+
+Branch protection is enforced by the broker. Protected branches can require the
+PR merge path, with optional owner/admin override.
+
 ## Web UI
 
-`bgit web` serves a small local repository browser on `127.0.0.1:8042`:
+`bgit web` serves a local browser UI on `127.0.0.1:8042`:
 
 ```bash
 bgit web
 ```
 
-By default it serves the configured remote repository using the same read path
-as `bgit fetch` and `bgit ls-remote`: anonymous public read first, then
-authenticated GCS/S3 retry when the repository is private. It also honors
-`bucketgit.profile` and `--profile`.
+The web UI uses the configured repository and broker by default. It shows files,
+commits, pull requests, issues, repository settings, capability-aware controls,
+local dirty/staged/unpushed state, and remote sync status.
 
-If the checkout is configured with `bucketgit.broker`, `bgit web` can fall back
-to broker-mediated read access signed by the user's ssh-agent key. This lets a
-user who only has SSH broker access browse the repository without direct cloud
-credentials.
-
-The web UI includes a branch/tag selector, clone command copy buttons, file and
-raw blob views, commit author and committer metadata, and per-commit diffs.
-
-Use `--local` to browse the local `.git` object store instead:
+Use local-only mode to browse the local `.git` object store without broker
+refreshes:
 
 ```bash
 bgit web --local
 bgit web --port 9000
 ```
 
-## Git SSH Transport
+The web assets are embedded into the `bgit` binary at build time.
 
-`bgit ssh setup` configures a checkout so normal Git clients use `bgit` as the
-SSH transport:
+## Native Git Transport
 
-```bash
-bgit ssh setup gs://my-bucket/repositories/demo.git
-bgit ssh setup s3://my-bucket/repositories/demo.git --profile work
-```
-
-This writes a Git remote like `git@git.bucketgit.com:bucket/prefix.git` and
-sets `core.sshCommand=bgit ssh`. Fresh native Git clones can use the same URL
-when `GIT_SSH_COMMAND` points at `bgit ssh`:
-
-```bash
-GIT_SSH_COMMAND="bgit ssh" git clone git@git.bucketgit.com:my-bucket/repositories/demo.git
-```
-
-SSH Git operations are authorized through the bgit broker. Fetch, clone, and
-`ls-remote` require an active key with `read`, `write`, or `admin`. Push
-requires `write` or `admin`. Suspended keys are rejected.
-
-When a broker is configured, both native `git push` through `bgit ssh` and
-`bgit push` use the broker for compare-and-swap ref updates before mirroring refs
-back to the bucket. This gives AWS and GCP the same concurrent-push behavior:
-one writer wins and stale writers are rejected instead of silently overwriting a
-ref.
-
-Direct `bgit` commands against `gs://` or `s3://` origins still use the selected
-cloud credentials. If the broker is unavailable and an operator needs to bypass
-broker coordination, use:
-
-```bash
-bgit push --skip-broker
-```
-
-When no broker is configured, `bgit push` writes refs directly to the bucket and
-accepts the usual last-writer-wins risk.
-
-For GCP broker bootstrap, `bgit ssh setup` enables the required APIs and uses a
-named Firestore database called `bgit`. If that database does not exist yet, the
-caller needs `datastore.databases.create`, for example via
-`roles/datastore.owner`. This permission is only needed while creating the
-database; later repo/key administration uses the deployed broker and SSH admin
-keys.
-
-Broker-mediated `bgit web` reads use the broker runtime's cloud permissions to
-read repository objects. The generated AWS broker role includes S3 read/list
-permissions. On GCP, grant the Cloud Run function service account storage
-read/list access if the repository bucket is outside the function's default
-project permissions.
-
-The broker tracks repositories and SSH keys:
-
-```bash
-bgit ssh repo add
-bgit ssh keys list
-bgit ssh keys add --user ada --role read --key ~/.ssh/ada.pub
-bgit ssh keys suspend KEY_OR_COMMENT
-bgit ssh keys remove KEY_OR_COMMENT
-```
-
-## Repository URLs
-
-Repository URLs use the `gs://` or `s3://` scheme:
+`bgit init` writes a Git remote like:
 
 ```text
-gs://bucket-name/path/to/repo.git
-s3://bucket-name/path/to/repo.git
+git@git.bucketgit.com:team/demo.git
 ```
 
-The bucket is the object-storage bucket name. Everything after the bucket is the
-repository prefix. For example, this repository:
+and configures:
 
 ```text
-gs://my-bucket/repositories/demo.git
+core.sshCommand=bgit ssh
 ```
 
-is stored under:
-
-```text
-gs://my-bucket/repositories/demo.git/HEAD
-gs://my-bucket/repositories/demo.git/objects/...
-gs://my-bucket/repositories/demo.git/refs/...
-```
-
-The same layout is used for S3:
-
-```text
-s3://my-bucket/repositories/demo.git/HEAD
-s3://my-bucket/repositories/demo.git/objects/...
-s3://my-bucket/repositories/demo.git/refs/...
-```
-
-## Common Commands
+That lets native Git use BucketGit for fetch and push inside initialized
+repositories:
 
 ```bash
-bgit --version
-bgit clone gs://my-bucket/repositories/demo.git [directory]
-bgit clone s3://my-bucket/repositories/demo.git [directory]
-bgit init [directory]
-bgit origin gs://my-bucket/repositories/demo.git
-bgit origin s3://my-bucket/repositories/demo.git
-bgit ssh setup gs://my-bucket/repositories/demo.git
-bgit web
-
-bgit fetch
-bgit pull
-bgit push
-bgit push --skip-broker
-bgit push --tags
-bgit push --delete feature
-bgit ls-remote
-bgit admin grant-write user:dev@example.com
-
-bgit checkout -b feature
-bgit checkout main
-bgit branch
-bgit merge feature
-bgit tag v1.0.0
-
-bgit status
-bgit add -A
-bgit commit -m "Update"
-bgit diff
-bgit log --oneline
-bgit show HEAD
-bgit restore README.md
-bgit reset --hard HEAD
-bgit stash
-bgit revert HEAD
-bgit config user.name "Ada Lovelace"
-bgit rev-parse HEAD
+git fetch
+git push
 ```
 
-Local workflow commands are implemented by `bgit` for the supported subset.
-Commands outside that subset return `Unsupported` instead of delegating to the
-system `git` binary.
-
-## Origins
-
-`bgit clone` writes the origin into `.git/config` automatically. To attach an
-origin to an existing checkout, run:
-
-```bash
-bgit origin gs://my-bucket/repositories/demo.git
-bgit origin s3://my-bucket/repositories/demo.git
-```
-
-You can also use Git-style remote commands:
-
-```bash
-bgit remote add origin gs://my-bucket/repositories/demo.git
-bgit remote add origin s3://my-bucket/repositories/demo.git
-bgit remote set-url origin gs://my-bucket/repositories/demo.git
-```
-
-If `bgit push` is run without an origin, it prints a copy-pasteable example:
-
-```text
-No configured push destination.
-Either specify the repository from the command-line:
-
-    bgit --bucket bucket-name --prefix path/to/repo.git push
-
-or configure a bgit origin:
-
-    bgit origin gs://bucket-name/path/to/repo.git
-    bgit origin s3://bucket-name/path/to/repo.git
-
-and then push:
-
-    bgit push
-```
-
-## Access Control
-
-`bgit admin` grants bucket access using the selected cloud profile. Run it
-inside a checkout to infer the bucket and prefix from `.git/config`, or pass
-`--bucket` explicitly.
-
-For GCS repositories:
-
-```bash
-bgit admin grant-read user:dev@example.com
-bgit admin grant-write serviceAccount:ci@project.iam.gserviceaccount.com
-bgit admin --bucket my-bucket grant-admin admin@example.com
-bgit admin make-public
-bgit admin make-private
-```
-
-GCS `grant-read` grants `roles/storage.objectViewer` and
-`roles/storage.legacyBucketReader`. `grant-write` grants
-`roles/storage.objectAdmin` and `roles/storage.legacyBucketReader`.
-`grant-admin` grants `roles/storage.admin`. `make-public` grants anonymous read
-access at bucket level. `make-private` removes `allUsers` and
-`allAuthenticatedUsers` from bgit's bucket-level read roles.
-
-The caller must already have permission to read and update the bucket IAM
-policy, such as `roles/storage.admin` on the bucket.
-
-For S3 repositories:
-
-```bash
-bgit admin grant-read arn:aws:iam::123456789012:role/Developer
-bgit admin --bucket s3://my-bucket/repositories/demo.git grant-write 123456789012
-bgit admin --bucket s3://my-bucket/repositories/demo.git grant-admin arn:aws:iam::123456789012:role/Admin
-bgit admin --bucket s3://my-bucket/repositories/demo.git make-public
-bgit admin --bucket s3://my-bucket/repositories/demo.git make-private
-```
-
-S3 identities must be IAM or STS ARNs, 12 digit AWS account IDs, or `*`.
-`grant-read` grants `s3:ListBucket` for the repository prefix and
-`s3:GetObject` for objects under that prefix. `grant-write` adds
-`s3:PutObject`, `s3:DeleteObject`, and multipart abort access. `grant-admin`
-grants `s3:*` for the bucket and repository prefix. The caller must already have
-permission to read and update the bucket policy.
-
-S3 `make-public` removes bucket-level Block Public Access and adds anonymous
-read access for the repository prefix. `make-private` removes bgit's anonymous
-statements for that prefix and restores bucket-level Block Public Access.
-
-## Branches And Tags
-
-New repositories default to the `main` branch. Use `--branch` when cloning or
-using direct GCS mode to target another branch:
-
-```bash
-bgit --branch develop clone gs://my-bucket/repositories/demo.git
-bgit --branch release fetch
-```
-
-Tags are regular Git tags in the object-storage-backed repository:
-
-```bash
-bgit tag v1.0.0
-bgit tag -a v1.0.1 -m "Release v1.0.1"
-bgit push --tags
-bgit ls-remote --tags
-```
+Native Git transport is authorized through the broker. Ref updates use
+compare-and-swap checks so stale writers are rejected instead of silently
+overwriting refs.
 
 ## Direct Bucket Mode
 
-Most developers should use `clone`, `init`, `origin`, and `push`. Direct bucket
-mode is available for scripts and one-off inspection without a checkout:
+Direct bucket mode is the low-level escape hatch for recovery, migration,
+scripts, and debugging. It uses cloud credentials directly and bypasses the
+normal broker-first workflow.
 
 ```bash
-bgit --bucket my-bucket --prefix repositories/demo.git ls docs/
-bgit --bucket my-bucket --prefix repositories/demo.git cat docs/readme.md
-bgit --bucket my-bucket --prefix repositories/demo.git log --limit 10
-bgit --bucket my-bucket --prefix repositories/demo.git put docs/readme.md --file README.md -m "Add readme" --author "Ada Lovelace" --email ada@example.com
+bgit direct help
+bgit direct clone gs://bucket/repositories/demo.git
+bgit direct clone s3://bucket/repositories/demo.git
+bgit direct fetch
+bgit direct push
+bgit --bucket my-bucket --prefix repositories/demo.git direct ls docs/
+bgit --bucket my-bucket --prefix repositories/demo.git direct cat docs/readme.md
 ```
 
-## How It Works
+Cloud IAM and bucket-policy recovery commands also live under direct mode:
 
-`bgit` stores Git objects and refs in an object-storage prefix using the normal Git
-repository layout. Remote operations read and write those objects and refs
-directly through the GCS or S3 API.
+```bash
+bgit direct admin grant-read user:dev@example.com
+bgit direct admin grant-write serviceAccount:ci@project.iam.gserviceaccount.com
+bgit direct admin grant-admin arn:aws:iam::123456789012:role/Admin
+```
 
-Local checkouts remain normal Git worktrees. `bgit` implements the supported
-local workflow commands directly, uses the `git` executable only for repository
-setup/config compatibility, and uses object-storage-backed remote updates for
-collaboration.
+## Broker Maintenance
+
+Broker maintenance commands are intentionally separated from normal user flows:
+
+```bash
+bgit janitor members reindex
+bgit broker delete --provider gcp --profile work --region europe-west1 --yes
+bgit broker delete --provider aws --profile work --region eu-west-1 --yes
+```
+
+Use them for repair, test cleanup, or broker decommissioning.
+
+## Development And Tests
+
+Build from source:
+
+```bash
+go build -o bgit .
+```
+
+Run unit tests:
+
+```bash
+go test ./...
+```
+
+Run the local broker integration suite:
+
+```bash
+./testsuite/run.sh
+BGIT_TEST_PROVIDER=gcp ./testsuite/run.sh
+BGIT_TEST_PROVIDER=aws ./testsuite/run.sh
+```
+
+The integration suite uses local SQLite-backed broker runtimes and does not
+require cloud credentials or deployed brokers.
+
+## Requirements
+
+Runtime requirements depend on the command:
+
+- `git` on `PATH` for repository initialization and native Git compatibility.
+- `ssh-agent`/`ssh-add` for broker SSH-key signing flows.
+- `gcloud` for GCP setup and profile creation.
+- AWS config/credentials files and optionally the AWS CLI for AWS setup/profile
+  creation.
+- Go 1.22 or newer to build from source.
 
 ## Unsupported Commands
 
-Some Git commands depend on Git's network protocol, server-side hooks, packfile
-maintenance, or repository features that `bgit` does not emulate. Unsupported
-commands return:
+BucketGit implements the supported local workflow commands directly. Commands
+outside that subset return an unsupported-command error instead of delegating to
+the system Git binary.
 
-```text
-Unsupported: '<command>' is not supported by bgit
-```
-
-Unsupported commands include `rebase`, `daemon`, `submodule`, `lfs`, `gc`,
-`fsck`, `repack`, `prune`, `worktree`, credential helpers, server helpers, and
-related maintenance commands. Native Git fetch and push are supported inside
-repositories configured with `bgit ssh setup`.
+Unsupported commands include repository maintenance and server features such as
+`daemon`, `submodule`, `lfs`, `gc`, `fsck`, `repack`, `prune`, `worktree`,
+credential helpers, and related server helpers.
 
 ## Contributing
 
@@ -547,14 +404,3 @@ fork-to-pull-request workflow and the checks to run before opening a PR.
 `bgit` is provided as-is, without warranty of any kind. You are responsible for
 testing it against your own repositories, access controls, backup strategy, and
 operational requirements before relying on it in production.
-
-## Help
-
-```bash
-bgit help
-bgit help push
-bgit push --help
-bgit --help push
-bgit push help
-bgit --version
-```

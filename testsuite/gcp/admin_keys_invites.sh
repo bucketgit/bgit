@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+source "$(dirname "$0")/../lib/testlib.sh"
+init_output="$(init_bgit_repo gcp invite)"
+dir="$(printf "%s\n" "$init_output" | sed -n "1p")"
+broker="$(git -C "$dir" config --get bucketgit.broker)"
+repo="$(git -C "$dir" config --get bucketgit.logicalRepo)"
+out="$(run_in "$dir" admin keys list)"
+assert_contains "$out" "owner"
+out="$(run_in "$dir" admin invite-user --broker "$broker" --user developer --role developer "$repo")"
+assert_contains "$out" "bgit admin accept-invite"
+out="$(cd "$dir" && expect_failure "$BGIT" admin invite-user --broker "$broker" --user bad --role owner "$repo")"
+assert_contains "$out" "invalid role"

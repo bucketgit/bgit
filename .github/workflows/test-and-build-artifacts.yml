@@ -1,0 +1,346 @@
+name: Test And Build Artifacts
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+    paths:
+      - "*.go"
+      - "**/*.go"
+      - "go.mod"
+      - "go.sum"
+      - "CHANGELOG.md"
+      - "broker/**"
+      - "www/**"
+      - "testsuite/**"
+      - ".github/workflows/test-and-build-artifacts.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  unit:
+    name: Unit Tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - macos-14
+          - macos-15-intel
+          - ubuntu-24.04
+          - windows-2022
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Unit Tests
+        run: go test ./...
+
+  build:
+    name: Build Multiarchitecture Artifacts
+    needs:
+      - unit
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Resolve Version From Changelog
+        if: github.ref == 'refs/heads/main'
+        shell: pwsh
+        run: |
+          if (!(Test-Path "CHANGELOG.md")) {
+            throw "Missing CHANGELOG.md"
+          }
+
+          $lines = Get-Content "CHANGELOG.md"
+          $line = $lines | Where-Object { $_ -match '^\s*##\s+v?(\d+\.\d+\.\d+)(?:\s|$)' } | Select-Object -First 1
+          if (-not $line) {
+            throw "Could not find semantic version heading in CHANGELOG.md"
+          }
+          if ($line -notmatch '^\s*##\s+v?(\d+\.\d+\.\d+)(?:\s|$)') {
+            throw "Invalid semantic version heading in CHANGELOG.md"
+          }
+
+          $version = $Matches[1]
+          $releaseTag = $version
+          $start = [Array]::IndexOf($lines, $line)
+          $notes = New-Object System.Collections.Generic.List[string]
+
+          for ($i = $start + 1; $i -lt $lines.Count; $i++) {
+            if ($lines[$i] -match '^\s*##\s+v?\d+\.\d+\.\d+(?:\s|$)') {
+              break
+            }
+            $notes.Add($lines[$i])
+          }
+
+          $releaseNotes = ($notes -join "`n").Trim()
+          if ([string]::IsNullOrWhiteSpace($releaseNotes)) {
+            throw "CHANGELOG.md section for $version has no release notes"
+          }
+
+          $releaseNotes | Out-File -FilePath "release-notes.md" -Encoding utf8
+
+          "APP_VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "RELEASE_TAG=$releaseTag" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "RELEASE_NAME=$releaseTag" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Resolve Development Release
+        if: github.ref == 'refs/heads/develop'
+        shell: pwsh
+        run: |
+          if (!(Test-Path "CHANGELOG.md")) {
+            throw "Missing CHANGELOG.md"
+          }
+
+          $lines = Get-Content "CHANGELOG.md"
+          $line = $lines | Where-Object { $_ -match '^\s*##\s+v?(\d+\.\d+\.\d+)(?:\s|$)' } | Select-Object -First 1
+          if (-not $line) {
+            throw "Could not find semantic version heading in CHANGELOG.md"
+          }
+          if ($line -notmatch '^\s*##\s+v?(\d+\.\d+\.\d+)(?:\s|$)') {
+            throw "Invalid semantic version heading in CHANGELOG.md"
+          }
+
+          $version = "$($Matches[1])-dev"
+
+          "Latest development release for $version" | Out-File -FilePath "release-notes.md" -Encoding utf8
+
+          "APP_VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "RELEASE_TAG=dev-latest" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "RELEASE_NAME=dev-latest" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Resolve Manual Development Release
+        if: github.ref != 'refs/heads/main' && github.ref != 'refs/heads/develop'
+        shell: pwsh
+        run: |
+          "Manual development build" | Out-File -FilePath "release-notes.md" -Encoding utf8
+
+          "APP_VERSION=dev" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "RELEASE_TAG=dev" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "RELEASE_NAME=dev" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Build
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path "dist" | Out-Null
+
+          $targets = @(
+            @{ GOOS = "darwin";  GOARCH = "arm64"; Artifact = "bgit-mac-arm64" },
+            @{ GOOS = "darwin";  GOARCH = "amd64"; Artifact = "bgit-mac-amd64" },
+            @{ GOOS = "linux";   GOARCH = "amd64"; Artifact = "bgit-linux-amd64" },
+            @{ GOOS = "linux";   GOARCH = "arm64"; Artifact = "bgit-linux-arm64" },
+            @{ GOOS = "windows"; GOARCH = "amd64"; Artifact = "bgit-windows-amd64.exe" },
+            @{ GOOS = "windows"; GOARCH = "arm64"; Artifact = "bgit-windows-arm64.exe" }
+          )
+
+          foreach ($target in $targets) {
+            $artifact = $target.Artifact
+            if ($env:RELEASE_TAG -eq "dev-latest") {
+              if ($artifact.EndsWith(".exe")) {
+                $artifact = $artifact.Substring(0, $artifact.Length - 4) + "-dev.exe"
+              } else {
+                $artifact = "$artifact-dev"
+              }
+            }
+
+            $env:GOOS = $target.GOOS
+            $env:GOARCH = $target.GOARCH
+            $env:CGO_ENABLED = "0"
+
+            go build -trimpath -ldflags="-s -w -X main.version=$env:APP_VERSION" -o "dist/$artifact" .
+
+            if (!(Test-Path "dist/$artifact")) {
+              throw "Missing expected artifact: dist/$artifact"
+            }
+          }
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bgit-artifacts
+          path: dist/*
+          if-no-files-found: error
+
+  integration:
+    name: Integration Tests (${{ matrix.os }})
+    needs:
+      - build
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            binary: bgit-mac-arm64
+          - os: macos-15-intel
+            binary: bgit-mac-amd64
+          - os: ubuntu-24.04
+            binary: bgit-linux-amd64
+          - os: windows-2022
+            binary: bgit-windows-amd64.exe
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 25
+
+      - name: Download Built Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: bgit-artifacts
+          path: dist
+
+      - name: Prepare Built Binary
+        shell: bash
+        run: |
+          if [[ "${{ matrix.binary }}" == *.exe ]]; then
+            cp "dist/${{ matrix.binary }}" ./bgit.exe
+            chmod +x ./bgit.exe
+            printf 'BGIT_PATH=%s/bgit.exe\n' "$GITHUB_WORKSPACE" >> "$GITHUB_ENV"
+            ./bgit.exe --version
+          else
+            cp "dist/${{ matrix.binary }}" ./bgit
+            chmod +x ./bgit
+            printf 'BGIT_PATH=%s/bgit\n' "$GITHUB_WORKSPACE" >> "$GITHUB_ENV"
+            ./bgit --version
+          fi
+
+      - name: Local Broker Integration (GCP runtime)
+        shell: bash
+        env:
+          BGIT_TEST_USE_EXISTING_BINARY: "1"
+        run: BGIT="$BGIT_PATH" ./testsuite/run-local-broker.sh gcp
+
+      - name: Local Broker Integration (AWS runtime)
+        shell: bash
+        env:
+          BGIT_TEST_USE_EXISTING_BINARY: "1"
+        run: BGIT="$BGIT_PATH" ./testsuite/run-local-broker.sh aws
+
+  publish:
+    name: Publish Release
+    needs:
+      - integration
+    runs-on: ubuntu-24.04
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop')
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download Built Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: bgit-artifacts
+          path: dist
+
+      - name: Resolve Version From Changelog
+        if: github.ref == 'refs/heads/main'
+        shell: pwsh
+        run: |
+          if (!(Test-Path "CHANGELOG.md")) {
+            throw "Missing CHANGELOG.md"
+          }
+
+          $lines = Get-Content "CHANGELOG.md"
+          $line = $lines | Where-Object { $_ -match '^\s*##\s+v?(\d+\.\d+\.\d+)(?:\s|$)' } | Select-Object -First 1
+          if (-not $line) {
+            throw "Could not find semantic version heading in CHANGELOG.md"
+          }
+          if ($line -notmatch '^\s*##\s+v?(\d+\.\d+\.\d+)(?:\s|$)') {
+            throw "Invalid semantic version heading in CHANGELOG.md"
+          }
+
+          $version = $Matches[1]
+          $releaseTag = $version
+          $start = [Array]::IndexOf($lines, $line)
+          $notes = New-Object System.Collections.Generic.List[string]
+
+          for ($i = $start + 1; $i -lt $lines.Count; $i++) {
+            if ($lines[$i] -match '^\s*##\s+v?\d+\.\d+\.\d+(?:\s|$)') {
+              break
+            }
+            $notes.Add($lines[$i])
+          }
+
+          $releaseNotes = ($notes -join "`n").Trim()
+          if ([string]::IsNullOrWhiteSpace($releaseNotes)) {
+            throw "CHANGELOG.md section for $version has no release notes"
+          }
+
+          $releaseNotes | Out-File -FilePath "release-notes.md" -Encoding utf8
+
+          "RELEASE_TAG=$releaseTag" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "RELEASE_NAME=$releaseTag" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Resolve Development Release
+        if: github.ref == 'refs/heads/develop'
+        shell: pwsh
+        run: |
+          "Latest development release" | Out-File -FilePath "release-notes.md" -Encoding utf8
+
+          "RELEASE_TAG=dev-latest" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "RELEASE_NAME=dev-latest" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Publish To Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = $env:RELEASE_TAG
+          $name = $env:RELEASE_NAME
+          $repo = "${{ github.repository }}"
+          $target = "${{ github.ref_name }}"
+
+          if ($tag -eq "dev-latest") {
+            git tag -f $tag "${{ github.sha }}"
+            git push origin "refs/tags/$tag" --force
+          }
+
+          gh release view $tag --repo $repo *> $null
+          if ($LASTEXITCODE -ne 0) {
+            if ($tag -eq "dev-latest") {
+              gh release create $tag --repo $repo --target $target --title $name --notes-file release-notes.md --prerelease
+            } else {
+              gh release create $tag --repo $repo --target $target --title $name --notes-file release-notes.md
+            }
+            if ($LASTEXITCODE -ne 0) {
+              gh release view $tag --repo $repo *> $null
+              if ($LASTEXITCODE -ne 0) {
+                throw "Could not create or access release $tag"
+              }
+            }
+          }
+
+          gh release edit $tag --repo $repo --title $name --notes-file release-notes.md
+          Get-ChildItem -Path dist -File | ForEach-Object {
+            gh release upload $tag $_.FullName --repo $repo --clobber
+            if ($LASTEXITCODE -ne 0) {
+              throw "Could not upload release asset $($_.FullName)"
+            }
+          }

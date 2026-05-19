@@ -42,7 +42,7 @@ async function loadRepo(repo) {
 }
 
 async function saveRepo(entry) {
-  await entry.ref.set(entry.data, {merge: true});
+  await entry.ref.set(entry.data, {merge: false});
   await syncMembershipIndex(entry);
 }
 
@@ -132,8 +132,10 @@ function audit(entry, event) {
 }
 
 function readSSHString(buf, offset) {
+  if (offset + 4 > buf.length) throw new Error('invalid SSH wire string');
   const len = buf.readUInt32BE(offset);
   const start = offset + 4;
+  if (start + len > buf.length) throw new Error('invalid SSH wire string');
   return {value: buf.subarray(start, start + len), offset: start + len};
 }
 
@@ -151,16 +153,88 @@ function normalizeKey(key) {
   return String(key || '').trim().split(/\s+/).slice(0, 2).join(' ');
 }
 
+function base64URL(buf) {
+  return Buffer.from(buf).toString('base64url');
+}
+
+function sshMPIntToBuffer(buf) {
+  let out = Buffer.from(buf);
+  while (out.length > 1 && out[0] === 0) out = out.subarray(1);
+  return out;
+}
+
+function ecdsaSignatureToDER(blob) {
+  let parsed = readSSHString(blob, 0);
+  const r = sshMPIntToBuffer(parsed.value);
+  parsed = readSSHString(blob, parsed.offset);
+  const s = sshMPIntToBuffer(parsed.value);
+  const encodeInt = (value) => {
+    let out = Buffer.from(value);
+    if (out.length === 0) out = Buffer.from([0]);
+    if (out[0] & 0x80) out = Buffer.concat([Buffer.from([0]), out]);
+    return Buffer.concat([Buffer.from([0x02, out.length]), out]);
+  };
+  const body = Buffer.concat([encodeInt(r), encodeInt(s)]);
+  if (body.length > 127) throw new Error('ECDSA signature too large');
+  return Buffer.concat([Buffer.from([0x30, body.length]), body]);
+}
+
 function publicKeyObject(publicKey) {
   const parts = normalizeKey(publicKey).split(/\s+/);
-  if (parts[0] !== 'ssh-ed25519') return crypto.createPublicKey(publicKey);
+  if (parts.length < 2) throw new Error('invalid SSH public key');
   const blob = Buffer.from(parts[1], 'base64');
   let parsed = readSSHString(blob, 0);
   const alg = parsed.value.toString();
-  if (alg !== 'ssh-ed25519') throw new Error('unsupported SSH key algorithm');
-  parsed = readSSHString(blob, parsed.offset);
-  const derPrefix = Buffer.from('302a300506032b6570032100', 'hex');
-  return crypto.createPublicKey({key: Buffer.concat([derPrefix, parsed.value]), format: 'der', type: 'spki'});
+  if (alg !== parts[0]) throw new Error('SSH key algorithm mismatch');
+  if (alg === 'ssh-ed25519') {
+    parsed = readSSHString(blob, parsed.offset);
+    return crypto.createPublicKey({key: {kty: 'OKP', crv: 'Ed25519', x: base64URL(parsed.value)}, format: 'jwk'});
+  }
+  if (alg === 'ssh-rsa') {
+    parsed = readSSHString(blob, parsed.offset);
+    const e = sshMPIntToBuffer(parsed.value);
+    parsed = readSSHString(blob, parsed.offset);
+    const n = sshMPIntToBuffer(parsed.value);
+    return crypto.createPublicKey({key: {kty: 'RSA', n: base64URL(n), e: base64URL(e)}, format: 'jwk'});
+  }
+  if (alg.startsWith('ecdsa-sha2-')) {
+    parsed = readSSHString(blob, parsed.offset);
+    const sshCurve = parsed.value.toString();
+    parsed = readSSHString(blob, parsed.offset);
+    const point = parsed.value;
+    const curves = {'nistp256': 'P-256', 'nistp384': 'P-384', 'nistp521': 'P-521'};
+    const crv = curves[sshCurve];
+    if (!crv || !point.length || point[0] !== 4) throw new Error('unsupported ECDSA SSH key');
+    const coordinateLength = Math.ceil(Number(sshCurve.replace('nistp', '')) / 8);
+    const x = point.subarray(1, 1 + coordinateLength);
+    const y = point.subarray(1 + coordinateLength, 1 + 2 * coordinateLength);
+    if (x.length !== coordinateLength || y.length !== coordinateLength) throw new Error('invalid ECDSA SSH key');
+    return crypto.createPublicKey({key: {kty: 'EC', crv, x: base64URL(x), y: base64URL(y)}, format: 'jwk'});
+  }
+  throw new Error('unsupported SSH key algorithm');
+}
+
+function signatureVerifyAlgorithm(alg) {
+  if (alg === 'ssh-ed25519') return null;
+  if (alg === 'ssh-rsa') return 'sha1';
+  if (alg === 'rsa-sha2-256') return 'sha256';
+  if (alg === 'rsa-sha2-512') return 'sha512';
+  if (alg === 'ecdsa-sha2-nistp256') return 'sha256';
+  if (alg === 'ecdsa-sha2-nistp384') return 'sha384';
+  if (alg === 'ecdsa-sha2-nistp521') return 'sha512';
+  throw new Error('unsupported SSH signature algorithm');
+}
+
+function signatureBlobForVerify(alg, sig) {
+  if (alg.startsWith('ecdsa-sha2-')) return ecdsaSignatureToDER(sig);
+  return sig;
+}
+
+function verifySSHSignature(publicKey, message, signature) {
+  const parsed = readSSHString(Buffer.from(signature, 'base64'), 0);
+  const alg = parsed.value.toString();
+  const sig = readSSHString(Buffer.from(signature, 'base64'), parsed.offset).value;
+  return crypto.verify(signatureVerifyAlgorithm(alg), Buffer.from(message, 'base64'), publicKeyObject(publicKey), signatureBlobForVerify(alg, sig));
 }
 
 function signedKey(req, entry) {
@@ -171,11 +245,7 @@ function signedKey(req, entry) {
   if (!publicKey || !message || !signature || message !== expectedMessage(req)) return null;
   const key = keys.find((k) => normalizeKey(k.public_key) === publicKey);
   if (!key) return null;
-  const parsed = readSSHString(Buffer.from(signature, 'base64'), 0);
-  const alg = parsed.value.toString();
-  const sig = readSSHString(Buffer.from(signature, 'base64'), parsed.offset).value;
-  const verifyAlg = alg === 'ssh-ed25519' ? null : 'sha256';
-  if (!crypto.verify(verifyAlg, Buffer.from(message, 'base64'), publicKeyObject(publicKey), sig)) return null;
+  if (!verifySSHSignature(publicKey, message, signature)) return null;
   return key;
 }
 
@@ -184,11 +254,7 @@ function submittedSignedKey(req) {
   const message = String(req.get('x-bgit-signature-message') || '');
   const signature = String(req.get('x-bgit-signature') || '');
   if (!publicKey || !message || !signature || message !== expectedMessage(req)) return null;
-  const parsed = readSSHString(Buffer.from(signature, 'base64'), 0);
-  const alg = parsed.value.toString();
-  const sig = readSSHString(Buffer.from(signature, 'base64'), parsed.offset).value;
-  const verifyAlg = alg === 'ssh-ed25519' ? null : 'sha256';
-  if (!crypto.verify(verifyAlg, Buffer.from(message, 'base64'), publicKeyObject(publicKey), sig)) return null;
+  if (!verifySSHSignature(publicKey, message, signature)) return null;
   return {public_key: publicKey, fingerprint: keyFingerprint(publicKey)};
 }
 
@@ -767,6 +833,8 @@ exports.broker = async (req, res) => {
       const brokerURL = String(body.broker_url || '').trim();
       const expires = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
       entry.data.invites = (entry.data.invites || []).filter((invite) => Date.parse(invite.expires_at || '') > Date.now());
+      const normalizedUser = user.toLowerCase();
+      if (entry.data.invites.some((invite) => String(invite.user || '').trim().toLowerCase() === normalizedUser)) throw Object.assign(new Error('invite already pending for user'), {status: 409});
       entry.data.invites.push({token_hash: ownershipTransferTokenHash(token), user, role, broker_url: brokerURL, expires_at: expires});
       const code = memberInviteCode(brokerURL, entry.data.repo || body.repo, token);
       audit(entry, {type: 'member_invite_create', user, role});
@@ -795,6 +863,23 @@ exports.broker = async (req, res) => {
       audit(entry, {type: 'member_invite_accept', user: invite.user, role: invite.role, fingerprint: signed.fingerprint});
       await saveRepo(entry);
       res.status(200).send(JSON.stringify({ok: true, user: invite.user, role: invite.role, fingerprint: signed.fingerprint}));
+      return;
+    }
+    if (req.path === '/keys/invite/cancel' && req.method === 'POST') {
+      const entry = await ensureRepo(body.repo);
+      requireAdmin(req, entry);
+      const invites = entry.data.invites || [];
+      const user = String(body.user || '').trim().toLowerCase();
+      const tokenHash = body.token ? ownershipTransferTokenHash(body.token) : '';
+      const next = invites.filter((item) => {
+        if (tokenHash) return item.token_hash !== tokenHash;
+        return String(item.user || '').trim().toLowerCase() !== user;
+      });
+      if (next.length === invites.length) throw Object.assign(new Error('invite is not pending or has expired'), {status: 404});
+      entry.data.invites = next;
+      audit(entry, {type: 'member_invite_cancel'});
+      await saveRepo(entry);
+      res.status(200).send(JSON.stringify({ok: true}));
       return;
     }
     if ((req.path === '/keys/remove' || req.path === '/keys/suspend') && req.method === 'POST') {

@@ -489,7 +489,7 @@ func (r *nativeGitRepo) pushWorktree(ctx context.Context, worktree string, opts 
 	}
 	updateRef := func(ref, oldHash, newHash string) error {
 		if brokerURL != "" {
-			if err := brokerUpdateRef(brokerURL, r.cfg, ref, oldHash, newHash); err != nil {
+			if err := brokerUpdateRefWithOverride(brokerURL, r.cfg, ref, oldHash, newHash, opts.force); err != nil {
 				return brokerPushError(err)
 			}
 		}

@@ -31,7 +31,7 @@ func brokerAdminCommand(cfg config, args []string, stdout io.Writer) error {
 
 func brokerAdminCommandWithInput(cfg config, args []string, stdin io.Reader, stdout io.Writer) error {
 	if len(args) == 0 {
-		return errors.New("usage: bgit admin keys|owner|protect|members|confirm-ownership-transfer|accept-ownership-transfer|cancel-ownership-transfer [args]\n\nCloud IAM administration moved to bgit direct admin.")
+		return errors.New("usage: bgit admin keys|owner|protect|members|confirm-ownership-transfer|accept-ownership-transfer|cancel-ownership-transfer|invite-user|accept-invite|cancel-invite [args]\n\nCloud IAM administration moved to bgit direct admin.")
 	}
 	switch args[0] {
 	case "keys":
@@ -50,6 +50,8 @@ func brokerAdminCommandWithInput(cfg config, args []string, stdin io.Reader, std
 		return brokerInviteUserCommand(cfg, args[1:], stdout)
 	case "accept-invite":
 		return brokerAcceptInviteCommand(args[1:], stdout)
+	case "cancel-invite":
+		return brokerCancelInviteCommand(cfg, args[1:], stdout)
 	case "grant-read", "grant-write", "grant-admin", "make-public", "make-private":
 		return errors.New("cloud IAM administration moved to bgit direct admin")
 	default:
@@ -676,6 +678,66 @@ func brokerAcceptInviteCommand(args []string, stdout io.Writer) error {
 	return nil
 }
 
+func brokerCancelInviteCommand(cfg config, args []string, stdout io.Writer) error {
+	brokerURL, repoName, user, err := parseCancelInviteTarget(cfg, args)
+	if err != nil {
+		return err
+	}
+	repo := brokerRepo{Provider: "gcs", Logical: logicalRepoWithGit(repoName), Origin: "git@" + defaultSSHHost + ":" + logicalRepoWithGit(repoName)}
+	if err := brokerPost(brokerURL, "/keys/invite/cancel", brokerOwnerTransferRequest{Repo: repo, User: user}, nil); err != nil {
+		return err
+	}
+	fmt.Fprintf(stdout, "cancelled invite for %s on %s\n", user, repo.Logical)
+	return nil
+}
+
+func parseCancelInviteTarget(cfg config, args []string) (string, string, string, error) {
+	brokerURL := ""
+	repoName := ""
+	user := ""
+	var err error
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		name, value, hasValue := strings.Cut(arg, "=")
+		switch name {
+		case "--broker":
+			value, i, err = optionValue(args, i, hasValue, value, name)
+			if err != nil {
+				return "", "", "", err
+			}
+			brokerURL = strings.TrimSpace(value)
+		case "--user":
+			value, i, err = optionValue(args, i, hasValue, value, name)
+			if err != nil {
+				return "", "", "", err
+			}
+			user = strings.TrimSpace(value)
+		default:
+			if strings.HasPrefix(arg, "-") {
+				return "", "", "", fmt.Errorf("unsupported cancel-invite option %s", arg)
+			}
+			if repoName != "" {
+				return "", "", "", errors.New("cancel-invite accepts exactly one repository")
+			}
+			repoName = strings.TrimSpace(arg)
+		}
+	}
+	if brokerURL == "" || repoName == "" {
+		if local, err := configForBrokerCommand(cfg); err == nil {
+			if brokerURL == "" {
+				brokerURL = local.brokerURL
+			}
+			if repoName == "" {
+				repoName = local.logicalRepo
+			}
+		}
+	}
+	if brokerURL == "" || repoName == "" || user == "" {
+		return "", "", "", errors.New("usage: bgit admin cancel-invite --broker URL --user USER REPO")
+	}
+	return brokerURL, repoName, user, nil
+}
+
 func parseInviteCode(code string) (ownerTransferCodePayload, error) {
 	code = strings.TrimSpace(code)
 	if !strings.HasPrefix(code, "bgitinv_") {
@@ -948,7 +1010,7 @@ func parseIssueIDArg(args []string) (int, error) {
 func prCommand(args []string, stdin io.Reader, stdout io.Writer) error {
 	_ = stdin
 	if len(args) == 0 {
-		return errors.New("usage: bgit pr create|list|view|checkout|diff|merge|close|reopen [args]")
+		return errors.New("usage: bgit pr create|list|view|checkout|diff|merge|close|reopen|comment|approve|reject [args]")
 	}
 	cfg, err := configForBrokerCommand(config{})
 	if err != nil {
@@ -999,14 +1061,50 @@ func prCommand(args []string, stdin io.Reader, stdout io.Writer) error {
 		fmt.Fprintf(stdout, "reopened PR #%d\n", id)
 		return nil
 	case "merge":
-		id, err := parsePRIDArg(args[1:])
+		deleteBranch := false
+		var idArgs []string
+		for _, arg := range args[1:] {
+			switch arg {
+			case "--delete-branch":
+				deleteBranch = true
+			default:
+				idArgs = append(idArgs, arg)
+			}
+		}
+		id, err := parsePRIDArg(idArgs)
 		if err != nil {
 			return err
 		}
-		if err := brokerPost(cfg.brokerURL, "/prs/merge", brokerPullRequestRequest{Repo: repoForBroker(cfg), ID: id, Merge: true}, nil); err != nil {
+		if err := brokerPost(cfg.brokerURL, "/prs/merge", brokerPullRequestRequest{Repo: repoForBroker(cfg), ID: id, Merge: true, DeleteBranch: deleteBranch}, nil); err != nil {
 			return err
 		}
 		fmt.Fprintf(stdout, "merged PR #%d\n", id)
+		return nil
+	case "comment":
+		id, comment, err := parsePRIDAndTextArg(args[1:], "usage: bgit pr comment ID COMMENT")
+		if err != nil {
+			return err
+		}
+		if err := brokerPost(cfg.brokerURL, "/prs/comment", brokerPullRequestRequest{Repo: repoForBroker(cfg), ID: id, Comment: comment}, nil); err != nil {
+			return err
+		}
+		fmt.Fprintf(stdout, "commented on PR #%d\n", id)
+		return nil
+	case "approve", "reject":
+		id, comment, err := parsePRIDAndOptionalTextArg(args[1:])
+		if err != nil {
+			return err
+		}
+		review := "approved"
+		verb := "approved"
+		if args[0] == "reject" {
+			review = "changes_requested"
+			verb = "requested changes on"
+		}
+		if err := brokerPost(cfg.brokerURL, "/prs/review", brokerPullRequestRequest{Repo: repoForBroker(cfg), ID: id, Review: review, Comment: comment}, nil); err != nil {
+			return err
+		}
+		fmt.Fprintf(stdout, "%s PR #%d\n", verb, id)
 		return nil
 	case "checkout":
 		pr, err := brokerGetPullRequest(cfg, args[1:])
@@ -1037,6 +1135,32 @@ func prCommand(args []string, stdin io.Reader, stdout io.Writer) error {
 	default:
 		return fmt.Errorf("unknown pr command %q", args[0])
 	}
+}
+
+func parsePRIDAndTextArg(args []string, usage string) (int, string, error) {
+	if len(args) < 2 {
+		return 0, "", errors.New(usage)
+	}
+	id, err := strconv.Atoi(args[0])
+	if err != nil || id <= 0 {
+		return 0, "", errors.New("pull request id is required")
+	}
+	text := strings.TrimSpace(strings.Join(args[1:], " "))
+	if text == "" {
+		return 0, "", errors.New(usage)
+	}
+	return id, text, nil
+}
+
+func parsePRIDAndOptionalTextArg(args []string) (int, string, error) {
+	if len(args) < 1 {
+		return 0, "", errors.New("pull request id is required")
+	}
+	id, err := strconv.Atoi(args[0])
+	if err != nil || id <= 0 {
+		return 0, "", errors.New("pull request id is required")
+	}
+	return id, strings.TrimSpace(strings.Join(args[1:], " ")), nil
 }
 
 func prCreateCommand(cfg config, args []string, stdout io.Writer) error {

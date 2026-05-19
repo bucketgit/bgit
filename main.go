@@ -519,6 +519,9 @@ func mergeConfig(primary, fallback config) config {
 	if primary.logicalRepo == "" {
 		primary.logicalRepo = fallback.logicalRepo
 	}
+	if primary.region == "" {
+		primary.region = fallback.region
+	}
 	if primary.branch == "" || primary.branch == defaultBranch {
 		primary.branch = fallback.branch
 	}
@@ -1027,6 +1030,7 @@ Configure a direct bucketgit origin using Git remote syntax.
   bgit admin keys list|add|remove|suspend|import-github [args]
   bgit admin invite-user --broker URL --user USER [--role ROLE] REPO
   bgit admin accept-invite CODE
+  bgit admin cancel-invite --broker URL --user USER REPO
   bgit admin confirm-ownership-transfer --broker URL REPO
   bgit admin accept-ownership-transfer CODE
   bgit admin cancel-ownership-transfer [--broker URL REPO]
@@ -1066,8 +1070,11 @@ creation; private repositories require membership.
   bgit pr view ID
   bgit pr checkout ID
   bgit pr diff ID
-  bgit pr merge ID
+  bgit pr merge ID [--delete-branch]
   bgit pr close ID
+  bgit pr comment ID COMMENT
+  bgit pr approve ID [COMMENT]
+  bgit pr reject ID [COMMENT]
 
 Broker-backed pull request metadata and merge/ref protection workflow.
 Pull requests are stored in the broker control plane, not in Git itself.

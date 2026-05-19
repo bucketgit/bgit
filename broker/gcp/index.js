@@ -26,11 +26,26 @@ function cleanName(value) {
   return String(value || 'repo').toLowerCase().replace(/[^a-z0-9.-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40) || 'repo';
 }
 
+function normalizeLogicalRepo(value) {
+  const base = String(value || '').trim().replace(/\.git$/, '');
+  if (!base) throw new Error('logical repo name is required');
+  if (base.includes('/') || base.includes('\\')) throw new Error('logical repo names must be flat');
+  if (base === '.' || base === '..') throw new Error('logical repo name is invalid');
+  return `${base}.git`;
+}
+
+function validateRepo(repo) {
+  if (!repo || (!repo.logical && (!repo.bucket || !repo.prefix))) throw new Error('repo is required');
+  if (repo.logical) repo.logical = normalizeLogicalRepo(repo.logical);
+  return repo;
+}
+
 function randomSuffix() {
   return crypto.randomBytes(5).toString('hex');
 }
 
 async function loadRepo(repo) {
+  repo = validateRepo(repo);
   const ref = repos.doc(docID(repo));
   const snap = await ref.get();
   if (!snap.exists) return {ref, data: {repo, keys: [], audit: []}};
@@ -688,7 +703,7 @@ function countApprovals(pr) {
 }
 
 async function ensureRepo(repo) {
-  if (!repo || (!repo.logical && (!repo.bucket || !repo.prefix))) throw new Error('repo is required');
+  repo = validateRepo(repo);
   const entry = await loadRepo(repo);
   const owners = await loadOwners();
   for (const owner of owners.data.keys || []) {
@@ -774,8 +789,7 @@ exports.broker = async (req, res) => {
       const entry = await ensureRepo(body.repo);
       const key = signedKey(req, entry);
       if (!key || key.role !== 'owner') throw Object.assign(new Error('owner SSH signature required'), {status: 403});
-      const logical = String(body.logical || '').trim().replace(/^\/+|\/+$/g, '');
-      if (!logical) throw new Error('logical repo name is required');
+      const logical = normalizeLogicalRepo(body.logical);
       const newRepo = {...(entry.data.repo || body.repo), logical};
       const newRef = repos.doc(docID(newRepo));
       const oldID = docID(entry.data.repo || body.repo);

@@ -1409,8 +1409,13 @@ func (s *webServer) handleAPIActionSettings(ctx context.Context, w http.Response
 		endpoint = "/owners/transfer/confirm"
 		payload = brokerOwnerTransferRequest{Repo: repoForBroker(s.cfg), BrokerURL: s.cfg.brokerURL}
 	case "repo-rename":
+		logical, err := normalizeLogicalRepoName(req.Logical)
+		if err != nil {
+			s.renderJSONError(w, http.StatusBadRequest, err)
+			return
+		}
 		endpoint = "/repo/rename"
-		payload = brokerRepoInfoRequest{Repo: repoForBroker(s.cfg), Logical: logicalRepoWithGit(req.Logical)}
+		payload = brokerRepoInfoRequest{Repo: repoForBroker(s.cfg), Logical: logical}
 	case "repo-delete":
 		endpoint = "/repo/delete"
 		payload = brokerRepoInfoRequest{Repo: repoForBroker(s.cfg)}
@@ -1455,7 +1460,11 @@ func (s *webServer) handleAPIActionSettings(ctx context.Context, w http.Response
 		return
 	}
 	if endpoint == "/repo/rename" && strings.TrimSpace(req.Logical) != "" {
-		logical := logicalRepoWithGit(req.Logical)
+		logical, err := normalizeLogicalRepoName(req.Logical)
+		if err != nil {
+			s.renderJSONError(w, http.StatusBadRequest, err)
+			return
+		}
 		_, _ = runGit(".", "config", "--local", "bucketgit.logicalRepo", logical)
 		_, _ = runGit(".", "remote", "set-url", "origin", "git@"+defaultSSHHost+":"+logical)
 		s.cfg.logicalRepo = logical

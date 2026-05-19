@@ -1253,6 +1253,8 @@ func TestAWSBrokerCloudFormationTemplateHasBrokerOutput(t *testing.T) {
 		"InvokedViaFunctionUrl",
 		"/refs/update",
 		"roleAllows",
+		"normalizeLogicalRepo",
+		"logical repo names must be flat",
 		"ConditionalCheckFailedException",
 		"BROKER_VERSION: " + brokerVersion,
 		`version: brokerVersion`,
@@ -1284,6 +1286,8 @@ func TestGCPBrokerSourceUsesFirestoreAndSignatureHeaders(t *testing.T) {
 		"/objects/read",
 		"/refs/update",
 		"roleAllows",
+		"normalizeLogicalRepo",
+		"logical repo names must be flat",
 		"runTransaction",
 		"process.env.BROKER_VERSION",
 		"version: brokerVersion",
@@ -2156,7 +2160,7 @@ func TestLocalBranchLifecycleMaintainsOriginTracking(t *testing.T) {
 	for _, args := range [][]string{
 		{"config", "user.name", "Ada"},
 		{"config", "user.email", "ada@example.com"},
-		{"remote", "add", "origin", "git@git.bucketgit.com:team/app.git"},
+		{"remote", "add", "origin", "git@git.bucketgit.com:app.git"},
 	} {
 		if _, err := runGit(target, args...); err != nil {
 			t.Fatal(err)
@@ -3185,7 +3189,7 @@ func TestOpenWebRepositoryUsesBrokerFromRepoConfig(t *testing.T) {
 	}
 	for _, args := range [][]string{
 		{"config", "bucketgit.broker", "https://broker.example.test"},
-		{"config", "bucketgit.logicalRepo", "team/app.git"},
+		{"config", "bucketgit.logicalRepo", "app.git"},
 		{"config", "bucketgit.provider", "gcs"},
 	} {
 		if _, err := runGit(target, args...); err != nil {
@@ -3212,7 +3216,7 @@ func TestOpenWebRepositoryUsesBrokerFromRepoConfig(t *testing.T) {
 	if !ok {
 		t.Fatalf("api store = %T, want *brokerGitStore", apiRepo.store)
 	}
-	if store.brokerURL != "https://broker.example.test" || cfg.brokerURL != "https://broker.example.test" || cfg.logicalRepo != "team/app.git" {
+	if store.brokerURL != "https://broker.example.test" || cfg.brokerURL != "https://broker.example.test" || cfg.logicalRepo != "app.git" {
 		t.Fatalf("store=%#v cfg=%#v", store, cfg)
 	}
 }
@@ -3224,7 +3228,7 @@ func TestOpenWebRepositoryLocalBypassesBroker(t *testing.T) {
 	}
 	for _, args := range [][]string{
 		{"config", "bucketgit.broker", "https://broker.example.test"},
-		{"config", "bucketgit.logicalRepo", "team/app.git"},
+		{"config", "bucketgit.logicalRepo", "app.git"},
 	} {
 		if _, err := runGit(target, args...); err != nil {
 			t.Fatal(err)
@@ -3254,17 +3258,17 @@ func TestOpenWebRepositoryLocalBypassesBroker(t *testing.T) {
 func TestWebClonePanelShowsBrokerCloneCommand(t *testing.T) {
 	server := &webServer{cfg: config{
 		brokerURL:   "https://broker.example.test/",
-		logicalRepo: "team/app.git",
-		origin:      "git@git.bucketgit.com:team/app.git",
+		logicalRepo: "app.git",
+		origin:      "git@git.bucketgit.com:app.git",
 	}}
 	html := server.clonePanelHTML()
-	if !strings.Contains(html, "team/app.git") {
+	if !strings.Contains(html, "app.git") {
 		t.Fatalf("clone panel missing repo: %s", html)
 	}
-	if !strings.Contains(html, "bgit clone https://broker.example.test/team/app.git") {
+	if !strings.Contains(html, "bgit clone https://broker.example.test/app.git") {
 		t.Fatalf("clone panel missing broker clone command: %s", html)
 	}
-	if !strings.Contains(html, "git@git.bucketgit.com:team/app.git") {
+	if !strings.Contains(html, "git@git.bucketgit.com:app.git") {
 		t.Fatalf("clone panel missing ssh origin: %s", html)
 	}
 }
@@ -3272,14 +3276,14 @@ func TestWebClonePanelShowsBrokerCloneCommand(t *testing.T) {
 func TestWebRepoHeaderUsesShortTitleAndBrokerLocationBadge(t *testing.T) {
 	cfg := config{
 		brokerURL:   "https://broker.example.test/",
-		logicalRepo: "team/app.git",
+		logicalRepo: "app.git",
 	}
 	title := webRepoTitle(cfg)
-	if title != "team/app.git" {
+	if title != "app.git" {
 		t.Fatalf("title = %q", title)
 	}
 	server := &webServer{cfg: cfg, title: title}
-	if badge := server.repoLocationBadge(); badge != "broker.example.test/team/app.git" {
+	if badge := server.repoLocationBadge(); badge != "broker.example.test/app.git" {
 		t.Fatalf("badge = %q", badge)
 	}
 	header := server.headerHTML("refs/heads/main", "")
@@ -3366,7 +3370,7 @@ func TestWebPullRequestCacheRendersPRTabAndPage(t *testing.T) {
 	handler := newWebHandlerWithAPI(
 		newNativeGitRepoForStore(config{branch: "main"}, &localGitStore{root: bare}),
 		nil,
-		config{branch: "main", brokerURL: "https://broker.example.test", logicalRepo: "team/app.git", provider: "gcs"},
+		config{branch: "main", brokerURL: "https://broker.example.test", logicalRepo: "app.git", provider: "gcs"},
 	)
 	if err := handler.writePullRequestCache([]brokerPullRequest{{
 		ID:        7,

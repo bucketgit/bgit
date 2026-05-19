@@ -4,6 +4,13 @@ All notable changes to `bgit` are documented in this file.
 
 This project follows semantic versioning.
 
+## 1.0.1
+
+Changed
+
+- Broker logical repository names are now flat. Path-shaped names are rejected
+  in the CLI, web settings, and broker to reserve URL paths for team routing.
+
 ## 1.0.0
 
 Breaking changes

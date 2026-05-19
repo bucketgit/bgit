@@ -588,11 +588,15 @@ type brokerKeysResponse struct {
 }
 
 func brokerUpsertLogicalRepo(brokerURL, provider, logicalRepo string) error {
+	logical, err := normalizeLogicalRepoName(logicalRepo)
+	if err != nil {
+		return err
+	}
 	cfg := config{
 		provider:    provider,
-		prefix:      strings.Trim(logicalRepo, "/"),
-		logicalRepo: strings.Trim(logicalRepo, "/"),
-		origin:      fmt.Sprintf("git@%s:%s", defaultSSHHost, strings.Trim(logicalRepo, "/")),
+		prefix:      logical,
+		logicalRepo: logical,
+		origin:      fmt.Sprintf("git@%s:%s", defaultSSHHost, logical),
 	}
 	req := brokerRepoRequest{Repo: repoForBroker(cfg)}
 	return brokerPost(brokerURL, "/repos/upsert", req, nil)
@@ -723,6 +727,9 @@ func repoForBroker(cfg config) brokerRepo {
 		cfg.origin = originForConfig(cfg)
 	}
 	logical := strings.Trim(firstNonEmpty(cfg.logicalRepo, cfg.prefix), "/")
+	if normalized, err := normalizeLogicalRepoName(logical); err == nil {
+		logical = normalized
+	}
 	return brokerRepo{
 		Provider: firstNonEmpty(cfg.provider, "gcs"),
 		Bucket:   cfg.bucket,

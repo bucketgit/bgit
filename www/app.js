@@ -587,10 +587,10 @@ async function handleSettingsForm(form) {
   } else if (action === 'repo-rename') {
     payload.logical = formValue(form, 'logical');
     if (!payload.logical) {
-      setSyncStatus('New logical repository name is required.', 'is-stale');
+      setSyncStatus('New repository name is required.', 'is-stale');
       return;
     }
-    const ok = await confirmModal({title: 'Rename repository?', body: 'Rename this logical repository to ' + payload.logical + '.', confirm: 'OK'});
+    const ok = await confirmModal({title: 'Rename repository?', body: 'Rename this repository to ' + payload.logical + '.', confirm: 'OK'});
     if (!ok) return;
   } else if (action === 'repo-delete') {
     const expected = form.querySelector('[data-confirm-repo]')?.getAttribute('data-confirm-repo') || '';

@@ -17,6 +17,14 @@ if [[ "${BGIT_TEST_USE_EXISTING_BINARY:-}" != "1" ]]; then
   go build -o bgit .
 fi
 
+native_path() {
+  if command -v cygpath >/dev/null 2>&1; then
+    cygpath -w "$1"
+  else
+    printf '%s' "$1"
+  fi
+}
+
 for key in "$ROOT"/testsuite/sshkeys/*; do
   tmp="${key}.tmp"
   tr -d '\r' < "$key" > "$tmp"
@@ -30,6 +38,7 @@ broker_url="http://127.0.0.1:${port}"
 config_path="${test_root}/home/.bgit/config.yaml"
 mkdir -p "$(dirname "$config_path")"
 export HOME="${test_root}/home"
+export USERPROFILE="$(native_path "$HOME")"
 
 cat > "$config_path" <<EOF
 version: 1
@@ -91,7 +100,7 @@ export BGIT="${BGIT:-$ROOT/bgit}"
 export BGIT_TEST_USE_EXISTING_BINARY=1
 export BGIT_TEST_RUN_ID="$run_id"
 export BGIT_TEST_PROVIDER="$provider"
-export BGIT_TEST_CONFIG="$config_path"
+export BGIT_TEST_CONFIG="$(native_path "$config_path")"
 export BGIT_TEST_GCP_PROFILE="gcp:local/test"
 export BGIT_TEST_AWS_PROFILE="aws:local/test"
 export BGIT_TEST_IN_LOCAL_BROKER=1

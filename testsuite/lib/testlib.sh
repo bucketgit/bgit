@@ -82,6 +82,8 @@ new_workdir() {
 init_local_git_identity() {
   git -C "$1" config user.name "BucketGit Tests"
   git -C "$1" config user.email "tests@bucketgit.local"
+  git -C "$1" config core.autocrlf false
+  git -C "$1" config core.eol lf
 }
 
 init_bgit_repo() {

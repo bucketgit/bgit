@@ -10,6 +10,7 @@ assert_contains "$out" "refs/heads/main"
 clone="$SUITE_ROOT/gcp/repo/remote-clone-$RUN_ID"
 rm -rf "$clone"
 expect_success "$BGIT" clone "$(git -C "$dir" config --get bucketgit.broker)/$(git -C "$dir" config --get bucketgit.logicalRepo)" "$clone" >/dev/null
+init_local_git_identity "$clone"
 assert_file_exists "$clone/README.md"
 printf 'gcp pull\n' >> "$dir/README.md"
 run_in "$dir" add README.md >/dev/null

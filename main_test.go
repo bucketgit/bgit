@@ -1052,6 +1052,9 @@ func TestProvisionAWSBrokerURLDeploysThenDiscoversStackOutput(t *testing.T) {
 	bin := t.TempDir()
 	marker := filepath.Join(t.TempDir(), "deployed")
 	writeFakeCLI(t, bin, "aws", []fakeCLIAction{
+		{match: "sts get-caller-identity", stdout: `{"Account":"123456789012","Arn":"arn:aws:iam::123456789012:user/dennis"}`},
+		{match: "s3api head-bucket --bucket bgit-broker-artifacts-123456789012-eu-west-1", exitCode: 1},
+		{match: "s3api create-bucket --bucket bgit-broker-artifacts-123456789012-eu-west-1"},
 		{match: "cloudformation describe-stacks", stdout: "https://bgit-broker-provisioned-aws.example.test", requireFile: marker, exitCode: 1},
 		{match: "cloudformation deploy", touch: marker},
 	})

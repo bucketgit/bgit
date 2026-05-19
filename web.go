@@ -26,6 +26,8 @@ import (
 	"sync"
 	"time"
 	"unicode/utf8"
+
+	"golang.org/x/crypto/ssh"
 )
 
 //go:embed www/*
@@ -156,6 +158,31 @@ type webAPIState struct {
 type webPullRequestCache struct {
 	UpdatedAt int64               `json:"updated_at"`
 	PRs       []brokerPullRequest `json:"prs"`
+}
+
+type brokerIssue struct {
+	ID        int                `json:"id,omitempty"`
+	Title     string             `json:"title,omitempty"`
+	Body      string             `json:"body,omitempty"`
+	Status    string             `json:"status,omitempty"`
+	Author    string             `json:"author,omitempty"`
+	CreatedAt string             `json:"created_at,omitempty"`
+	UpdatedAt string             `json:"updated_at,omitempty"`
+	Comments  []brokerIssueReply `json:"comments,omitempty"`
+}
+
+type brokerIssueReply struct {
+	User string `json:"user,omitempty"`
+	Body string `json:"body,omitempty"`
+	At   string `json:"at,omitempty"`
+}
+
+type brokerIssueRequest struct {
+	Repo    brokerRepo `json:"repo"`
+	ID      int        `json:"id,omitempty"`
+	Title   string     `json:"title,omitempty"`
+	Body    string     `json:"body,omitempty"`
+	Comment string     `json:"comment,omitempty"`
 }
 
 func webCommand(ctx context.Context, cfg config, args []string, stdout io.Writer) error {
@@ -387,6 +414,10 @@ func (s *webServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.handleAPIActionPull(ctx, w, r)
 	case route == "api/actions/pr":
 		s.handleAPIActionPullRequest(ctx, w, r)
+	case route == "api/actions/issues":
+		s.handleAPIActionIssue(ctx, w, r)
+	case route == "api/actions/settings":
+		s.handleAPIActionSettings(ctx, w, r)
 	case route == "api/diff":
 		s.handleAPIDiff(ctx, w, r)
 	case route == "api/refs":
@@ -397,6 +428,10 @@ func (s *webServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		srv.handleAPICommits(ctx, w, r)
 	case route == "api/prs":
 		s.handleAPIPullRequests(ctx, w, r)
+	case route == "api/issues":
+		s.handleAPIIssues(ctx, w, r)
+	case route == "api/settings":
+		s.handleAPISettings(ctx, w, r)
 	case route == "api/blob":
 		srv.handleAPIBlob(ctx, w, r)
 	case strings.HasPrefix(route, "api/commit/"):
@@ -409,6 +444,12 @@ func (s *webServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.handlePullRequests(ctx, w, r)
 	case strings.HasPrefix(route, "prs/"):
 		s.handlePullRequest(ctx, w, r, strings.TrimPrefix(route, "prs/"))
+	case route == "issues":
+		s.handleIssues(ctx, w, r)
+	case strings.HasPrefix(route, "issues/"):
+		s.handleIssue(ctx, w, r, strings.TrimPrefix(route, "issues/"))
+	case route == "settings":
+		s.handleSettings(ctx, w, r)
 	case route == "archive.zip":
 		srv.handleArchiveZip(ctx, w, r)
 	case strings.HasPrefix(route, "commit/"):
@@ -673,6 +714,166 @@ func (s *webServer) handleAPIPullRequests(ctx context.Context, w http.ResponseWr
 		"source": source,
 		"stale":  stale,
 	})
+}
+
+type webSettingsInfo struct {
+	Repo          brokerRepo                `json:"repo"`
+	Title         string                    `json:"title"`
+	BrokerURL     string                    `json:"broker_url,omitempty"`
+	Provider      string                    `json:"provider,omitempty"`
+	Region        string                    `json:"region,omitempty"`
+	Description   string                    `json:"description,omitempty"`
+	DefaultBranch string                    `json:"default_branch,omitempty"`
+	Visibility    string                    `json:"visibility,omitempty"`
+	ReadOnly      bool                      `json:"read_only,omitempty"`
+	IssuesEnabled bool                      `json:"issues_enabled"`
+	Keys          []brokerKey               `json:"keys,omitempty"`
+	Protections   []brokerProtectionRequest `json:"protections,omitempty"`
+	Errors        map[string]string         `json:"errors,omitempty"`
+}
+
+type brokerRepoInfoRequest struct {
+	Repo          brokerRepo `json:"repo"`
+	Description   string     `json:"description,omitempty"`
+	DefaultBranch string     `json:"default_branch,omitempty"`
+	Visibility    string     `json:"visibility,omitempty"`
+	ReadOnly      bool       `json:"read_only,omitempty"`
+	IssuesEnabled bool       `json:"issues_enabled"`
+	Logical       string     `json:"logical,omitempty"`
+}
+
+type brokerRepoInfoResponse struct {
+	Repo          brokerRepo `json:"repo"`
+	Description   string     `json:"description"`
+	DefaultBranch string     `json:"default_branch"`
+	Visibility    string     `json:"visibility"`
+	ReadOnly      bool       `json:"read_only"`
+	IssuesEnabled bool       `json:"issues_enabled"`
+}
+
+func (s *webServer) handleAPISettings(ctx context.Context, w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	s.renderJSON(w, s.settingsInfo(ctx))
+}
+
+func (s *webServer) handleAPIIssues(ctx context.Context, w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	issues, err := s.listIssues(ctx)
+	if err != nil {
+		s.renderJSONError(w, http.StatusForbidden, err)
+		return
+	}
+	s.renderJSON(w, map[string]any{"issues": issues})
+}
+
+func (s *webServer) listIssues(ctx context.Context) ([]brokerIssue, error) {
+	if strings.TrimSpace(s.cfg.brokerURL) == "" || strings.TrimSpace(s.cfg.logicalRepo) == "" {
+		return nil, errors.New("broker issues unavailable")
+	}
+	var resp struct {
+		Issues []brokerIssue `json:"issues"`
+	}
+	if err := brokerPostContext(ctx, s.cfg.brokerURL, "/issues/list", brokerIssueRequest{Repo: repoForBroker(s.cfg)}, &resp); err != nil {
+		return nil, err
+	}
+	return resp.Issues, nil
+}
+
+func (s *webServer) getIssue(ctx context.Context, id int) (brokerIssue, error) {
+	var resp struct {
+		Issue brokerIssue `json:"issue"`
+	}
+	if err := brokerPostContext(ctx, s.cfg.brokerURL, "/issues/view", brokerIssueRequest{Repo: repoForBroker(s.cfg), ID: id}, &resp); err != nil {
+		return brokerIssue{}, err
+	}
+	return resp.Issue, nil
+}
+
+func (s *webServer) settingsInfo(ctx context.Context) webSettingsInfo {
+	info := webSettingsInfo{
+		Repo:          repoForBroker(s.cfg),
+		Title:         s.title,
+		BrokerURL:     s.cfg.brokerURL,
+		Provider:      s.cfg.provider,
+		Region:        firstNonEmpty(s.cfg.region, globalConfigRegionForBrokerURL(s.cfg.brokerURL)),
+		DefaultBranch: defaultBranch,
+		Visibility:    "private",
+		IssuesEnabled: true,
+		Errors:        map[string]string{},
+	}
+	if strings.TrimSpace(s.cfg.brokerURL) == "" || strings.TrimSpace(s.cfg.logicalRepo) == "" {
+		return info
+	}
+	var repoInfo brokerRepoInfoResponse
+	if err := brokerPostContext(ctx, s.cfg.brokerURL, "/repo/info", brokerRepoInfoRequest{Repo: repoForBroker(s.cfg)}, &repoInfo); err != nil {
+		info.Errors["repo"] = err.Error()
+	} else {
+		if repoInfo.Repo.Logical != "" || repoInfo.Repo.Bucket != "" {
+			info.Repo = repoInfo.Repo
+		}
+		info.Description = repoInfo.Description
+		info.DefaultBranch = firstNonEmpty(repoInfo.DefaultBranch, defaultBranch)
+		info.Visibility = firstNonEmpty(repoInfo.Visibility, "private")
+		info.ReadOnly = repoInfo.ReadOnly
+		info.IssuesEnabled = repoInfo.IssuesEnabled
+	}
+	if keys, err := brokerListKeys(s.cfg.brokerURL, s.cfg); err != nil {
+		info.Errors["members"] = err.Error()
+	} else {
+		info.Keys = keys
+	}
+	var protections struct {
+		Protections []brokerProtectionRequest `json:"protections"`
+	}
+	if err := brokerPostContext(ctx, s.cfg.brokerURL, "/protection/list", brokerProtectionRequest{Repo: repoForBroker(s.cfg)}, &protections); err != nil {
+		info.Errors["protections"] = err.Error()
+	} else {
+		info.Protections = protections.Protections
+	}
+	if len(info.Errors) == 0 {
+		info.Errors = nil
+	}
+	return info
+}
+
+func globalConfigRegionForBrokerURL(brokerURL string) string {
+	want := normalizeBrokerURLForCompare(brokerURL)
+	if want == "" {
+		return ""
+	}
+	path, err := defaultGlobalConfigPath()
+	if err != nil {
+		return ""
+	}
+	global, err := readGlobalConfig(path)
+	if err != nil {
+		return ""
+	}
+	for _, profile := range global.GCPProfiles {
+		for _, region := range profile.Regions {
+			if normalizeBrokerURLForCompare(region.BrokerURL) == want {
+				return region.Name
+			}
+		}
+	}
+	for _, profile := range global.AWSProfiles {
+		for _, region := range profile.Regions {
+			if normalizeBrokerURLForCompare(region.BrokerURL) == want {
+				return region.Name
+			}
+		}
+	}
+	return ""
+}
+
+func normalizeBrokerURLForCompare(value string) string {
+	return strings.TrimRight(strings.TrimSpace(value), "/")
 }
 
 func (s *webServer) handleAPICommit(ctx context.Context, w http.ResponseWriter, r *http.Request, hash string) {
@@ -1135,6 +1336,179 @@ func (s *webServer) handleAPIActionPullRequest(ctx context.Context, w http.Respo
 	}
 	prs := s.upsertPullRequestCache(resp.PR)
 	s.renderJSON(w, map[string]any{"ok": true, "pr": resp.PR, "prs": webAPIPullRequests(prs)})
+}
+
+func (s *webServer) handleAPIActionSettings(ctx context.Context, w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if strings.TrimSpace(s.cfg.brokerURL) == "" || strings.TrimSpace(s.cfg.logicalRepo) == "" {
+		s.renderJSONError(w, http.StatusBadRequest, errors.New("settings require a broker-backed repository"))
+		return
+	}
+	var req struct {
+		Action         string `json:"action"`
+		Description    string `json:"description"`
+		DefaultBranch  string `json:"default_branch"`
+		Visibility     string `json:"visibility"`
+		ReadOnly       bool   `json:"read_only"`
+		IssuesEnabled  bool   `json:"issues_enabled"`
+		Logical        string `json:"logical"`
+		User           string `json:"user"`
+		Role           string `json:"role"`
+		PublicKey      string `json:"public_key"`
+		Key            string `json:"key"`
+		Ref            string `json:"ref"`
+		RequirePR      bool   `json:"require_pr"`
+		AllowOverrides bool   `json:"allow_overrides"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		s.renderJSONError(w, http.StatusBadRequest, err)
+		return
+	}
+	endpoint := ""
+	var payload any
+	switch strings.TrimSpace(req.Action) {
+	case "update-repo":
+		endpoint = "/repo/update"
+		payload = brokerRepoInfoRequest{
+			Repo:          repoForBroker(s.cfg),
+			Description:   req.Description,
+			DefaultBranch: req.DefaultBranch,
+			Visibility:    req.Visibility,
+			ReadOnly:      req.ReadOnly,
+			IssuesEnabled: req.IssuesEnabled,
+		}
+	case "add-member":
+		user := strings.TrimSpace(req.User)
+		if user == "" {
+			s.renderJSONError(w, http.StatusBadRequest, errors.New("user is required"))
+			return
+		}
+		role := normalizeBrokerRole(req.Role)
+		if !validBrokerRole(role) || role == "owner" {
+			s.renderJSONError(w, http.StatusBadRequest, fmt.Errorf("invalid role %q", req.Role))
+			return
+		}
+		endpoint = "/keys/invite/create"
+		payload = brokerOwnerTransferRequest{Repo: repoForBroker(s.cfg), User: user, Role: role, BrokerURL: s.cfg.brokerURL}
+	case "remove-member":
+		endpoint = "/keys/remove"
+		payload = brokerKeyRequest{Repo: repoForBroker(s.cfg), Key: strings.TrimSpace(req.Key)}
+	case "suspend-member":
+		endpoint = "/keys/suspend"
+		payload = brokerKeyRequest{Repo: repoForBroker(s.cfg), Key: strings.TrimSpace(req.Key)}
+	case "unsuspend-member":
+		endpoint = "/keys/unsuspend"
+		payload = brokerKeyRequest{Repo: repoForBroker(s.cfg), Key: strings.TrimSpace(req.Key)}
+	case "transfer-owner":
+		endpoint = "/owners/transfer/confirm"
+		payload = brokerOwnerTransferRequest{Repo: repoForBroker(s.cfg), BrokerURL: s.cfg.brokerURL}
+	case "repo-rename":
+		endpoint = "/repo/rename"
+		payload = brokerRepoInfoRequest{Repo: repoForBroker(s.cfg), Logical: logicalRepoWithGit(req.Logical)}
+	case "repo-delete":
+		endpoint = "/repo/delete"
+		payload = brokerRepoInfoRequest{Repo: repoForBroker(s.cfg)}
+	case "protect-upsert":
+		ref := normalizeDestinationRef(firstNonEmpty(strings.TrimSpace(req.Ref), defaultBranch))
+		endpoint = "/protection/upsert"
+		payload = brokerProtectionRequest{Repo: repoForBroker(s.cfg), Ref: ref, RequirePR: req.RequirePR, AllowOverrides: req.AllowOverrides}
+	case "protect-remove":
+		endpoint = "/protection/remove"
+		payload = brokerProtectionRequest{Repo: repoForBroker(s.cfg), Ref: normalizeDestinationRef(req.Ref)}
+	default:
+		s.renderJSONError(w, http.StatusBadRequest, fmt.Errorf("unsupported settings action %q", req.Action))
+		return
+	}
+	if endpoint != "/repo/update" {
+		switch p := payload.(type) {
+		case brokerKeyRequest:
+			if strings.TrimSpace(p.Key) == "" && len(p.PublicKeys) == 0 {
+				s.renderJSONError(w, http.StatusBadRequest, errors.New("member key is required"))
+				return
+			}
+		case brokerOwnerTransferRequest:
+			if endpoint == "/keys/invite/create" && strings.TrimSpace(p.User) == "" {
+				s.renderJSONError(w, http.StatusBadRequest, errors.New("member invite requires user"))
+				return
+			}
+		case brokerProtectionRequest:
+			if strings.TrimSpace(p.Ref) == "" {
+				s.renderJSONError(w, http.StatusBadRequest, errors.New("branch protection ref is required"))
+				return
+			}
+		case brokerRepoInfoRequest:
+			if endpoint == "/repo/rename" && strings.TrimSpace(p.Logical) == "" {
+				s.renderJSONError(w, http.StatusBadRequest, errors.New("logical repo name is required"))
+				return
+			}
+		}
+	}
+	var brokerResp map[string]any
+	if err := brokerPostContext(ctx, s.cfg.brokerURL, endpoint, payload, &brokerResp); err != nil {
+		s.renderJSONError(w, http.StatusBadRequest, err)
+		return
+	}
+	if endpoint == "/repo/rename" && strings.TrimSpace(req.Logical) != "" {
+		logical := logicalRepoWithGit(req.Logical)
+		_, _ = runGit(".", "config", "--local", "bucketgit.logicalRepo", logical)
+		_, _ = runGit(".", "remote", "set-url", "origin", "git@"+defaultSSHHost+":"+logical)
+		s.cfg.logicalRepo = logical
+	}
+	s.renderJSON(w, map[string]any{"ok": true, "settings": s.settingsInfo(ctx), "broker": brokerResp})
+}
+
+func (s *webServer) handleAPIActionIssue(ctx context.Context, w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if strings.TrimSpace(s.cfg.brokerURL) == "" || strings.TrimSpace(s.cfg.logicalRepo) == "" {
+		s.renderJSONError(w, http.StatusBadRequest, errors.New("issues require a broker-backed repository"))
+		return
+	}
+	var req struct {
+		Action  string `json:"action"`
+		ID      int    `json:"id"`
+		Title   string `json:"title"`
+		Body    string `json:"body"`
+		Comment string `json:"comment"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		s.renderJSONError(w, http.StatusBadRequest, err)
+		return
+	}
+	endpoint := ""
+	payload := brokerIssueRequest{Repo: repoForBroker(s.cfg), ID: req.ID, Title: strings.TrimSpace(req.Title), Body: strings.TrimSpace(req.Body), Comment: strings.TrimSpace(req.Comment)}
+	switch strings.TrimSpace(req.Action) {
+	case "create":
+		endpoint = "/issues/create"
+		if payload.Title == "" {
+			s.renderJSONError(w, http.StatusBadRequest, errors.New("issue title is required"))
+			return
+		}
+	case "comment":
+		endpoint = "/issues/comment"
+		if payload.ID <= 0 || payload.Comment == "" {
+			s.renderJSONError(w, http.StatusBadRequest, errors.New("issue comment requires an issue and comment"))
+			return
+		}
+	case "close":
+		endpoint = "/issues/close"
+	case "reopen":
+		endpoint = "/issues/reopen"
+	default:
+		s.renderJSONError(w, http.StatusBadRequest, fmt.Errorf("unsupported issue action %q", req.Action))
+		return
+	}
+	var resp map[string]any
+	if err := brokerPostContext(ctx, s.cfg.brokerURL, endpoint, payload, &resp); err != nil {
+		s.renderJSONError(w, http.StatusBadRequest, err)
+		return
+	}
+	s.renderJSON(w, map[string]any{"ok": true})
 }
 
 func (s *webServer) webRepositoryState(ctx context.Context, refreshRemote bool, selectedRef string) (webAPIState, error) {
@@ -1672,6 +2046,220 @@ func (s *webServer) handlePullRequests(ctx context.Context, w http.ResponseWrite
 	s.renderPage(w, webPageTitle(s.title, "pull requests"), body.String())
 }
 
+func (s *webServer) handleIssues(ctx context.Context, w http.ResponseWriter, r *http.Request) {
+	issues, err := s.listIssues(ctx)
+	if err != nil {
+		issues = nil
+	}
+	ref := branchRef(firstNonEmpty(s.cfg.branch, defaultBranch))
+	var body strings.Builder
+	body.WriteString(`<main class="layout" data-bgit-source="seed">`)
+	body.WriteString(s.headerHTML(ref, "issues"))
+	body.WriteString(`<div class="repo-content repo-content-single"><div class="repo-primary"><section class="panel issues-panel"><div class="panel-title">Issues</div>`)
+	body.WriteString(issueListHTML(issues))
+	body.WriteString(`<form class="issue-form" data-issue-form="create"><h3>New issue</h3><label>Title<input name="title" autocomplete="off" required></label><label>Description<textarea name="body" rows="4"></textarea></label><div class="settings-actions"><button class="button-link primary" type="submit">Create issue</button></div></form>`)
+	if err != nil {
+		body.WriteString(`<div class="settings-error">` + html.EscapeString(err.Error()) + `</div>`)
+	}
+	body.WriteString(`</section></div></div></main>`)
+	s.renderPage(w, webPageTitle(s.title, "issues"), body.String())
+}
+
+func (s *webServer) handleIssue(ctx context.Context, w http.ResponseWriter, r *http.Request, idPart string) {
+	id, err := strconv.Atoi(strings.Trim(idPart, "/"))
+	if err != nil || id <= 0 {
+		http.NotFound(w, r)
+		return
+	}
+	issue, err := s.getIssue(ctx, id)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+	ref := branchRef(firstNonEmpty(s.cfg.branch, defaultBranch))
+	var body strings.Builder
+	body.WriteString(`<main class="layout" data-bgit-source="seed">`)
+	body.WriteString(s.headerHTML(ref, "issues"))
+	body.WriteString(`<div class="repo-content repo-content-single"><div class="repo-primary"><section class="panel issue-detail" data-issue-id="` + strconv.Itoa(issue.ID) + `">`)
+	body.WriteString(`<div class="issue-heading"><span class="issue-state ` + html.EscapeString(issue.Status) + `">` + html.EscapeString(strings.ToUpper(firstNonEmpty(issue.Status, "open"))) + `</span><h1>` + html.EscapeString(issue.Title) + `</h1></div>`)
+	body.WriteString(`<div class="issue-comment"><strong>` + html.EscapeString(firstNonEmpty(issue.Author, "anonymous")) + ` opened ` + html.EscapeString(relativeTime(parseTime(issue.CreatedAt))) + `</strong><p>` + html.EscapeString(issue.Body) + `</p></div>`)
+	for _, comment := range issue.Comments {
+		body.WriteString(`<div class="issue-comment"><strong>` + html.EscapeString(firstNonEmpty(comment.User, "anonymous")) + ` commented ` + html.EscapeString(relativeTime(parseTime(comment.At))) + `</strong><p>` + html.EscapeString(comment.Body) + `</p></div>`)
+	}
+	body.WriteString(`<form class="issue-form" data-issue-form="comment"><label>Comment<textarea name="comment" rows="4" required></textarea></label><div class="settings-actions"><button class="button-link primary" type="submit">Comment</button>`)
+	if issue.Status == "closed" {
+		body.WriteString(`<button class="button-link" type="button" data-issue-action="reopen">Reopen</button>`)
+	} else {
+		body.WriteString(`<button class="button-link" type="button" data-issue-action="close">Close</button>`)
+	}
+	body.WriteString(`</div></form></section></div></div></main>`)
+	s.renderPage(w, webPageTitle(s.title, "issue"), body.String())
+}
+
+func (s *webServer) handleSettings(ctx context.Context, w http.ResponseWriter, r *http.Request) {
+	info := s.settingsInfo(ctx)
+	ref := branchRef(firstNonEmpty(s.cfg.branch, defaultBranch))
+	var body strings.Builder
+	body.WriteString(`<main class="layout" data-bgit-source="seed">`)
+	body.WriteString(s.headerHTML(ref, "settings"))
+	body.WriteString(`<div class="repo-content repo-content-single"><div class="repo-primary settings-primary" data-settings-root>`)
+	body.WriteString(`<section class="panel settings-panel"><div class="panel-title">Repository settings</div>`)
+	if strings.TrimSpace(s.cfg.brokerURL) == "" {
+		body.WriteString(`<div class="empty">Settings are available for broker-backed repositories.</div></section>`)
+		body.WriteString(`</div></div></main>`)
+		s.renderPage(w, webPageTitle(s.title, "settings"), body.String())
+		return
+	}
+	body.WriteString(s.settingsAboutHTML(info))
+	body.WriteString(s.settingsAccessHTML(info))
+	body.WriteString(s.settingsBranchesHTML(info))
+	body.WriteString(s.settingsPullRequestsHTML(info))
+	body.WriteString(s.settingsDangerHTML(info))
+	if len(info.Errors) > 0 {
+		body.WriteString(`<section class="settings-section"><h2>Unavailable sections</h2>`)
+		for name, message := range info.Errors {
+			body.WriteString(`<div class="settings-error"><strong>` + html.EscapeString(name) + `</strong> ` + html.EscapeString(message) + `</div>`)
+		}
+		body.WriteString(`</section>`)
+	}
+	body.WriteString(`</section></div></div></main>`)
+	s.renderPage(w, webPageTitle(s.title, "settings"), body.String())
+}
+
+func (s *webServer) settingsAboutHTML(info webSettingsInfo) string {
+	var b strings.Builder
+	b.WriteString(`<section class="settings-section"><h2>About</h2>`)
+	b.WriteString(`<form class="settings-form" data-settings-form="update-repo" data-capability="manage_protection">`)
+	b.WriteString(`<label>Repository description<textarea name="description" rows="3" placeholder="Describe this repository">` + html.EscapeString(info.Description) + `</textarea></label>`)
+	b.WriteString(`<div class="settings-form-grid"><label>Default branch<input name="default_branch" value="` + html.EscapeString(firstNonEmpty(info.DefaultBranch, defaultBranch)) + `" autocomplete="off"></label><label>Visibility<select name="visibility">`)
+	for _, option := range []string{"private", "public"} {
+		selected := ""
+		if firstNonEmpty(info.Visibility, "private") == option {
+			selected = ` selected`
+		}
+		b.WriteString(`<option value="` + option + `"` + selected + `>` + option + `</option>`)
+	}
+	readOnlyChecked := ""
+	if info.ReadOnly {
+		readOnlyChecked = ` checked`
+	}
+	issuesChecked := ""
+	if info.IssuesEnabled {
+		issuesChecked = ` checked`
+	}
+	b.WriteString(`</select></label><label class="settings-check"><input type="checkbox" name="issues_enabled"` + issuesChecked + `> Enable issues</label><label class="settings-check"><input type="checkbox" name="read_only"` + readOnlyChecked + `> Make repository read-only</label></div>`)
+	b.WriteString(`<div class="settings-actions"><button class="button-link primary" type="submit">Save about</button></div></form>`)
+	b.WriteString(`<div class="settings-meta-grid">`)
+	b.WriteString(settingsMetaItem("Repository", logicalRepoDisplayName(firstNonEmpty(info.Repo.Logical, info.Title))))
+	b.WriteString(settingsMetaItem("Provider", firstNonEmpty(info.Provider, info.Repo.Provider)))
+	b.WriteString(settingsMetaItem("Region", info.Region))
+	b.WriteString(settingsMetaItem("Broker", strings.TrimPrefix(strings.TrimPrefix(info.BrokerURL, "https://"), "http://")))
+	b.WriteString(`</div></section>`)
+	return b.String()
+}
+
+func (s *webServer) settingsAccessHTML(info webSettingsInfo) string {
+	var b strings.Builder
+	b.WriteString(`<section class="settings-section"><h2>Access</h2>`)
+	b.WriteString(`<div class="settings-table" data-settings-members>`)
+	if len(info.Keys) == 0 {
+		b.WriteString(`<div class="empty">No members found.</div>`)
+	} else {
+		for _, key := range info.Keys {
+			fingerprint := publicKeyFingerprint(key.PublicKey)
+			if fingerprint == "" {
+				fingerprint = key.PublicKey
+			}
+			status := "active"
+			if key.Suspended {
+				status = "suspended"
+			}
+			b.WriteString(`<div class="settings-row" data-member-key="` + html.EscapeString(fingerprint) + `">`)
+			b.WriteString(`<div><strong>` + html.EscapeString(firstNonEmpty(key.User, "unknown")) + `</strong><span>` + html.EscapeString(key.Role) + ` · ` + html.EscapeString(status) + `</span><small>` + html.EscapeString(fingerprint) + `</small>`)
+			if key.Source != "" {
+				b.WriteString(`<small>` + html.EscapeString(key.Source) + `</small>`)
+			}
+			b.WriteString(`</div><div class="settings-row-actions" data-capability="admin_keys">`)
+			if key.Role == "owner" {
+				b.WriteString(`<span class="settings-note">Owner key</span>`)
+			} else {
+				if key.Suspended {
+					b.WriteString(`<button class="button-link" type="button" data-settings-action="unsuspend-member">Unsuspend</button>`)
+				} else {
+					b.WriteString(`<button class="button-link" type="button" data-settings-action="suspend-member">Suspend</button>`)
+				}
+				b.WriteString(`<button class="button-link" type="button" data-settings-action="remove-member">Remove</button>`)
+			}
+			b.WriteString(`</div></div>`)
+		}
+	}
+	b.WriteString(`</div>`)
+	b.WriteString(`<form class="settings-form settings-member-form" data-settings-form="add-member" data-capability="admin_keys">`)
+	b.WriteString(`<h3>Invite member</h3><div class="settings-form-grid"><label>Username<input name="user" autocomplete="off" required></label><label>Role<select name="role">`)
+	for _, role := range []string{"read", "triage", "developer", "maintainer", "admin"} {
+		b.WriteString(`<option value="` + role + `">` + role + `</option>`)
+	}
+	b.WriteString(`</select></label></div>`)
+	b.WriteString(`<div class="settings-actions"><button class="button-link primary" type="submit">Create invite</button></div></form>`)
+	b.WriteString(`</section>`)
+	return b.String()
+}
+
+func (s *webServer) settingsBranchesHTML(info webSettingsInfo) string {
+	var b strings.Builder
+	b.WriteString(`<section class="settings-section"><h2>Branches</h2><div class="settings-table" data-settings-protections>`)
+	if len(info.Protections) == 0 {
+		b.WriteString(`<div class="empty">No protected branches.</div>`)
+	} else {
+		for _, protection := range info.Protections {
+			mode := "PR required"
+			if protection.AllowOverrides {
+				mode += " · owner/admin override"
+			}
+			b.WriteString(`<div class="settings-row" data-protection-ref="` + html.EscapeString(protection.Ref) + `"><div><strong>` + html.EscapeString(shortRefName(protection.Ref)) + `</strong><span>` + html.EscapeString(mode) + `</span></div><div class="settings-row-actions" data-capability="manage_protection"><button class="button-link" type="button" data-settings-action="protect-remove">Remove</button></div></div>`)
+		}
+	}
+	b.WriteString(`</div><form class="settings-form settings-protection-form" data-settings-form="protect-upsert" data-capability="manage_protection">`)
+	b.WriteString(`<h3>Protect branch</h3><div class="settings-form-grid"><label>Branch or ref<input name="ref" value="main" autocomplete="off" required></label><label class="settings-check"><input type="checkbox" name="require_pr" checked> Require pull request</label><label class="settings-check"><input type="checkbox" name="allow_overrides"> Owner/admin override</label></div>`)
+	b.WriteString(`<div class="settings-actions"><button class="button-link primary" type="submit">Protect branch</button></div></form></section>`)
+	return b.String()
+}
+
+func (s *webServer) settingsPullRequestsHTML(info webSettingsInfo) string {
+	return `<section class="settings-section"><h2>Pull requests</h2><div class="settings-info-list"><div><strong>Protected branches</strong><span>Branches can require pull requests before updates land.</span></div><div><strong>Review metadata</strong><span>Approvals, requested changes, comments, and inline review threads are stored by the broker.</span></div></div></section>`
+}
+
+func (s *webServer) settingsDangerHTML(info webSettingsInfo) string {
+	logical := firstNonEmpty(info.Repo.Logical, info.Title)
+	var b strings.Builder
+	b.WriteString(`<section class="settings-section settings-danger" data-capability="owner_transfer"><h2>Danger Zone</h2><div class="settings-warning">Owner-only repository actions live here. These actions can permanently change or delete repository state.</div>`)
+	b.WriteString(`<form class="settings-form settings-member-form" data-settings-form="transfer-owner" data-capability="owner_transfer">`)
+	b.WriteString(`<h3>Transfer ownership</h3><p class="settings-note">Creates a one-time accept command for the new owner. Their SSH signature becomes the new owner key.</p>`)
+	b.WriteString(`<div class="settings-actions"><button class="button-link" type="submit">Transfer ownership</button></div></form>`)
+	b.WriteString(`<form class="settings-form settings-member-form" data-settings-form="repo-rename" data-capability="owner_transfer">`)
+	b.WriteString(`<h3>Rename repository</h3><div class="settings-form-grid"><label>New repository name<input name="logical" value="` + html.EscapeString(logicalRepoDisplayName(logical)) + `" autocomplete="off" required></label></div>`)
+	b.WriteString(`<div class="settings-actions"><button class="button-link" type="submit">Rename repository</button></div></form>`)
+	b.WriteString(`<form class="settings-form settings-member-form" data-settings-form="repo-delete" data-capability="owner_transfer">`)
+	b.WriteString(`<h3>Delete repository</h3><p class="settings-note">Deletes broker metadata, bucket contents, and the physical bucket.</p><div class="settings-form-grid"><label>Type the repository name to confirm<input name="confirm" autocomplete="off" required></label></div>`)
+	b.WriteString(`<div class="settings-actions"><button class="button-link danger" type="submit" data-confirm-repo="` + html.EscapeString(logicalRepoDisplayName(logical)) + `">Delete repository</button></div></form></section>`)
+	return b.String()
+}
+
+func settingsMetaItem(label, value string) string {
+	if strings.TrimSpace(value) == "" {
+		value = "not configured"
+	}
+	return `<div><span>` + html.EscapeString(label) + `</span><strong>` + html.EscapeString(value) + `</strong></div>`
+}
+
+func publicKeyFingerprint(value string) string {
+	pub, _, _, _, err := ssh.ParseAuthorizedKey([]byte(strings.TrimSpace(value)))
+	if err != nil {
+		return ""
+	}
+	return ssh.FingerprintSHA256(pub)
+}
+
 func (s *webServer) handlePullRequest(ctx context.Context, w http.ResponseWriter, r *http.Request, value string) {
 	parts := strings.Split(strings.Trim(value, "/"), "/")
 	if len(parts) == 0 || strings.TrimSpace(parts[0]) == "" {
@@ -2130,12 +2718,20 @@ func (s *webServer) headerHTML(ref, repoPath string) string {
 	codeActive := ` class="active"`
 	commitsActive := ""
 	prsActive := ""
+	issuesActive := ""
+	settingsActive := ""
 	if repoPath == "commits" {
 		codeActive = ""
 		commitsActive = ` class="active"`
 	} else if repoPath == "prs" {
 		codeActive = ""
 		prsActive = ` class="active"`
+	} else if repoPath == "settings" {
+		codeActive = ""
+		settingsActive = ` class="active"`
+	} else if repoPath == "issues" {
+		codeActive = ""
+		issuesActive = ` class="active"`
 	}
 	b.WriteString(`<div class="tabs-row"><nav class="tabs"><a` + codeActive + ` href="` + html.EscapeString(webURL("tree", "", ref)) + `">Code</a><a` + commitsActive + ` href="` + html.EscapeString("/commits?ref="+urlQueryEscape(ref)) + `">Commits</a>`)
 	if s.pullRequestsAvailable() {
@@ -2148,6 +2744,8 @@ func (s *webServer) headerHTML(ref, repoPath string) string {
 		}
 		b.WriteString(`<a` + prsActive + ` href="/prs" data-pr-tab` + hidden + `>Pull requests (<span data-pr-tab-count>` + strconv.Itoa(count) + `</span>)</a>`)
 	}
+	b.WriteString(`<a` + issuesActive + ` href="/issues">Issues</a>`)
+	b.WriteString(`<a` + settingsActive + ` href="/settings" data-capability="read">Settings</a>`)
 	b.WriteString(`</nav>`)
 	codeActions := ""
 	if codeActive != "" {
@@ -2158,8 +2756,27 @@ func (s *webServer) headerHTML(ref, repoPath string) string {
 		b.WriteString(`<div class="repo-controls"><div class="repo-header-location">` + html.EscapeString(location) + `</div></div>`)
 	}
 	b.WriteString(`</div>`)
+	if banner := s.repoPolicyBannerHTML(); banner != "" {
+		b.WriteString(banner)
+	}
 	b.WriteString(`</header>`)
 	return b.String()
+}
+
+func (s *webServer) repoPolicyBannerHTML() string {
+	if strings.TrimSpace(s.cfg.brokerURL) == "" || strings.TrimSpace(s.cfg.logicalRepo) == "" {
+		return ""
+	}
+	var repoInfo brokerRepoInfoResponse
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := brokerPostContext(ctx, s.cfg.brokerURL, "/repo/info", brokerRepoInfoRequest{Repo: repoForBroker(s.cfg)}, &repoInfo); err != nil {
+		return ""
+	}
+	if repoInfo.ReadOnly {
+		return `<div class="repo-policy-banner">This repository has been set to read-only.</div>`
+	}
+	return ""
 }
 
 func (s *webServer) repoToolbarHTML(ref string, includeSearch bool) string {
@@ -2740,6 +3357,20 @@ func pullRequestListHTML(prs []brokerPullRequest) string {
 		b.WriteString(`</div></li>`)
 	}
 	b.WriteString(`</ul>`)
+	return b.String()
+}
+
+func issueListHTML(issues []brokerIssue) string {
+	if len(issues) == 0 {
+		return `<div class="empty">No issues found.</div>`
+	}
+	var b strings.Builder
+	b.WriteString(`<div class="issue-list">`)
+	for _, issue := range issues {
+		status := firstNonEmpty(issue.Status, "open")
+		b.WriteString(`<a class="issue-row" href="/issues/` + strconv.Itoa(issue.ID) + `"><span class="issue-state ` + html.EscapeString(status) + `">` + html.EscapeString(strings.ToUpper(status)) + `</span><span><strong>` + html.EscapeString(firstNonEmpty(issue.Title, "Untitled issue")) + `</strong><small>#` + strconv.Itoa(issue.ID) + ` opened by ` + html.EscapeString(firstNonEmpty(issue.Author, "anonymous")) + `</small></span></a>`)
+	}
+	b.WriteString(`</div>`)
 	return b.String()
 }
 
@@ -3790,6 +4421,16 @@ func relativeTime(ts int64) string {
 	default:
 		return relativeTimeUnit(int(diff/year), "year", suffix)
 	}
+}
+
+func parseTime(value string) int64 {
+	if value == "" {
+		return 0
+	}
+	if parsed, err := time.Parse(time.RFC3339, value); err == nil {
+		return parsed.Unix()
+	}
+	return 0
 }
 
 func relativeTimeUnit(count int, unit, suffix string) string {

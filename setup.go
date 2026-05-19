@@ -22,7 +22,7 @@ import (
 	"golang.org/x/term"
 )
 
-const setupProbeTimeout = 2 * time.Second
+const setupProbeTimeout = 10 * time.Second
 const setupDialogProfilesPerProvider = 10
 const setupRegionDialogItemsPerPage = 10
 

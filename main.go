@@ -146,6 +146,13 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 		}
 		return prCommand(cmdArgs, stdin, stdout)
 	}
+	if cmd == "issue" || cmd == "issues" {
+		if localCfg, err := readLocalConfig("."); err == nil {
+			cfg = mergeConfig(cfg, localCfg)
+			setBrokerIdentityPreference(cfg.identity)
+		}
+		return issueCommand(cmdArgs, stdin, stdout)
+	}
 	if cmd == "web" {
 		return webCommand(context.Background(), cfg, cmdArgs, stdout)
 	}
@@ -584,6 +591,10 @@ func readLocalConfig(dir string) (config, error) {
 	if logicalOut, logicalErr := runGit(dir, "config", "--get", "bucketgit.logicalRepo"); logicalErr == nil {
 		logicalRepo = strings.Trim(strings.TrimSpace(string(logicalOut)), "/")
 	}
+	localRegion := ""
+	if regionOut, regionErr := runGit(dir, "config", "--get", "bucketgit.region"); regionErr == nil {
+		localRegion = strings.TrimSpace(string(regionOut))
+	}
 	localProvider := ""
 	if providerOut, providerErr := runGit(dir, "config", "--get", "bucketgit.provider"); providerErr == nil {
 		localProvider = strings.TrimSpace(string(providerOut))
@@ -598,6 +609,7 @@ func readLocalConfig(dir string) (config, error) {
 			origin:              fmt.Sprintf("git@%s:%s", defaultSSHHost, logicalRepo),
 			brokerURL:           brokerURL,
 			logicalRepo:         logicalRepo,
+			region:              localRegion,
 			identity:            identity,
 			auth:                localAuth.auth,
 			gcloudConfiguration: localAuth.gcloudConfiguration,
@@ -610,6 +622,7 @@ func readLocalConfig(dir string) (config, error) {
 		cfg, _, err := parseRepoURI(origin)
 		if err == nil {
 			cfg.branch = branch
+			cfg.region = localRegion
 			cfg.auth = localAuth.auth
 			cfg.gcloudConfiguration = localAuth.gcloudConfiguration
 			return cfg, nil
@@ -624,6 +637,7 @@ func readLocalConfig(dir string) (config, error) {
 			cfg, _, parseErr := parseRepoURI(origin)
 			if parseErr == nil {
 				cfg.branch = branch
+				cfg.region = localRegion
 				cfg.auth = localAuth.auth
 				cfg.gcloudConfiguration = localAuth.gcloudConfiguration
 				return cfg, nil
@@ -646,6 +660,7 @@ func readLocalConfig(dir string) (config, error) {
 		origin:              originForConfig(config{provider: provider, bucket: bucket, prefix: prefix}),
 		brokerURL:           brokerURL,
 		logicalRepo:         logicalRepo,
+		region:              localRegion,
 		auth:                localAuth.auth,
 		gcloudConfiguration: localAuth.gcloudConfiguration,
 	}, nil
@@ -873,6 +888,7 @@ collaborate
    push       Update remote refs and upload objects
    ls-remote  List remote refs
    pr         Create, review, merge, and close pull requests
+   issue      Create, comment on, close, and reopen issues
 
 administer
    whoami     Show broker identity, role, and capabilities for this repo
@@ -1009,8 +1025,17 @@ Configure a direct bucketgit origin using Git remote syntax.
 `,
 		"admin": `usage:
   bgit admin keys list|add|remove|suspend|import-github [args]
-  bgit admin owner transfer --user USER KEY_OR_FINGERPRINT
+  bgit admin invite-user --broker URL --user USER [--role ROLE] REPO
+  bgit admin accept-invite CODE
+  bgit admin confirm-ownership-transfer --broker URL REPO
+  bgit admin accept-ownership-transfer CODE
+  bgit admin cancel-ownership-transfer [--broker URL REPO]
   bgit admin protect add|list|remove [ref]
+  bgit admin repo visibility public|private
+  bgit admin repo readonly on|off
+  bgit admin repo issues on|off
+  bgit admin repo rename NEW_LOGICAL_NAME
+  bgit admin repo delete --yes
 
 Broker-backed repository administration. Cloud IAM and bucket-policy
 administration moved to bgit direct admin.
@@ -1019,8 +1044,21 @@ examples:
   bgit admin keys list
   bgit admin keys add --user ada --role developer --key ~/.ssh/ada.pub
   bgit admin keys import-github octocat --role read
+  bgit admin invite-user --broker https://broker.example.com --user ada --role developer app
   bgit admin protect add main
+  bgit admin repo visibility public
   bgit direct admin grant-read user:dev@example.com
+`,
+		"issue": `usage:
+  bgit issue list
+  bgit issue create TITLE [--body BODY]
+  bgit issue view ID
+  bgit issue comment ID COMMENT
+  bgit issue close ID
+  bgit issue reopen ID
+
+Broker-backed repository issues. Public repositories allow anonymous issue
+creation; private repositories require membership.
 `,
 		"pr": `usage:
   bgit pr create [--title TITLE] [--body BODY] [--source BRANCH] [--target BRANCH]

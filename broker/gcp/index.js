@@ -179,6 +179,37 @@ function signedKey(req, entry) {
   return key;
 }
 
+function submittedSignedKey(req) {
+  const publicKey = normalizeKey(req.get('x-bgit-key'));
+  const message = String(req.get('x-bgit-signature-message') || '');
+  const signature = String(req.get('x-bgit-signature') || '');
+  if (!publicKey || !message || !signature || message !== expectedMessage(req)) return null;
+  const parsed = readSSHString(Buffer.from(signature, 'base64'), 0);
+  const alg = parsed.value.toString();
+  const sig = readSSHString(Buffer.from(signature, 'base64'), parsed.offset).value;
+  const verifyAlg = alg === 'ssh-ed25519' ? null : 'sha256';
+  if (!crypto.verify(verifyAlg, Buffer.from(message, 'base64'), publicKeyObject(publicKey), sig)) return null;
+  return {public_key: publicKey, fingerprint: keyFingerprint(publicKey)};
+}
+
+function ownershipTransferCode(brokerURL, repo, token) {
+  const payload = Buffer.from(JSON.stringify({broker_url: brokerURL, repo, token})).toString('base64url');
+  return 'bgitot_' + payload;
+}
+
+function ownershipTransferTokenHash(token) {
+  return crypto.createHash('sha256').update(String(token || '')).digest('hex');
+}
+
+function ownershipTransferExpired(transfer) {
+  return !transfer || !transfer.expires_at || Date.parse(transfer.expires_at) <= Date.now();
+}
+
+function memberInviteCode(brokerURL, repo, token) {
+  const payload = Buffer.from(JSON.stringify({broker_url: brokerURL, repo, token})).toString('base64url');
+  return 'bgitinv_' + payload;
+}
+
 function verifySignature(req, entry) {
   const adminKeys = (entry.data.keys || []).filter((k) => (k.role === 'admin' || k.role === 'owner') && !k.suspended);
   if (adminKeys.length === 0) return true;
@@ -201,6 +232,16 @@ function keyFingerprint(publicKey) {
   return 'SHA256:' + crypto.createHash('sha256').update(data).digest('base64').replace(/=+$/g, '');
 }
 
+function keyMatches(item, key) {
+  const value = String(key || '').trim();
+  if (!value) return false;
+  const normalized = normalizeKey(value);
+  return normalizeKey(item.public_key) === normalized ||
+    item.public_key === value ||
+    item.public_key.includes(value) ||
+    keyFingerprint(item.public_key) === value;
+}
+
 function memberDocID(fingerprint) {
   return Buffer.from(String(fingerprint || '')).toString('base64url');
 }
@@ -221,6 +262,18 @@ function roleCapabilities(role) {
   };
 }
 
+function anonymousKey() {
+  return {user: 'anonymous', role: 'read', public_key: '', source: 'public', anonymous: true};
+}
+
+function repoIsPublic(entry) {
+  return (entry.data.visibility || 'private') === 'public';
+}
+
+function repoIsReadOnly(entry) {
+  return !!entry.data.read_only;
+}
+
 function validRole(role) {
   return ['owner', 'admin', 'maintainer', 'developer', 'triage', 'read'].includes(role);
 }
@@ -239,6 +292,7 @@ function requireAdmin(req, entry) {
 
 function requireRead(req, entry) {
   const key = signedKey(req, entry);
+  if (!key && repoIsPublic(entry)) return anonymousKey();
   if (!key || !roleAllows(key.role, 'read')) {
     const err = new Error('read SSH signature required');
     err.status = 403;
@@ -248,6 +302,11 @@ function requireRead(req, entry) {
 }
 
 function requireWrite(req, entry) {
+  if (repoIsReadOnly(entry)) {
+    const err = new Error('repository is read-only');
+    err.status = 403;
+    throw err;
+  }
   const key = signedKey(req, entry);
   if (!key || !roleAllows(key.role, 'write')) {
     const err = new Error('write SSH signature required');
@@ -255,6 +314,12 @@ function requireWrite(req, entry) {
     throw err;
   }
   return key;
+}
+
+function requireIssueCreate(req, entry) {
+  if (repoIsReadOnly(entry)) throw Object.assign(new Error('repository is read-only'), {status: 403});
+  if (repoIsPublic(entry)) return signedKey(req, entry) || anonymousKey();
+  return requireRead(req, entry);
 }
 
 function cleanObjectPath(value) {
@@ -298,6 +363,18 @@ async function writeTextObject(repo, objectPath, value) {
 
 async function deleteObject(repo, objectPath) {
   await storage.bucket(repo.bucket).file(objectName(repo, objectPath)).delete({ignoreNotFound: true});
+}
+
+async function deletePhysicalRepo(repo) {
+  if (!repo.bucket) return;
+  const bucket = storage.bucket(repo.bucket);
+  const [files] = await bucket.getFiles();
+  await Promise.all(files.map((file) => file.delete({ignoreNotFound: true})));
+  try {
+    await bucket.delete();
+  } catch (err) {
+    if (err && err.code !== 404) throw err;
+  }
 }
 
 async function listObjects(repo, prefix) {
@@ -379,6 +456,67 @@ async function updateRefCAS(repo, ref, oldHash, newHash, key, opts = {}) {
 function nextPRID(data) {
   data.next_pr_id = Number(data.next_pr_id || 1);
   return data.next_pr_id++;
+}
+
+function nextIssueID(data) {
+  data.next_issue_id = Number(data.next_issue_id || 1);
+  return data.next_issue_id++;
+}
+
+function issueDoc(entry, id) {
+  return entry.ref.collection('issues').doc(String(id).padStart(10, '0'));
+}
+
+async function saveIssue(entry, issue) {
+  await issueDoc(entry, issue.id).set(issue, {merge: false});
+}
+
+async function loadIssue(entry, id) {
+  const snap = await issueDoc(entry, id).get();
+  if (!snap.exists) return null;
+  return snap.data() || null;
+}
+
+async function listIssues(entry) {
+  const snap = await entry.ref.collection('issues').orderBy('id', 'desc').get();
+  return snap.docs.map((doc) => doc.data() || {});
+}
+
+async function deleteRepoMetadata(entry) {
+  const prSnap = await entry.ref.collection('prs').get();
+  const issueSnap = await entry.ref.collection('issues').get();
+  const deletes = [];
+  prSnap.forEach((doc) => deletes.push(doc.ref.delete()));
+  issueSnap.forEach((doc) => deletes.push(doc.ref.delete()));
+  const repo = entry.data.repo || {};
+  const oldRepoDocID = docID(repo);
+  for (const key of entry.data.keys || []) {
+    if (!key.public_key) continue;
+    deletes.push(members.doc(memberDocID(keyFingerprint(key.public_key))).collection('repos').doc(oldRepoDocID).delete());
+  }
+  deletes.push(entry.ref.delete());
+  await Promise.all(deletes);
+}
+
+async function moveRepoSubcollections(oldEntry, newRef) {
+  const copies = [];
+  for (const collectionName of ['prs', 'issues']) {
+    const snap = await oldEntry.ref.collection(collectionName).get();
+    snap.forEach((doc) => {
+      copies.push(newRef.collection(collectionName).doc(doc.id).set(doc.data() || {}, {merge: false}));
+    });
+  }
+  await Promise.all(copies);
+}
+
+async function deleteMembershipIndex(entry) {
+  const repoDocID = docID(entry.data.repo || {});
+  const deletes = [];
+  for (const key of entry.data.keys || []) {
+    if (!key.public_key) continue;
+    deletes.push(members.doc(memberDocID(keyFingerprint(key.public_key))).collection('repos').doc(repoDocID).delete());
+  }
+  await Promise.all(deletes);
 }
 
 function findPR(data, id) {
@@ -532,6 +670,73 @@ exports.broker = async (req, res) => {
       res.status(200).send(JSON.stringify({ok: true, repo: entry.data.repo, bucket_suffix: entry.data.bucket_suffix}));
       return;
     }
+    if (req.path === '/repo/info' && req.method === 'POST') {
+      const entry = await ensureRepo(body.repo);
+      requireRead(req, entry);
+      res.status(200).send(JSON.stringify({
+        repo: entry.data.repo || body.repo,
+        description: entry.data.description || '',
+        default_branch: entry.data.default_branch || 'main',
+        visibility: entry.data.visibility || 'private',
+        read_only: !!entry.data.read_only,
+        issues_enabled: entry.data.issues_enabled !== false,
+      }));
+      return;
+    }
+    if (req.path === '/repo/update' && req.method === 'POST') {
+      const entry = await ensureRepo(body.repo);
+      requireAdmin(req, entry);
+      if (Object.prototype.hasOwnProperty.call(body, 'description')) entry.data.description = String(body.description || '').trim();
+      if (Object.prototype.hasOwnProperty.call(body, 'default_branch')) entry.data.default_branch = String(body.default_branch || '').trim() || 'main';
+      if (Object.prototype.hasOwnProperty.call(body, 'visibility')) entry.data.visibility = body.visibility === 'public' ? 'public' : 'private';
+      if (Object.prototype.hasOwnProperty.call(body, 'read_only')) entry.data.read_only = !!body.read_only;
+      if (Object.prototype.hasOwnProperty.call(body, 'issues_enabled')) entry.data.issues_enabled = body.issues_enabled !== false;
+      audit(entry, {type: 'repo_update'});
+      await saveRepo(entry);
+      res.status(200).send(JSON.stringify({
+        ok: true,
+        repo: entry.data.repo || body.repo,
+        description: entry.data.description,
+        default_branch: entry.data.default_branch,
+        visibility: entry.data.visibility,
+        read_only: !!entry.data.read_only,
+        issues_enabled: entry.data.issues_enabled !== false,
+      }));
+      return;
+    }
+    if (req.path === '/repo/rename' && req.method === 'POST') {
+      const entry = await ensureRepo(body.repo);
+      const key = signedKey(req, entry);
+      if (!key || key.role !== 'owner') throw Object.assign(new Error('owner SSH signature required'), {status: 403});
+      const logical = String(body.logical || '').trim().replace(/^\/+|\/+$/g, '');
+      if (!logical) throw new Error('logical repo name is required');
+      const newRepo = {...(entry.data.repo || body.repo), logical};
+      const newRef = repos.doc(docID(newRepo));
+      const oldID = docID(entry.data.repo || body.repo);
+      const newID = docID(newRepo);
+      if (oldID !== newID && (await newRef.get()).exists) throw Object.assign(new Error('target logical repo already exists'), {status: 409});
+      entry.data.repo = newRepo;
+      audit(entry, {type: 'repo_rename', logical, user: key.user});
+      await newRef.set(entry.data, {merge: false});
+      if (oldID !== newID) {
+        await moveRepoSubcollections({ref: entry.ref, data: {...entry.data, repo: body.repo}}, newRef);
+        await deleteMembershipIndex({data: {...entry.data, repo: body.repo}});
+        await entry.ref.delete();
+      }
+      await syncMembershipIndex({ref: newRef, data: entry.data});
+      res.status(200).send(JSON.stringify({ok: true, repo: newRepo}));
+      return;
+    }
+    if (req.path === '/repo/delete' && req.method === 'POST') {
+      const entry = await ensureRepo(body.repo);
+      const key = signedKey(req, entry);
+      if (!key || key.role !== 'owner') throw Object.assign(new Error('owner SSH signature required'), {status: 403});
+      const repo = await ensurePhysicalRepo(entry);
+      await deletePhysicalRepo(repo);
+      await deleteRepoMetadata(entry);
+      res.status(200).send(JSON.stringify({ok: true}));
+      return;
+    }
     if (req.path === '/keys/list' && req.method === 'POST') {
       const entry = await ensureRepo(body.repo);
       requireAdmin(req, entry);
@@ -551,40 +756,146 @@ exports.broker = async (req, res) => {
       res.status(200).send(JSON.stringify({ok: true}));
       return;
     }
+    if (req.path === '/keys/invite/create' && req.method === 'POST') {
+      const entry = await ensureRepo(body.repo);
+      requireAdmin(req, entry);
+      const user = String(body.user || '').trim();
+      const role = normalizeRole(body.role || 'read');
+      if (!user) throw new Error('user is required');
+      if (!validRole(role) || role === 'owner') throw new Error('invalid role');
+      const token = crypto.randomBytes(24).toString('base64url');
+      const brokerURL = String(body.broker_url || '').trim();
+      const expires = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
+      entry.data.invites = (entry.data.invites || []).filter((invite) => Date.parse(invite.expires_at || '') > Date.now());
+      entry.data.invites.push({token_hash: ownershipTransferTokenHash(token), user, role, broker_url: brokerURL, expires_at: expires});
+      const code = memberInviteCode(brokerURL, entry.data.repo || body.repo, token);
+      audit(entry, {type: 'member_invite_create', user, role});
+      await saveRepo(entry);
+      res.status(200).send(JSON.stringify({ok: true, code, accept_command: 'bgit admin accept-invite ' + code}));
+      return;
+    }
+    if (req.path === '/keys/invite/accept' && req.method === 'POST') {
+      const entry = await ensureRepo(body.repo);
+      const signed = submittedSignedKey(req);
+      if (!signed) throw Object.assign(new Error('SSH signature required'), {status: 403});
+      const tokenHash = ownershipTransferTokenHash(body.token);
+      const invites = entry.data.invites || [];
+      const invite = invites.find((item) => item.token_hash === tokenHash && Date.parse(item.expires_at || '') > Date.now());
+      if (!invite) throw Object.assign(new Error('invite is not pending or has expired'), {status: 404});
+      const existing = (entry.data.keys || []).find((item) => normalizeKey(item.public_key) === normalizeKey(signed.public_key));
+      if (existing) {
+        existing.user = invite.user;
+        existing.role = invite.role;
+        existing.suspended = false;
+      } else {
+        entry.data.keys = entry.data.keys || [];
+        entry.data.keys.push({user: invite.user, role: invite.role, public_key: signed.public_key, source: 'invite', suspended: false});
+      }
+      entry.data.invites = invites.filter((item) => item.token_hash !== tokenHash);
+      audit(entry, {type: 'member_invite_accept', user: invite.user, role: invite.role, fingerprint: signed.fingerprint});
+      await saveRepo(entry);
+      res.status(200).send(JSON.stringify({ok: true, user: invite.user, role: invite.role, fingerprint: signed.fingerprint}));
+      return;
+    }
     if ((req.path === '/keys/remove' || req.path === '/keys/suspend') && req.method === 'POST') {
       const entry = await ensureRepo(body.repo);
       requireAdmin(req, entry);
       const key = String(body.key || '').trim();
-      const normalized = normalizeKey(key);
-      const match = (k) => normalizeKey(k.public_key) === normalized || k.public_key.includes(key);
+      const match = (k) => keyMatches(k, key);
       if (entry.data.keys.some((k) => match(k) && k.role === 'owner')) throw Object.assign(new Error('owners cannot be removed or suspended'), {status: 403});
-      if (req.path === '/keys/remove') entry.data.keys = entry.data.keys.filter((k) => !match(k));
-      else for (const item of entry.data.keys) if (match(item)) item.suspended = true;
+      let changed = false;
+      if (req.path === '/keys/remove') {
+        const before = entry.data.keys.length;
+        entry.data.keys = entry.data.keys.filter((k) => !match(k));
+        changed = entry.data.keys.length !== before;
+      } else {
+        for (const item of entry.data.keys) {
+          if (match(item)) {
+            item.suspended = true;
+            changed = true;
+          }
+        }
+      }
+      if (!changed) throw Object.assign(new Error('key not found'), {status: 404});
       await saveRepo(entry);
       res.status(200).send(JSON.stringify({ok: true}));
       return;
     }
-    if (req.path === '/owners/transfer' && req.method === 'POST') {
+    if (req.path === '/keys/unsuspend' && req.method === 'POST') {
+      const entry = await ensureRepo(body.repo);
+      requireAdmin(req, entry);
+      const key = String(body.key || '').trim();
+      const match = (k) => keyMatches(k, key);
+      let changed = false;
+      for (const item of entry.data.keys || []) {
+        if (match(item)) {
+          item.suspended = false;
+          changed = true;
+        }
+      }
+      if (!changed) throw Object.assign(new Error('key not found'), {status: 404});
+      await saveRepo(entry);
+      res.status(200).send(JSON.stringify({ok: true}));
+      return;
+    }
+    if (req.path === '/owners/transfer/confirm' && req.method === 'POST') {
       const entry = await ensureRepo(body.repo);
       const key = signedKey(req, entry);
       if (!key || key.role !== 'owner') throw Object.assign(new Error('owner SSH signature required'), {status: 403});
-      const target = String(body.key || '').trim();
-      const normalized = normalizeKey(target);
-      const match = (k) => normalizeKey(k.public_key) === normalized || k.public_key.includes(target);
-      let changed = false;
-      for (const item of entry.data.keys) {
-        if (match(item)) {
-          item.role = 'owner';
-          item.user = body.user || item.user;
-          changed = true;
-        } else if (item.role === 'owner' && normalizeKey(item.public_key) === normalizeKey(key.public_key)) {
-          item.role = 'admin';
-        }
+      if (entry.data.owner_transfer && !ownershipTransferExpired(entry.data.owner_transfer)) {
+        throw Object.assign(new Error('ownership transfer already pending; run bgit admin cancel-ownership-transfer to cancel it'), {status: 409});
       }
-      if (!changed) throw new Error('target key not found');
-      audit(entry, {type: 'owner_transfer', user: body.user || ''});
+      const token = crypto.randomBytes(24).toString('base64url');
+      const brokerURL = String(body.broker_url || '').trim();
+      const expires = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
+      entry.data.owner_transfer = {
+        token_hash: ownershipTransferTokenHash(token),
+        requested_by: key.user || '',
+        requested_by_fingerprint: keyFingerprint(key.public_key),
+        broker_url: brokerURL,
+        expires_at: expires,
+      };
+      const code = ownershipTransferCode(brokerURL, entry.data.repo || body.repo, token);
+      audit(entry, {type: 'owner_transfer_confirm', user: key.user || '', expires_at: expires});
+      await saveRepo(entry);
+      res.status(200).send(JSON.stringify({ok: true, code, accept_command: 'bgit admin accept-ownership-transfer ' + code, cancel_command: 'bgit admin cancel-ownership-transfer --broker ' + brokerURL + ' ' + ((entry.data.repo || body.repo).logical || '')}));
+      return;
+    }
+    if (req.path === '/owners/transfer/cancel' && req.method === 'POST') {
+      const entry = await ensureRepo(body.repo);
+      const key = signedKey(req, entry);
+      if (!key || key.role !== 'owner') throw Object.assign(new Error('owner SSH signature required'), {status: 403});
+      delete entry.data.owner_transfer;
+      audit(entry, {type: 'owner_transfer_cancel', user: key.user || ''});
       await saveRepo(entry);
       res.status(200).send(JSON.stringify({ok: true}));
+      return;
+    }
+    if (req.path === '/owners/transfer/accept' && req.method === 'POST') {
+      const entry = await ensureRepo(body.repo);
+      const transfer = entry.data.owner_transfer;
+      if (!transfer || ownershipTransferExpired(transfer)) throw Object.assign(new Error('ownership transfer is not pending or has expired'), {status: 404});
+      if (ownershipTransferTokenHash(body.token) !== transfer.token_hash) throw Object.assign(new Error('ownership transfer code is invalid'), {status: 403});
+      const accepted = submittedSignedKey(req);
+      if (!accepted) throw Object.assign(new Error('SSH signature required'), {status: 403});
+      const user = String(body.user || 'owner').trim() || 'owner';
+      const ownerFingerprint = transfer.requested_by_fingerprint || '';
+      for (const item of entry.data.keys || []) {
+        if (item.role === 'owner' && keyFingerprint(item.public_key) === ownerFingerprint) item.role = 'admin';
+      }
+      const existing = (entry.data.keys || []).find((item) => normalizeKey(item.public_key) === normalizeKey(accepted.public_key));
+      if (existing) {
+        existing.role = 'owner';
+        existing.user = user;
+        existing.suspended = false;
+      } else {
+        entry.data.keys = entry.data.keys || [];
+        entry.data.keys.push({user, role: 'owner', public_key: accepted.public_key, source: 'ownership-transfer', suspended: false});
+      }
+      delete entry.data.owner_transfer;
+      audit(entry, {type: 'owner_transfer_accept', user, fingerprint: accepted.fingerprint});
+      await saveRepo(entry);
+      res.status(200).send(JSON.stringify({ok: true, user, fingerprint: accepted.fingerprint}));
       return;
     }
     if (req.path === '/protection/list' && req.method === 'POST') {
@@ -610,6 +921,62 @@ exports.broker = async (req, res) => {
       audit(entry, {type: 'protection_remove', ref: body.ref});
       await saveRepo(entry);
       res.status(200).send(JSON.stringify({ok: true}));
+      return;
+    }
+    if (req.path === '/issues/list' && req.method === 'POST') {
+      const entry = await ensureRepo(body.repo);
+      requireRead(req, entry);
+      if (entry.data.issues_enabled === false) throw Object.assign(new Error('issues are disabled'), {status: 403});
+      const issues = await listIssues(entry);
+      res.status(200).send(JSON.stringify({issues}));
+      return;
+    }
+    if (req.path === '/issues/view' && req.method === 'POST') {
+      const entry = await ensureRepo(body.repo);
+      requireRead(req, entry);
+      if (entry.data.issues_enabled === false) throw Object.assign(new Error('issues are disabled'), {status: 403});
+      const issue = await loadIssue(entry, body.id);
+      if (!issue) throw Object.assign(new Error('issue not found'), {status: 404});
+      res.status(200).send(JSON.stringify({issue}));
+      return;
+    }
+    if (req.path === '/issues/create' && req.method === 'POST') {
+      const entry = await ensureRepo(body.repo);
+      if (entry.data.issues_enabled === false) throw Object.assign(new Error('issues are disabled'), {status: 403});
+      const key = requireIssueCreate(req, entry);
+      const title = String(body.title || '').trim();
+      const issueBody = String(body.body || '').trim();
+      if (!title) throw new Error('issue title is required');
+      const issue = {id: nextIssueID(entry.data), title, body: issueBody, status: 'open', author: key.user || 'anonymous', comments: [], created_at: new Date().toISOString(), updated_at: new Date().toISOString()};
+      await saveRepo(entry);
+      await saveIssue(entry, issue);
+      res.status(200).send(JSON.stringify({ok: true, issue}));
+      return;
+    }
+    if (req.path === '/issues/comment' && req.method === 'POST') {
+      const entry = await ensureRepo(body.repo);
+      if (entry.data.issues_enabled === false) throw Object.assign(new Error('issues are disabled'), {status: 403});
+      const key = requireIssueCreate(req, entry);
+      const issue = await loadIssue(entry, body.id);
+      if (!issue) throw Object.assign(new Error('issue not found'), {status: 404});
+      const comment = String(body.comment || '').trim();
+      if (!comment) throw new Error('comment is required');
+      issue.comments = issue.comments || [];
+      issue.comments.push({user: key.user || 'anonymous', body: comment, at: new Date().toISOString()});
+      issue.updated_at = new Date().toISOString();
+      await saveIssue(entry, issue);
+      res.status(200).send(JSON.stringify({ok: true, issue}));
+      return;
+    }
+    if (req.path === '/issues/close' || req.path === '/issues/reopen') {
+      const entry = await ensureRepo(body.repo);
+      requireWrite(req, entry);
+      const issue = await loadIssue(entry, body.id);
+      if (!issue) throw Object.assign(new Error('issue not found'), {status: 404});
+      issue.status = req.path === '/issues/reopen' ? 'open' : 'closed';
+      issue.updated_at = new Date().toISOString();
+      await saveIssue(entry, issue);
+      res.status(200).send(JSON.stringify({ok: true, issue}));
       return;
     }
     if (req.path === '/prs/create' && req.method === 'POST') {
@@ -682,6 +1049,7 @@ exports.broker = async (req, res) => {
     }
     if (req.path === '/prs/comment' && req.method === 'POST') {
       const entry = await ensureRepo(body.repo);
+      if (repoIsReadOnly(entry)) throw Object.assign(new Error('repository is read-only'), {status: 403});
       const key = requireRead(req, entry);
       const pr = await loadPR(entry, body.id);
       if (!pr) throw Object.assign(new Error('pull request not found'), {status: 404});
@@ -698,6 +1066,7 @@ exports.broker = async (req, res) => {
     }
     if (req.path === '/prs/reply' && req.method === 'POST') {
       const entry = await ensureRepo(body.repo);
+      if (repoIsReadOnly(entry)) throw Object.assign(new Error('repository is read-only'), {status: 403});
       const key = requireRead(req, entry);
       const pr = await loadPR(entry, body.id);
       if (!pr) throw Object.assign(new Error('pull request not found'), {status: 404});
@@ -734,6 +1103,7 @@ exports.broker = async (req, res) => {
     }
     if (req.path === '/prs/merge' && req.method === 'POST') {
       const entry = await ensureRepo(body.repo);
+      if (repoIsReadOnly(entry)) throw Object.assign(new Error('repository is read-only'), {status: 403});
       const key = signedKey(req, entry);
       if (!key || !roleAllows(key.role, 'merge')) throw Object.assign(new Error('merge SSH signature required'), {status: 403});
       const pr = await loadPR(entry, body.id);
@@ -765,18 +1135,18 @@ exports.broker = async (req, res) => {
       const entry = await ensureRepo(body.repo);
       const key = signedKey(req, entry);
       const operation = body.operation || '';
-      const allowed = !!key && roleAllows(key.role, operation);
-      res.status(200).send(JSON.stringify({allowed, user: key && key.user, role: key && key.role}));
+      const allowed = (operation === 'read' && repoIsPublic(entry)) || (!!key && roleAllows(key.role, operation));
+      res.status(200).send(JSON.stringify({allowed, user: key && key.user || (allowed ? 'anonymous' : ''), role: key && key.role || (allowed ? 'read' : '')}));
       return;
     }
     if (req.path === '/auth/status' && req.method === 'POST') {
       const entry = await ensureRepo(body.repo);
-      const key = signedKey(req, entry);
+      const key = signedKey(req, entry) || (repoIsPublic(entry) ? anonymousKey() : null);
       if (!key) throw Object.assign(new Error('SSH signature required'), {status: 403});
       res.status(200).send(JSON.stringify({
         broker_version: brokerVersion,
         repo: entry.data.repo || body.repo,
-        identity: {user: key.user || '', source: key.source || '', key_fingerprint: keyFingerprint(key.public_key), public_key: key.public_key || ''},
+        identity: {user: key.user || '', source: key.source || '', key_fingerprint: key.public_key ? keyFingerprint(key.public_key) : '', public_key: key.public_key || ''},
         user: key.user || '',
         role: key.role || '',
         capabilities: roleCapabilities(key.role || ''),

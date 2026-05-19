@@ -3,6 +3,8 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -11,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 )
 
@@ -28,23 +31,106 @@ func brokerAdminCommand(cfg config, args []string, stdout io.Writer) error {
 
 func brokerAdminCommandWithInput(cfg config, args []string, stdin io.Reader, stdout io.Writer) error {
 	if len(args) == 0 {
-		return errors.New("usage: bgit admin keys|owner|protect|members [args]\n\nCloud IAM administration moved to bgit direct admin.")
+		return errors.New("usage: bgit admin keys|owner|protect|members|confirm-ownership-transfer|accept-ownership-transfer|cancel-ownership-transfer [args]\n\nCloud IAM administration moved to bgit direct admin.")
 	}
 	switch args[0] {
 	case "keys":
 		return brokerAdminKeysCommand(cfg, args[1:], stdin, stdout)
 	case "repo":
-		return errors.New("repo registration happens during bgit init; use bgit admin keys for user/key administration")
+		return brokerAdminRepoCommand(cfg, args[1:], stdout)
 	case "owner":
 		return brokerOwnerCommand(cfg, args[1:], stdout)
 	case "protect":
 		return brokerProtectionCommand(cfg, args[1:], stdout)
 	case "members":
 		return brokerMembersCommand(cfg, args[1:], stdout)
+	case "confirm-ownership-transfer", "accept-ownership-transfer", "cancel-ownership-transfer":
+		return brokerOwnerCommand(cfg, args, stdout)
+	case "invite-user":
+		return brokerInviteUserCommand(cfg, args[1:], stdout)
+	case "accept-invite":
+		return brokerAcceptInviteCommand(args[1:], stdout)
 	case "grant-read", "grant-write", "grant-admin", "make-public", "make-private":
 		return errors.New("cloud IAM administration moved to bgit direct admin")
 	default:
 		return fmt.Errorf("unknown admin command %q", args[0])
+	}
+}
+
+type brokerRepoAdminRequest struct {
+	Repo          brokerRepo `json:"repo"`
+	Description   string     `json:"description,omitempty"`
+	DefaultBranch string     `json:"default_branch,omitempty"`
+	Visibility    string     `json:"visibility,omitempty"`
+	ReadOnly      *bool      `json:"read_only,omitempty"`
+	IssuesEnabled *bool      `json:"issues_enabled,omitempty"`
+	Logical       string     `json:"logical,omitempty"`
+}
+
+func brokerAdminRepoCommand(cfg config, args []string, stdout io.Writer) error {
+	if len(args) == 0 {
+		return errors.New("usage: bgit admin repo visibility|readonly|issues|rename|delete [args]")
+	}
+	cfg, err := configForBrokerCommand(cfg)
+	if err != nil {
+		return err
+	}
+	switch args[0] {
+	case "visibility":
+		if len(args) != 2 || (args[1] != "public" && args[1] != "private") {
+			return errors.New("usage: bgit admin repo visibility public|private")
+		}
+		req := brokerRepoAdminRequest{Repo: repoForBroker(cfg), Visibility: args[1]}
+		if err := brokerPost(cfg.brokerURL, "/repo/update", req, nil); err != nil {
+			return err
+		}
+		fmt.Fprintf(stdout, "set repository visibility to %s\n", args[1])
+		return nil
+	case "readonly":
+		if len(args) != 2 || (args[1] != "on" && args[1] != "off") {
+			return errors.New("usage: bgit admin repo readonly on|off")
+		}
+		readOnly := args[1] == "on"
+		req := brokerRepoAdminRequest{Repo: repoForBroker(cfg), ReadOnly: &readOnly}
+		if err := brokerPost(cfg.brokerURL, "/repo/update", req, nil); err != nil {
+			return err
+		}
+		fmt.Fprintf(stdout, "set repository read-only to %t\n", readOnly)
+		return nil
+	case "issues":
+		if len(args) != 2 || (args[1] != "on" && args[1] != "off") {
+			return errors.New("usage: bgit admin repo issues on|off")
+		}
+		issuesEnabled := args[1] == "on"
+		req := brokerRepoAdminRequest{Repo: repoForBroker(cfg), IssuesEnabled: &issuesEnabled}
+		if err := brokerPost(cfg.brokerURL, "/repo/update", req, nil); err != nil {
+			return err
+		}
+		fmt.Fprintf(stdout, "set repository issues to %t\n", issuesEnabled)
+		return nil
+	case "rename":
+		if len(args) != 2 {
+			return errors.New("usage: bgit admin repo rename NEW_LOGICAL_NAME")
+		}
+		logical := logicalRepoWithGit(args[1])
+		if err := brokerPost(cfg.brokerURL, "/repo/rename", brokerRepoAdminRequest{Repo: repoForBroker(cfg), Logical: logical}, nil); err != nil {
+			return err
+		}
+		_, _ = runGit(".", "config", "--local", "bucketgit.logicalRepo", logical)
+		_, _ = runGit(".", "remote", "set-url", "origin", "git@"+defaultSSHHost+":"+logical)
+		fmt.Fprintf(stdout, "renamed repository to %s\n", logicalRepoDisplayName(logical))
+		return nil
+	case "delete":
+		if len(args) != 2 || args[1] != "--yes" {
+			return errors.New("usage: bgit admin repo delete --yes")
+		}
+		if err := brokerPost(cfg.brokerURL, "/repo/delete", brokerRepoAdminRequest{Repo: repoForBroker(cfg)}, nil); err != nil {
+			return err
+		}
+		fmt.Fprintln(stdout, "deleted repository")
+		return nil
+	default:
+		return fmt.Errorf("unknown repo admin command %q", args[0])
 	}
 }
 
@@ -377,49 +463,237 @@ func configForBrokerCommand(base config) (config, error) {
 }
 
 type brokerOwnerTransferRequest struct {
-	Repo brokerRepo `json:"repo"`
-	User string     `json:"user"`
-	Key  string     `json:"key"`
+	Repo      brokerRepo `json:"repo"`
+	User      string     `json:"user,omitempty"`
+	Role      string     `json:"role,omitempty"`
+	BrokerURL string     `json:"broker_url,omitempty"`
+	Token     string     `json:"token,omitempty"`
+}
+
+type brokerOwnerTransferResponse struct {
+	Code          string `json:"code"`
+	AcceptCommand string `json:"accept_command"`
+	CancelCommand string `json:"cancel_command"`
+	User          string `json:"user,omitempty"`
+	Role          string `json:"role,omitempty"`
+	Fingerprint   string `json:"fingerprint,omitempty"`
+}
+
+type ownerTransferCodePayload struct {
+	BrokerURL string     `json:"broker_url"`
+	Repo      brokerRepo `json:"repo"`
+	Token     string     `json:"token"`
 }
 
 func brokerOwnerCommand(cfg config, args []string, stdout io.Writer) error {
-	if len(args) == 0 || args[0] != "transfer" {
-		return errors.New("usage: bgit admin owner transfer --user USER KEY_OR_FINGERPRINT")
+	if len(args) == 0 {
+		return errors.New("usage: bgit admin confirm-ownership-transfer --broker URL REPO\n       bgit admin accept-ownership-transfer CODE\n       bgit admin cancel-ownership-transfer [--broker URL REPO]")
 	}
-	cfg, err := configForBrokerCommand(cfg)
+	switch args[0] {
+	case "transfer":
+		return errors.New("bgit admin owner transfer was replaced by bgit admin confirm-ownership-transfer")
+	case "confirm-ownership-transfer":
+		return brokerConfirmOwnershipTransferCommand(cfg, args[1:], stdout)
+	case "accept-ownership-transfer":
+		return brokerAcceptOwnershipTransferCommand(args[1:], stdout)
+	case "cancel-ownership-transfer":
+		return brokerCancelOwnershipTransferCommand(cfg, args[1:], stdout)
+	default:
+		return fmt.Errorf("unknown owner command %q", args[0])
+	}
+}
+
+func brokerConfirmOwnershipTransferCommand(cfg config, args []string, stdout io.Writer) error {
+	brokerURL, repoName, err := parseOwnershipTransferTarget(cfg, args, true)
 	if err != nil {
 		return err
 	}
-	user := ""
-	key := ""
-	for i := 1; i < len(args); i++ {
+	repo := brokerRepo{Provider: "gcs", Logical: logicalRepoWithGit(repoName), Origin: "git@" + defaultSSHHost + ":" + logicalRepoWithGit(repoName)}
+	var resp brokerOwnerTransferResponse
+	if err := brokerPost(brokerURL, "/owners/transfer/confirm", brokerOwnerTransferRequest{Repo: repo, BrokerURL: brokerURL}, &resp); err != nil {
+		return err
+	}
+	fmt.Fprintf(stdout, "ownership transfer pending for %s\n\nGive this command to the new owner:\n  %s\n\nCancel with:\n  %s\n", repo.Logical, resp.AcceptCommand, resp.CancelCommand)
+	return nil
+}
+
+func brokerAcceptOwnershipTransferCommand(args []string, stdout io.Writer) error {
+	if len(args) != 1 {
+		return errors.New("usage: bgit admin accept-ownership-transfer CODE")
+	}
+	payload, err := parseOwnershipTransferCode(args[0])
+	if err != nil {
+		return err
+	}
+	var resp brokerOwnerTransferResponse
+	if err := brokerPost(payload.BrokerURL, "/owners/transfer/accept", brokerOwnerTransferRequest{Repo: payload.Repo, Token: payload.Token, User: "owner"}, &resp); err != nil {
+		return err
+	}
+	fmt.Fprintf(stdout, "accepted ownership for %s with key %s\n", payload.Repo.Logical, resp.Fingerprint)
+	return nil
+}
+
+func brokerCancelOwnershipTransferCommand(cfg config, args []string, stdout io.Writer) error {
+	brokerURL, repoName, err := parseOwnershipTransferTarget(cfg, args, false)
+	if err != nil {
+		return err
+	}
+	repo := brokerRepo{Provider: "gcs", Logical: logicalRepoWithGit(repoName), Origin: "git@" + defaultSSHHost + ":" + logicalRepoWithGit(repoName)}
+	if err := brokerPost(brokerURL, "/owners/transfer/cancel", brokerOwnerTransferRequest{Repo: repo}, nil); err != nil {
+		return err
+	}
+	fmt.Fprintf(stdout, "cancelled pending ownership transfer for %s\n", repo.Logical)
+	return nil
+}
+
+func parseOwnershipTransferTarget(cfg config, args []string, requireBroker bool) (string, string, error) {
+	brokerURL := ""
+	repoName := ""
+	var err error
+	for i := 0; i < len(args); i++ {
 		arg := args[i]
 		name, value, hasValue := strings.Cut(arg, "=")
 		switch name {
+		case "--broker":
+			value, i, err = optionValue(args, i, hasValue, value, name)
+			if err != nil {
+				return "", "", err
+			}
+			brokerURL = strings.TrimSpace(value)
+		default:
+			if strings.HasPrefix(arg, "-") {
+				return "", "", fmt.Errorf("unsupported ownership transfer option %s", arg)
+			}
+			if repoName != "" {
+				return "", "", errors.New("ownership transfer accepts exactly one repository")
+			}
+			repoName = strings.TrimSpace(arg)
+		}
+	}
+	if brokerURL == "" && !requireBroker {
+		if local, err := configForBrokerCommand(cfg); err == nil {
+			brokerURL = local.brokerURL
+			if repoName == "" {
+				repoName = local.logicalRepo
+			}
+		}
+	}
+	if brokerURL == "" {
+		return "", "", errors.New("ownership transfer requires --broker URL")
+	}
+	if repoName == "" {
+		return "", "", errors.New("ownership transfer requires a repository name")
+	}
+	return brokerURL, repoName, nil
+}
+
+func parseOwnershipTransferCode(code string) (ownerTransferCodePayload, error) {
+	code = strings.TrimSpace(code)
+	if !strings.HasPrefix(code, "bgitot_") {
+		return ownerTransferCodePayload{}, errors.New("invalid ownership transfer code")
+	}
+	raw := strings.TrimPrefix(code, "bgitot_")
+	data, err := base64.RawURLEncoding.DecodeString(raw)
+	if err != nil {
+		return ownerTransferCodePayload{}, errors.New("invalid ownership transfer code")
+	}
+	var payload ownerTransferCodePayload
+	if err := json.Unmarshal(data, &payload); err != nil {
+		return ownerTransferCodePayload{}, errors.New("invalid ownership transfer code")
+	}
+	if strings.TrimSpace(payload.BrokerURL) == "" || strings.TrimSpace(payload.Token) == "" || strings.TrimSpace(payload.Repo.Logical) == "" {
+		return ownerTransferCodePayload{}, errors.New("invalid ownership transfer code")
+	}
+	return payload, nil
+}
+
+func brokerInviteUserCommand(cfg config, args []string, stdout io.Writer) error {
+	brokerURL := ""
+	repoName := ""
+	user := ""
+	role := "read"
+	var err error
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		name, value, hasValue := strings.Cut(arg, "=")
+		switch name {
+		case "--broker":
+			value, i, err = optionValue(args, i, hasValue, value, name)
+			if err != nil {
+				return err
+			}
+			brokerURL = strings.TrimSpace(value)
 		case "--user":
 			value, i, err = optionValue(args, i, hasValue, value, name)
 			if err != nil {
 				return err
 			}
-			user = value
+			user = strings.TrimSpace(value)
+		case "--role":
+			value, i, err = optionValue(args, i, hasValue, value, name)
+			if err != nil {
+				return err
+			}
+			role = normalizeBrokerRole(value)
 		default:
 			if strings.HasPrefix(arg, "-") {
-				return fmt.Errorf("unsupported owner transfer option %s", arg)
+				return fmt.Errorf("unsupported invite-user option %s", arg)
 			}
-			if key != "" {
-				return errors.New("owner transfer accepts exactly one key")
+			if repoName != "" {
+				return errors.New("invite-user accepts exactly one repository")
 			}
-			key = arg
+			repoName = strings.TrimSpace(arg)
 		}
 	}
-	if user == "" || key == "" {
-		return errors.New("usage: bgit admin owner transfer --user USER KEY_OR_FINGERPRINT")
+	if brokerURL == "" || repoName == "" || user == "" {
+		return errors.New("usage: bgit admin invite-user --broker URL --user USER [--role ROLE] REPO")
 	}
-	if err := brokerPost(cfg.brokerURL, "/owners/transfer", brokerOwnerTransferRequest{Repo: repoForBroker(cfg), User: user, Key: key}, nil); err != nil {
+	if !validBrokerRole(role) || role == "owner" {
+		return fmt.Errorf("invalid role %q", role)
+	}
+	repo := brokerRepo{Provider: "gcs", Logical: logicalRepoWithGit(repoName), Origin: "git@" + defaultSSHHost + ":" + logicalRepoWithGit(repoName)}
+	var resp brokerOwnerTransferResponse
+	if err := brokerPost(brokerURL, "/keys/invite/create", brokerOwnerTransferRequest{Repo: repo, BrokerURL: brokerURL, User: user, Role: role}, &resp); err != nil {
 		return err
 	}
-	fmt.Fprintf(stdout, "transferred owner role to %s\n", user)
+	fmt.Fprintf(stdout, "invite pending for %s as %s on %s\n\nGive this command to the user:\n  %s\n", user, role, repo.Logical, resp.AcceptCommand)
 	return nil
+}
+
+func brokerAcceptInviteCommand(args []string, stdout io.Writer) error {
+	if len(args) != 1 {
+		return errors.New("usage: bgit admin accept-invite CODE")
+	}
+	payload, err := parseInviteCode(args[0])
+	if err != nil {
+		return err
+	}
+	var resp brokerOwnerTransferResponse
+	if err := brokerPost(payload.BrokerURL, "/keys/invite/accept", brokerOwnerTransferRequest{Repo: payload.Repo, Token: payload.Token}, &resp); err != nil {
+		return err
+	}
+	fmt.Fprintf(stdout, "accepted invite for %s as %s with key %s\n", resp.User, resp.Role, resp.Fingerprint)
+	return nil
+}
+
+func parseInviteCode(code string) (ownerTransferCodePayload, error) {
+	code = strings.TrimSpace(code)
+	if !strings.HasPrefix(code, "bgitinv_") {
+		return ownerTransferCodePayload{}, errors.New("invalid invite code")
+	}
+	raw := strings.TrimPrefix(code, "bgitinv_")
+	data, err := base64.RawURLEncoding.DecodeString(raw)
+	if err != nil {
+		return ownerTransferCodePayload{}, errors.New("invalid invite code")
+	}
+	var payload ownerTransferCodePayload
+	if err := json.Unmarshal(data, &payload); err != nil {
+		return ownerTransferCodePayload{}, errors.New("invalid invite code")
+	}
+	if strings.TrimSpace(payload.BrokerURL) == "" || strings.TrimSpace(payload.Token) == "" || strings.TrimSpace(payload.Repo.Logical) == "" {
+		return ownerTransferCodePayload{}, errors.New("invalid invite code")
+	}
+	return payload, nil
 }
 
 type brokerProtectionRequest struct {
@@ -554,6 +828,121 @@ type brokerPullRequestRequest struct {
 	Comments        []brokerPullRequestComment `json:"comments,omitempty"`
 	TargetNoteID    int                        `json:"target_note_id,omitempty"`
 	TargetCommentID int                        `json:"target_comment_id,omitempty"`
+}
+
+func issueCommand(args []string, stdin io.Reader, stdout io.Writer) error {
+	_ = stdin
+	if len(args) == 0 {
+		return errors.New("usage: bgit issue list|create|view|comment|close|reopen [args]")
+	}
+	cfg, err := configForBrokerCommand(config{})
+	if err != nil {
+		return err
+	}
+	switch args[0] {
+	case "list":
+		var resp struct {
+			Issues []brokerIssue `json:"issues"`
+		}
+		if err := brokerPost(cfg.brokerURL, "/issues/list", brokerIssueRequest{Repo: repoForBroker(cfg)}, &resp); err != nil {
+			return err
+		}
+		for _, issue := range resp.Issues {
+			fmt.Fprintf(stdout, "#%d\t%s\t%s\n", issue.ID, firstNonEmpty(issue.Status, "open"), issue.Title)
+		}
+		return nil
+	case "create":
+		title := ""
+		body := ""
+		for i := 1; i < len(args); i++ {
+			arg := args[i]
+			name, value, hasValue := strings.Cut(arg, "=")
+			switch name {
+			case "--body":
+				value, i, err = optionValue(args, i, hasValue, value, name)
+				if err != nil {
+					return err
+				}
+				body = value
+			default:
+				if strings.HasPrefix(arg, "-") {
+					return fmt.Errorf("unsupported issue create option %s", arg)
+				}
+				if title != "" {
+					title += " "
+				}
+				title += arg
+			}
+		}
+		if strings.TrimSpace(title) == "" {
+			return errors.New("usage: bgit issue create TITLE [--body BODY]")
+		}
+		var resp struct {
+			Issue brokerIssue `json:"issue"`
+		}
+		if err := brokerPost(cfg.brokerURL, "/issues/create", brokerIssueRequest{Repo: repoForBroker(cfg), Title: title, Body: body}, &resp); err != nil {
+			return err
+		}
+		fmt.Fprintf(stdout, "created issue #%d\n", resp.Issue.ID)
+		return nil
+	case "view":
+		id, err := parseIssueIDArg(args)
+		if err != nil {
+			return err
+		}
+		var resp struct {
+			Issue brokerIssue `json:"issue"`
+		}
+		if err := brokerPost(cfg.brokerURL, "/issues/view", brokerIssueRequest{Repo: repoForBroker(cfg), ID: id}, &resp); err != nil {
+			return err
+		}
+		fmt.Fprintf(stdout, "#%d %s\n%s\n\n%s\n", resp.Issue.ID, resp.Issue.Title, firstNonEmpty(resp.Issue.Status, "open"), resp.Issue.Body)
+		for _, comment := range resp.Issue.Comments {
+			fmt.Fprintf(stdout, "\n%s commented:\n%s\n", firstNonEmpty(comment.User, "anonymous"), comment.Body)
+		}
+		return nil
+	case "comment":
+		if len(args) < 3 {
+			return errors.New("usage: bgit issue comment ID COMMENT")
+		}
+		id, err := strconv.Atoi(strings.TrimPrefix(args[1], "#"))
+		if err != nil || id <= 0 {
+			return errors.New("issue id is required")
+		}
+		comment := strings.Join(args[2:], " ")
+		if err := brokerPost(cfg.brokerURL, "/issues/comment", brokerIssueRequest{Repo: repoForBroker(cfg), ID: id, Comment: comment}, nil); err != nil {
+			return err
+		}
+		fmt.Fprintf(stdout, "commented on issue #%d\n", id)
+		return nil
+	case "close", "reopen":
+		id, err := parseIssueIDArg(args)
+		if err != nil {
+			return err
+		}
+		if err := brokerPost(cfg.brokerURL, "/issues/"+args[0], brokerIssueRequest{Repo: repoForBroker(cfg), ID: id}, nil); err != nil {
+			return err
+		}
+		verb := "closed"
+		if args[0] == "reopen" {
+			verb = "reopened"
+		}
+		fmt.Fprintf(stdout, "%s issue #%d\n", verb, id)
+		return nil
+	default:
+		return fmt.Errorf("unknown issue command %q", args[0])
+	}
+}
+
+func parseIssueIDArg(args []string) (int, error) {
+	if len(args) != 2 {
+		return 0, errors.New("issue id is required")
+	}
+	id, err := strconv.Atoi(strings.TrimPrefix(args[1], "#"))
+	if err != nil || id <= 0 {
+		return 0, errors.New("issue id is required")
+	}
+	return id, nil
 }
 
 func prCommand(args []string, stdin io.Reader, stdout io.Writer) error {
@@ -1144,6 +1533,21 @@ func defaultInitRepoName() string {
 		name += ".git"
 	}
 	return name
+}
+
+func logicalRepoWithGit(name string) string {
+	name = strings.Trim(strings.TrimSpace(name), "/")
+	if name == "" {
+		return "repo.git"
+	}
+	if !strings.HasSuffix(name, ".git") {
+		name += ".git"
+	}
+	return name
+}
+
+func logicalRepoDisplayName(name string) string {
+	return strings.TrimSuffix(strings.Trim(strings.TrimSpace(name), "/"), ".git")
 }
 
 func initDialogInitialState(target string, global globalConfig, repoName, profileName string) initDialogConfig {

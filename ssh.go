@@ -740,6 +740,8 @@ func brokerPostContext(ctx context.Context, brokerURL, path string, req any, res
 	headerSets := brokerSignatureHeaderSetsForBroker(brokerURL, data)
 	if len(headerSets) == 0 {
 		headerSets = []map[string]string{{}}
+	} else {
+		headerSets = append(headerSets, map[string]string{})
 	}
 	var lastErr error
 	for i, headers := range headerSets {
@@ -1320,10 +1322,15 @@ func provisionAWSBrokerURL(cfg config, opts sshSetupOptions, stdout io.Writer) (
 		fmt.Fprintf(stdout, " with profile %s", strings.TrimSpace(cfg.gcloudConfiguration))
 	}
 	fmt.Fprintln(stdout)
+	s3Bucket, err := ensureAWSBrokerDeploymentBucket(cfg, region, stdout)
+	if err != nil {
+		return "", err
+	}
 	args := []string{
 		"cloudformation", "deploy",
 		"--stack-name", "bgit-broker",
 		"--template-file", templatePath,
+		"--s3-bucket", s3Bucket,
 		"--capabilities", "CAPABILITY_NAMED_IAM",
 		"--region", region,
 	}
@@ -1332,6 +1339,32 @@ func provisionAWSBrokerURL(cfg config, opts sshSetupOptions, stdout io.Writer) (
 		return "", fmt.Errorf("deploy AWS bgit broker: %w\n%s", err, strings.TrimSpace(string(out)))
 	}
 	return discoverAWSBrokerURL(cfg, opts)
+}
+
+func ensureAWSBrokerDeploymentBucket(cfg config, region string, stdout io.Writer) (string, error) {
+	accountID, _ := awsCallerIdentity(context.Background(), strings.TrimSpace(cfg.gcloudConfiguration))
+	if accountID == "" {
+		return "", errors.New("discover AWS account id for broker deployment bucket")
+	}
+	bucket := fmt.Sprintf("bgit-broker-artifacts-%s-%s", accountID, region)
+	headArgs := []string{"s3api", "head-bucket", "--bucket", bucket, "--region", region}
+	if err := awsCommand(context.Background(), strings.TrimSpace(cfg.gcloudConfiguration), headArgs...).Run(); err == nil {
+		return bucket, nil
+	}
+	fmt.Fprintf(stdout, "creating AWS broker deployment bucket %s in %s\n", bucket, region)
+	createArgs := []string{"s3api", "create-bucket", "--bucket", bucket, "--region", region}
+	if region != "us-east-1" {
+		createArgs = append(createArgs, "--create-bucket-configuration", "LocationConstraint="+region)
+	}
+	out, err := awsCommand(context.Background(), strings.TrimSpace(cfg.gcloudConfiguration), createArgs...).CombinedOutput()
+	if err != nil {
+		text := strings.TrimSpace(string(out))
+		if strings.Contains(text, "BucketAlreadyOwnedByYou") || strings.Contains(text, "BucketAlreadyExists") {
+			return bucket, nil
+		}
+		return "", fmt.Errorf("create AWS broker deployment bucket %s: %w\n%s", bucket, err, text)
+	}
+	return bucket, nil
 }
 
 func appendAWSProfile(args []string, profile string) []string {

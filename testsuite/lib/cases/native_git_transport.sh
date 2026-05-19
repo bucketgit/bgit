@@ -40,6 +40,9 @@ printf 'remote update\n' >> "$dir/README.md"
 run_in "$dir" add README.md >/dev/null
 run_in "$dir" commit -m "remote update" >/dev/null
 run_in "$dir" push >/dev/null
+if [[ -n "$(git -C "$clone" status --porcelain)" ]]; then
+  git -C "$clone" status --porcelain >&2
+  fail "native clone should be clean before pull"
+fi
 (cd "$clone" && git checkout main >/dev/null && git pull >/dev/null)
 assert_contains "$(cat "$clone/README.md")" "remote update"
-

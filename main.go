@@ -1476,6 +1476,9 @@ func initEmptyWorktree(args []string, stdout io.Writer) error {
 	if _, err := runGit(absTarget, "config", "--local", "bucketgit.branch", *branch); err != nil {
 		return err
 	}
+	if err := configureBucketGitLineEndings(absTarget); err != nil {
+		return err
+	}
 	fmt.Fprintf(stdout, "Initialized empty Git repository in %s/\n", filepath.Join(absTarget, ".git"))
 	return nil
 }
@@ -1496,6 +1499,22 @@ func writeBucketGitConfig(worktree string, cfg config) error {
 	}
 	if strings.TrimSpace(cfg.gcloudConfiguration) != "" {
 		pairs = append(pairs, []string{"bucketgit.profile", cfg.gcloudConfiguration})
+	}
+	for _, pair := range pairs {
+		if _, err := runGit(worktree, "config", "--local", pair[0], pair[1]); err != nil {
+			return err
+		}
+	}
+	if err := configureBucketGitLineEndings(worktree); err != nil {
+		return err
+	}
+	return nil
+}
+
+func configureBucketGitLineEndings(worktree string) error {
+	pairs := [][]string{
+		{"core.autocrlf", "false"},
+		{"core.eol", "lf"},
 	}
 	for _, pair := range pairs {
 		if _, err := runGit(worktree, "config", "--local", pair[0], pair[1]); err != nil {

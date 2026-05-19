@@ -42,6 +42,8 @@ func TestBrokerInitWritesBrokerGitConfig(t *testing.T) {
 		"bucketgit.logicalRepo": "team/app.git",
 		"branch.main.remote":    "origin",
 		"branch.main.merge":     "refs/heads/main",
+		"core.autocrlf":         "false",
+		"core.eol":              "lf",
 	} {
 		out, err := runGit(target, "config", "--get", key)
 		if err != nil {

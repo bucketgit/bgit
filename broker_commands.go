@@ -2026,6 +2026,9 @@ func initBrokerWorktree(target, repoName string, profile brokerProfile, identity
 			return err
 		}
 	}
+	if err := configureBucketGitLineEndings(absTarget); err != nil {
+		return err
+	}
 	if err := setGitOrigin(absTarget, remoteURL); err != nil {
 		return err
 	}

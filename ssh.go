@@ -10,7 +10,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -20,7 +19,6 @@ import (
 	"time"
 
 	"golang.org/x/crypto/ssh"
-	"golang.org/x/crypto/ssh/agent"
 )
 
 const defaultSSHHost = "git.bucketgit.com"
@@ -812,16 +810,7 @@ func brokerSignatureHeaderSets(payload []byte) []map[string]string {
 }
 
 func brokerSignatureHeaderSetsForBroker(brokerURL string, payload []byte) []map[string]string {
-	sock := strings.TrimSpace(os.Getenv("SSH_AUTH_SOCK"))
-	if sock == "" {
-		return nil
-	}
-	conn, err := net.Dial("unix", sock)
-	if err != nil {
-		return nil
-	}
-	defer conn.Close()
-	signers, err := agent.NewClient(conn).Signers()
+	signers, err := sshAgentSigners()
 	if err != nil || len(signers) == 0 {
 		return nil
 	}

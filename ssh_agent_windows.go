@@ -19,10 +19,11 @@ func sshAgentSigners() ([]ssh.Signer, error) {
 	sock := strings.TrimSpace(os.Getenv("SSH_AUTH_SOCK"))
 	var conn net.Conn
 	var err error
+	timeout := 5 * time.Second
 	if strings.HasPrefix(sock, `\\.\pipe\`) {
-		conn, err = winio.DialPipe(sock, 5*time.Second)
+		conn, err = winio.DialPipe(sock, &timeout)
 	} else {
-		conn, err = winio.DialPipe(windowsOpenSSHAgentPipe, 5*time.Second)
+		conn, err = winio.DialPipe(windowsOpenSSHAgentPipe, &timeout)
 	}
 	if err != nil {
 		return nil, err

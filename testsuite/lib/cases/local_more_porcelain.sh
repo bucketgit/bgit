@@ -2,9 +2,8 @@
 set -euo pipefail
 source "$(dirname "$0")/../testlib.sh"
 
-dir="$(new_workdir local porcelain-more)"
-"$BGIT" init --noninteractive --repo local-porcelain-more --profile "$GCP_PROFILE" "${CONFIG_ARGS[@]}" "$dir" >/dev/null
-init_local_git_identity "$dir"
+init_output="$(init_bgit_repo gcp local-porcelain-more)"
+dir="$(printf "%s\n" "$init_output" | sed -n "1p")"
 commit_file "$dir" README.md "line one" "initial"
 
 run_in "$dir" switch -c feature >/dev/null

@@ -538,7 +538,12 @@ type brokerRepo struct {
 	Prefix   string `json:"prefix"`
 	Origin   string `json:"origin"`
 	Logical  string `json:"logical,omitempty"`
+	Host     string `json:"host,omitempty"`
+	TeamID   string `json:"team_id,omitempty"`
 }
+
+const coreTeamID = "t_core"
+const coreTeamName = "core"
 
 type brokerKey struct {
 	User      string `json:"user"`
@@ -587,10 +592,14 @@ type brokerKeysResponse struct {
 	Keys []brokerKey `json:"keys"`
 }
 
-func brokerUpsertLogicalRepo(brokerURL, provider, logicalRepo string) error {
+func brokerUpsertLogicalRepo(brokerURL, provider, logicalRepo string, teamID ...string) error {
 	logical, err := normalizeLogicalRepoName(logicalRepo)
 	if err != nil {
 		return err
+	}
+	team := ""
+	if len(teamID) > 0 {
+		team = strings.TrimSpace(teamID[0])
 	}
 	cfg := config{
 		provider:    provider,
@@ -598,7 +607,11 @@ func brokerUpsertLogicalRepo(brokerURL, provider, logicalRepo string) error {
 		logicalRepo: logical,
 		origin:      fmt.Sprintf("git@%s:%s", defaultSSHHost, logical),
 	}
-	req := brokerRepoRequest{Repo: repoForBroker(cfg)}
+	repo := repoForBroker(cfg)
+	if team != "" {
+		repo.TeamID = team
+	}
+	req := brokerRepoRequest{Repo: repo}
 	return brokerPost(brokerURL, "/repos/upsert", req, nil)
 }
 
@@ -736,7 +749,16 @@ func repoForBroker(cfg config) brokerRepo {
 		Prefix:   strings.Trim(cfg.prefix, "/"),
 		Origin:   cfg.origin,
 		Logical:  logical,
+		TeamID:   brokerTeamIDForConfig(cfg),
 	}
+}
+
+func brokerTeamIDForConfig(cfg config) string {
+	teamID := strings.TrimSpace(cfg.teamID)
+	if teamID == "" && strings.TrimSpace(cfg.logicalRepo) != "" {
+		teamID = coreTeamID
+	}
+	return teamID
 }
 
 func brokerPost(brokerURL, path string, req any, resp any) error {

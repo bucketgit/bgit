@@ -12,14 +12,25 @@ const storage = new Storage();
 const auth = new GoogleAuth({scopes: ['https://www.googleapis.com/auth/cloud-platform']});
 const brokerVersion = process.env.BROKER_VERSION || '{{BROKER_VERSION}}';
 const zero = '0000000000000000000000000000000000000000';
+const coreTeamID = 't_core';
+const coreTeamName = 'core';
 
 function repoID(repo) {
+  if (repo && repo.logical) return ['logical', repo.team_id || coreTeamID, repo.logical].join(':');
+  return [repo.provider || 'gcs', repo.bucket, repo.prefix].join(':');
+}
+
+function legacyRepoID(repo) {
   if (repo && repo.logical) return ['logical', repo.logical].join(':');
   return [repo.provider || 'gcs', repo.bucket, repo.prefix].join(':');
 }
 
 function docID(repo) {
   return Buffer.from(repoID(repo)).toString('base64url');
+}
+
+function legacyDocID(repo) {
+  return Buffer.from(legacyRepoID(repo)).toString('base64url');
 }
 
 function cleanName(value) {
@@ -37,6 +48,7 @@ function normalizeLogicalRepo(value) {
 function validateRepo(repo) {
   if (!repo || (!repo.logical && (!repo.bucket || !repo.prefix))) throw new Error('repo is required');
   if (repo.logical) repo.logical = normalizeLogicalRepo(repo.logical);
+  if (repo.logical && !repo.team_id) repo.team_id = coreTeamID;
   return repo;
 }
 
@@ -45,15 +57,55 @@ function randomSuffix() {
 }
 
 async function loadRepo(repo) {
+  const hadLogicalNoTeam = !!(repo && repo.logical && !repo.team_id);
   repo = validateRepo(repo);
   const ref = repos.doc(docID(repo));
   const snap = await ref.get();
+  if (!snap.exists && (hadLogicalNoTeam || repo.team_id === coreTeamID)) {
+    const legacyRef = repos.doc(legacyDocID(repo));
+    const legacySnap = await legacyRef.get();
+    if (legacySnap.exists) {
+      const legacyData = legacySnap.data() || {};
+      legacyData.repo = {...(legacyData.repo || repo), team_id: coreTeamID};
+      legacyData.keys = legacyData.keys || [];
+      legacyData.audit = legacyData.audit || [];
+      return {ref: legacyRef, data: legacyData};
+    }
+  }
   if (!snap.exists) return {ref, data: {repo, keys: [], audit: []}};
   const data = snap.data() || {};
   data.repo = data.repo || repo;
+  if (data.repo.logical && !data.repo.team_id) data.repo.team_id = coreTeamID;
   data.keys = data.keys || [];
   data.audit = data.audit || [];
   return {ref, data};
+}
+
+async function loadExistingRepo(repo) {
+  const hadLogicalNoTeam = !!(repo && repo.logical && !repo.team_id);
+  repo = validateRepo(repo);
+  const ref = repos.doc(docID(repo));
+  const snap = await ref.get();
+  if (snap.exists) {
+    const data = snap.data() || {};
+    data.repo = data.repo || repo;
+    if (data.repo.logical && !data.repo.team_id) data.repo.team_id = coreTeamID;
+    data.keys = data.keys || [];
+    data.audit = data.audit || [];
+    return {ref, data};
+  }
+  if (hadLogicalNoTeam || repo.team_id === coreTeamID) {
+    const legacyRef = repos.doc(legacyDocID(repo));
+    const legacySnap = await legacyRef.get();
+    if (legacySnap.exists) {
+      const legacyData = legacySnap.data() || {};
+      legacyData.repo = {...(legacyData.repo || repo), team_id: coreTeamID};
+      legacyData.keys = legacyData.keys || [];
+      legacyData.audit = legacyData.audit || [];
+      return {ref: legacyRef, data: legacyData};
+    }
+  }
+  return null;
 }
 
 async function saveRepo(entry) {
@@ -62,25 +114,61 @@ async function saveRepo(entry) {
 }
 
 async function syncMembershipIndex(entry) {
-  const repo = entry.data.repo || {};
-  if (!repo.logical && (!repo.bucket || !repo.prefix)) return;
-  const repoIDValue = repoID(repo);
-  const logical = repo.logical || repo.prefix || repoIDValue;
-  const writes = [];
+ const repo = entry.data.repo || {};
+ if (!repo.logical && (!repo.bucket || !repo.prefix)) return;
+ const repoIDValue = repoID(repo);
+ const logical = repo.logical || repo.prefix || repoIDValue;
+  const users = await loadBrokerUsers();
+  const usersByID = new Map((users.data.users || []).map((user) => [user.id, user]));
+  const memberships = new Map();
+  function addMembership(publicKey, user, role, source, suspended) {
+    if (!publicKey) return;
+    const fingerprint = keyFingerprint(publicKey);
+    const existing = memberships.get(fingerprint);
+    const nextRole = existing ? strongerRole(existing.role, role || '') : role || '';
+    memberships.set(fingerprint, {public_key: publicKey, user: user || '', role: nextRole, source: source || '', suspended: !!suspended});
+  }
   for (const key of entry.data.keys || []) {
-    if (!key.public_key) continue;
-    const fingerprint = keyFingerprint(key.public_key);
+    addMembership(key.public_key, key.user, key.role, key.source, key.suspended);
+  }
+  for (const grant of entry.data.teams || []) {
+    const team = await loadTeam(grant.id || grant.team_id);
+    if (!team) continue;
+    for (const member of team.data.members || []) {
+      if (member.suspended) continue;
+      const user = usersByID.get(member.user_id);
+      if (!user || user.suspended || user.pending) continue;
+      const role = weakerRole(normalizeRole(member.role || 'read'), normalizeRole(grant.role || 'read'));
+      for (const key of user.keys || []) {
+        addMembership(key.public_key || key, user.username || member.username || member.user_id, role, 'team', false);
+      }
+    }
+  }
+  const writes = [];
+  for (const membership of memberships.values()) {
+    const fingerprint = keyFingerprint(membership.public_key);
     writes.push(members.doc(memberDocID(fingerprint)).collection('repos').doc(docID(repo)).set({
       repo_id: repoIDValue,
       logical,
       repo,
-      user: key.user || '',
-      role: key.role || '',
-      source: key.source || '',
-      suspended: !!key.suspended,
+      user: membership.user || '',
+      role: membership.role || '',
+      source: membership.source || '',
+      suspended: !!membership.suspended,
       updated_at: new Date().toISOString(),
     }, {merge: true}));
   }
+  await Promise.all(writes);
+}
+
+async function syncReposForTeam(teamID) {
+  const snap = await repos.get();
+  const writes = [];
+  snap.forEach((doc) => {
+    if (String(doc.id || '').startsWith('_') || String(doc.id || '').startsWith('team:')) return;
+    const data = doc.data() || {};
+    if ((data.teams || []).some((grant) => (grant.id || grant.team_id) === teamID)) writes.push(syncMembershipIndex({ref: doc.ref, data}));
+  });
   await Promise.all(writes);
 }
 
@@ -138,6 +226,140 @@ async function loadOwners() {
   data.keys = data.keys || [];
   data.audit = data.audit || [];
   return {ref, data};
+}
+
+async function loadBrokerUsers() {
+  const ref = repos.doc('_users');
+  const snap = await ref.get();
+  const data = snap.exists ? (snap.data() || {}) : {};
+  data.users = data.users || [];
+  const owners = await loadOwners();
+  for (const key of owners.data.keys || []) {
+    const user = key.user || 'owner';
+    let existing = data.users.find((item) => String(item.username || '').toLowerCase() === String(user).toLowerCase());
+    if (!existing) {
+      existing = {id: 'u_' + cleanName(user), username: user, broker_role: key.role === 'admin' ? 'admin' : 'owner', keys: [], suspended: false};
+      data.users.push(existing);
+    }
+    if (key.public_key && !existing.keys.find((k) => normalizeKey(k.public_key || k) === normalizeKey(key.public_key))) {
+      existing.keys.push({public_key: key.public_key, source: key.source || 'owner'});
+    }
+  }
+  return {ref, data};
+}
+
+async function saveBrokerUsers(entry) {
+  await entry.ref.set(entry.data, {merge: false});
+}
+
+function validBrokerRole(role) {
+  return ['owner', 'admin', 'user'].includes(role);
+}
+
+function normalizeBrokerRole(role) {
+  return validBrokerRole(role) ? role : 'user';
+}
+
+async function signedBrokerUser(req) {
+  const users = await loadBrokerUsers();
+  const publicKey = normalizeKey(req.get('x-bgit-key'));
+  const message = String(req.get('x-bgit-signature-message') || '');
+  const signature = String(req.get('x-bgit-signature') || '');
+  if (!publicKey || !message || !signature || message !== expectedMessage(req)) return null;
+  for (const user of users.data.users || []) {
+    if (user.suspended) continue;
+    for (const key of user.keys || []) {
+      const keyValue = normalizeKey(key.public_key || key);
+      if (keyValue === publicKey && verifySSHSignature(publicKey, message, signature)) {
+        return {user: user.username || user.id, user_id: user.id, broker_role: user.broker_role || 'user', public_key: publicKey, source: 'broker-user'};
+      }
+    }
+  }
+  return null;
+}
+
+async function requireBrokerAdmin(req) {
+  const user = await signedBrokerUser(req);
+  if (user && (user.broker_role === 'owner' || user.broker_role === 'admin')) return user;
+  const owners = await loadOwners();
+  const key = signedKey(req, owners);
+  if (key && (key.role === 'owner' || key.role === 'admin')) return {user: key.user || 'owner', broker_role: key.role, public_key: key.public_key};
+  throw Object.assign(new Error('broker admin SSH signature required'), {status: 403});
+}
+
+function teamDocID(teamID) {
+  return 'team:' + String(teamID || '').trim();
+}
+
+async function loadTeam(teamID) {
+  const ref = repos.doc(teamDocID(teamID));
+  const snap = await ref.get();
+  if (!snap.exists) return null;
+  const data = snap.data() || {};
+  data.members = data.members || [];
+  return {ref, data};
+}
+
+async function ensureCoreTeam(actor) {
+  const existing = await loadTeam(coreTeamID);
+  if (existing) return existing;
+  const ref = repos.doc(teamDocID(coreTeamID));
+  const team = {id: coreTeamID, name: coreTeamName, members: [], created_by: actor || 'setup', created_at: new Date().toISOString()};
+  await ref.set(team, {merge: false});
+  return {ref, data: team};
+}
+
+async function loadTeamByName(name) {
+  const want = String(name || '').trim().toLowerCase();
+  if (!want) return null;
+  if (want === coreTeamName || want === coreTeamID) return ensureCoreTeam('lookup');
+  const snap = await repos.get();
+  const matches = snap.docs
+    .filter((doc) => String(doc.id || '').startsWith('team:'))
+    .map((doc) => ({ref: doc.ref, data: doc.data() || {}}))
+    .filter((team) => String(team.data.name || '').trim().toLowerCase() === want || String(team.data.id || '').trim().toLowerCase() === want);
+  if (matches.length === 0) return null;
+  if (matches.length > 1) throw Object.assign(new Error('team name is ambiguous'), {status: 409});
+  matches[0].data.members = matches[0].data.members || [];
+  return matches[0];
+}
+
+async function teamRoleForUser(teamID, userID) {
+  if (!teamID || !userID) return '';
+  const team = await loadTeam(teamID);
+  if (!team) return '';
+  const member = (team.data.members || []).find((item) => item.user_id === userID);
+  return member && !member.suspended ? normalizeRole(member.role || 'read') : '';
+}
+
+function strongerRole(a, b) {
+  const rank = {read: 1, triage: 2, developer: 3, maintainer: 4, admin: 5, owner: 6};
+  return (rank[b] || 0) > (rank[a] || 0) ? b : a;
+}
+
+function weakerRole(a, b) {
+  const rank = {read: 1, triage: 2, developer: 3, maintainer: 4, admin: 5, owner: 6};
+  if (!a) return b || '';
+  if (!b) return a || '';
+  return (rank[b] || 0) < (rank[a] || 0) ? b : a;
+}
+
+async function effectiveSignedKey(req, entry) {
+  let direct = signedKey(req, entry);
+  let role = direct ? direct.role : '';
+  const brokerUser = await signedBrokerUser(req);
+  if (brokerUser) {
+    for (const grant of entry.data.teams || []) {
+      const teamRole = await teamRoleForUser(grant.id || grant.team_id, brokerUser.user_id);
+      if (teamRole) role = strongerRole(role, weakerRole(teamRole, grant.role || teamRole));
+    }
+  }
+  if (!direct && brokerUser && role) {
+    direct = {user: brokerUser.user, role, public_key: brokerUser.public_key, source: 'team', user_id: brokerUser.user_id};
+  } else if (direct && role && role !== direct.role) {
+    direct = {...direct, role};
+  }
+  return direct;
 }
 
 function audit(entry, event) {
@@ -291,6 +513,11 @@ function memberInviteCode(brokerURL, repo, token) {
   return 'bgitinv_' + payload;
 }
 
+function brokerUserInviteCode(brokerURL, user, role, token) {
+  const payload = Buffer.from(JSON.stringify({broker_url: brokerURL, user, role, token})).toString('base64url');
+  return 'bgituser_' + payload;
+}
+
 function verifySignature(req, entry) {
   const adminKeys = (entry.data.keys || []).filter((k) => (k.role === 'admin' || k.role === 'owner') && !k.suspended);
   if (adminKeys.length === 0) return true;
@@ -321,6 +548,37 @@ function keyMatches(item, key) {
     item.public_key === value ||
     item.public_key.includes(value) ||
     keyFingerprint(item.public_key) === value;
+}
+
+function normalizedUsername(user) {
+  return String(user || '').trim().toLowerCase();
+}
+
+function assertUniqueRepoKey(entry, publicKey, user) {
+  const normalized = normalizeKey(publicKey);
+  if (!normalized) return null;
+  const existing = (entry.data.keys || []).find((item) => normalizeKey(item.public_key) === normalized);
+  if (existing && normalizedUsername(existing.user) !== normalizedUsername(user)) {
+    throw Object.assign(new Error('SSH key already belongs to user ' + (existing.user || 'unknown')), {status: 409});
+  }
+  return existing || null;
+}
+
+function assertUniqueBrokerUserKey(users, publicKey, username) {
+  const normalized = normalizeKey(publicKey);
+  if (!normalized) return null;
+  const target = normalizedUsername(username);
+  for (const user of users.data.users || []) {
+    for (const key of user.keys || []) {
+      if (normalizeKey(key.public_key || key) === normalized) {
+        if (normalizedUsername(user.username) !== target) {
+          throw Object.assign(new Error('SSH key already belongs to broker user ' + (user.username || 'unknown')), {status: 409});
+        }
+        return key;
+      }
+    }
+  }
+  return null;
 }
 
 function memberDocID(fingerprint) {
@@ -363,16 +621,32 @@ function normalizeRole(role) {
   return role === 'write' ? 'developer' : role;
 }
 
-function requireAdmin(req, entry) {
-  if (!verifySignature(req, entry)) {
+async function requireAdmin(req, entry) {
+  const key = await effectiveSignedKey(req, entry);
+  if (!key || (key.role !== 'owner' && key.role !== 'admin')) {
+    const brokerUser = await signedBrokerUser(req);
+    if (brokerUser && (brokerUser.broker_role === 'owner' || brokerUser.broker_role === 'admin')) {
+      return {user: brokerUser.user || '', role: brokerUser.broker_role, broker_role: brokerUser.broker_role, public_key: brokerUser.public_key || '', source: 'broker-user'};
+    }
     const err = new Error('admin SSH signature required');
     err.status = 403;
     throw err;
   }
+  return key;
 }
 
-function requireRead(req, entry) {
-  const key = signedKey(req, entry);
+async function requireOwner(req, entry) {
+  const key = await effectiveSignedKey(req, entry);
+  if (key && key.role === 'owner') return key;
+  const brokerUser = await signedBrokerUser(req);
+  if (brokerUser && brokerUser.broker_role === 'owner') {
+    return {user: brokerUser.user || '', role: 'owner', broker_role: 'owner', public_key: brokerUser.public_key || '', source: 'broker-user'};
+  }
+  throw Object.assign(new Error('owner SSH signature required'), {status: 403});
+}
+
+async function requireRead(req, entry) {
+  const key = await effectiveSignedKey(req, entry);
   if (!key && repoIsPublic(entry)) return anonymousKey();
   if (!key || !roleAllows(key.role, 'read')) {
     const err = new Error('read SSH signature required');
@@ -382,13 +656,13 @@ function requireRead(req, entry) {
   return key;
 }
 
-function requireWrite(req, entry) {
+async function requireWrite(req, entry) {
   if (repoIsReadOnly(entry)) {
     const err = new Error('repository is read-only');
     err.status = 403;
     throw err;
   }
-  const key = signedKey(req, entry);
+  const key = await effectiveSignedKey(req, entry);
   if (!key || !roleAllows(key.role, 'write')) {
     const err = new Error('write SSH signature required');
     err.status = 403;
@@ -397,9 +671,9 @@ function requireWrite(req, entry) {
   return key;
 }
 
-function requireIssueCreate(req, entry) {
+async function requireIssueCreate(req, entry) {
   if (repoIsReadOnly(entry)) throw Object.assign(new Error('repository is read-only'), {status: 403});
-  if (repoIsPublic(entry)) return signedKey(req, entry) || anonymousKey();
+  if (repoIsPublic(entry)) return await effectiveSignedKey(req, entry) || anonymousKey();
   return requireRead(req, entry);
 }
 
@@ -705,12 +979,10 @@ function countApprovals(pr) {
 async function ensureRepo(repo) {
   repo = validateRepo(repo);
   const entry = await loadRepo(repo);
+  if (entry.data.repo && entry.data.repo.logical && entry.data.repo.team_id === coreTeamID) await ensureCoreTeam('repo');
   const owners = await loadOwners();
-  for (const owner of owners.data.keys || []) {
-    if (owner.role === 'owner' && !entry.data.keys.find((k) => normalizeKey(k.public_key) === normalizeKey(owner.public_key))) {
-      entry.data.keys.push(owner);
-    }
-  }
+  const ownerKeys = new Set((owners.data.keys || []).filter((owner) => owner.role === 'owner').map((owner) => normalizeKey(owner.public_key)));
+  entry.data.keys = (entry.data.keys || []).filter((key) => !(key.role === 'owner' && ownerKeys.has(normalizeKey(key.public_key)) && key.source !== 'ownership-transfer'));
   return entry;
 }
 
@@ -729,31 +1001,368 @@ exports.broker = async (req, res) => {
       const role = normalizeRole(body.role || 'owner');
       if (role !== 'owner') throw new Error('owner bootstrap only accepts owner role');
       for (const publicKey of body.public_keys || []) {
-        if (!entry.data.keys.find((k) => normalizeKey(k.public_key) === normalizeKey(publicKey))) entry.data.keys.push({user, role, public_key: publicKey, source: body.source || '', suspended: false});
+        if (!assertUniqueRepoKey(entry, publicKey, user)) entry.data.keys.push({user, role, public_key: publicKey, source: body.source || '', suspended: false});
       }
       await saveRepo(entry);
+      await ensureCoreTeam(user);
       res.status(200).send(JSON.stringify({ok: true}));
       return;
     }
+    if (req.path === '/broker/users/list' && req.method === 'POST') {
+      await requireBrokerAdmin(req);
+      const users = await loadBrokerUsers();
+      res.status(200).send(JSON.stringify({users: users.data.users || []}));
+      return;
+    }
+    if (req.path === '/broker/users/upsert' && req.method === 'POST') {
+      await requireBrokerAdmin(req);
+      const users = await loadBrokerUsers();
+      const username = String(body.user || body.username || '').trim();
+      if (!username) throw new Error('user is required');
+      const role = normalizeBrokerRole(body.broker_role || body.role || 'user');
+      if (!validBrokerRole(body.broker_role || body.role || 'user')) throw new Error('invalid broker role');
+      if (role === 'owner') throw Object.assign(new Error('broker owner role is managed by owner transfer'), {status: 403});
+      let user = users.data.users.find((item) => String(item.username || '').toLowerCase() === username.toLowerCase());
+      if (user && user.broker_role === 'owner') throw Object.assign(new Error('broker owner cannot be reassigned or suspended'), {status: 403});
+      if (!user) {
+        user = {id: 'u_' + crypto.randomBytes(6).toString('hex'), username, broker_role: role, keys: [], suspended: false};
+        users.data.users.push(user);
+      }
+      user.username = username;
+      user.broker_role = role;
+      user.suspended = !!body.suspended;
+      user.keys = user.keys || [];
+      for (const publicKey of body.public_keys || []) {
+        if (!assertUniqueBrokerUserKey(users, publicKey, username)) user.keys.push({public_key: publicKey, source: body.source || ''});
+      }
+      await saveBrokerUsers(users);
+      res.status(200).send(JSON.stringify({ok: true, user}));
+      return;
+    }
+    if (req.path === '/broker/users/delete' && req.method === 'POST') {
+      await requireBrokerAdmin(req);
+      const users = await loadBrokerUsers();
+      const username = String(body.user || body.username || '').trim();
+      if (!username) throw new Error('user is required');
+      const normalizedUser = username.toLowerCase();
+      const user = (users.data.users || []).find((item) => String(item.username || '').toLowerCase() === normalizedUser);
+      if (!user) throw Object.assign(new Error('broker user not found'), {status: 404});
+      if (user.broker_role === 'owner') throw Object.assign(new Error('broker owner cannot be deleted'), {status: 403});
+      users.data.users = (users.data.users || []).filter((item) => String(item.username || '').toLowerCase() !== normalizedUser);
+      users.data.invites = (users.data.invites || []).filter((invite) => String(invite.user || '').trim().toLowerCase() !== normalizedUser);
+      await saveBrokerUsers(users);
+      for (const key of user.keys || []) {
+        if (!key.public_key) continue;
+        const idx = await members.doc(memberDocID(keyFingerprint(key.public_key))).collection('repos').get();
+        await Promise.all(idx.docs.map((doc) => doc.ref.delete()));
+      }
+      const snap = await repos.get();
+      const removedRepoKeys = [];
+      for (const doc of snap.docs) {
+        const id = String(doc.id || '');
+        if (id.startsWith('_')) continue;
+        const data = doc.data() || {};
+        let changed = false;
+        if (id.startsWith('team:')) {
+          const nextMembers = (data.members || []).filter((member) => String(member.username || '').trim().toLowerCase() !== normalizedUser && String(member.user_id || '') !== user.id);
+          if (nextMembers.length !== (data.members || []).length) {
+            data.members = nextMembers;
+            changed = true;
+          }
+        } else {
+          const originalKeys = data.keys || [];
+          for (const key of originalKeys) {
+            if (String(key.user || '').trim().toLowerCase() === normalizedUser && key.public_key) removedRepoKeys.push(key.public_key);
+          }
+          const nextKeys = originalKeys.filter((key) => String(key.user || '').trim().toLowerCase() !== normalizedUser);
+          const nextInvites = (data.invites || []).filter((invite) => String(invite.user || '').trim().toLowerCase() !== normalizedUser);
+          if (nextKeys.length !== (data.keys || []).length) {
+            data.keys = nextKeys;
+            changed = true;
+          }
+          if (nextInvites.length !== (data.invites || []).length) {
+            data.invites = nextInvites;
+            changed = true;
+          }
+        }
+        if (changed) await doc.ref.set(data, {merge: false});
+      }
+      for (const publicKey of removedRepoKeys) {
+        const idx = await members.doc(memberDocID(keyFingerprint(publicKey))).collection('repos').get();
+        await Promise.all(idx.docs.map((doc) => doc.ref.delete()));
+      }
+      res.status(200).send(JSON.stringify({ok: true}));
+      return;
+    }
+    if (req.path === '/broker/users/invite/create' && req.method === 'POST') {
+      await requireBrokerAdmin(req);
+      const users = await loadBrokerUsers();
+      const username = String(body.user || body.username || '').trim();
+      if (!username) throw new Error('user is required');
+      const role = normalizeBrokerRole(body.broker_role || body.role || 'user');
+      if (!validBrokerRole(body.broker_role || body.role || 'user') || role === 'owner') throw new Error('invalid broker role');
+      users.data.invites = (users.data.invites || []).filter((invite) => Date.parse(invite.expires_at || '') > Date.now());
+      const normalizedUser = username.toLowerCase();
+      if (users.data.invites.some((invite) => String(invite.user || '').trim().toLowerCase() === normalizedUser)) throw Object.assign(new Error('broker user invite already pending for user'), {status: 409});
+      let user = (users.data.users || []).find((item) => String(item.username || '').toLowerCase() === normalizedUser);
+      if (!user) {
+        user = {id: 'u_' + crypto.randomBytes(6).toString('hex'), username, broker_role: role, keys: [], suspended: false, pending: true};
+        users.data.users.push(user);
+      } else {
+        user.username = username;
+        user.broker_role = role;
+        if (!(user.keys || []).length) user.pending = true;
+      }
+      const token = crypto.randomBytes(24).toString('base64url');
+      const brokerURL = String(body.broker_url || '').trim();
+      const expires = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
+      users.data.invites.push({token_hash: ownershipTransferTokenHash(token), user: username, role, broker_url: brokerURL, expires_at: expires});
+      await saveBrokerUsers(users);
+      const code = brokerUserInviteCode(brokerURL, username, role, token);
+      res.status(200).send(JSON.stringify({ok: true, code, accept_command: 'bgit admin accept-broker-invite ' + code, user: username, role}));
+      return;
+    }
+    if (req.path === '/broker/users/invite/accept' && req.method === 'POST') {
+      const users = await loadBrokerUsers();
+      const signed = submittedSignedKey(req);
+      if (!signed) throw Object.assign(new Error('SSH signature required'), {status: 403});
+      const tokenHash = ownershipTransferTokenHash(body.token);
+      const invites = users.data.invites || [];
+      const invite = invites.find((item) => item.token_hash === tokenHash && Date.parse(item.expires_at || '') > Date.now());
+      if (!invite) throw Object.assign(new Error('broker user invite is not pending or has expired'), {status: 404});
+      const username = String(invite.user || body.user || '').trim();
+      let user = (users.data.users || []).find((item) => String(item.username || '').toLowerCase() === username.toLowerCase());
+      if (!user) {
+        user = {id: 'u_' + crypto.randomBytes(6).toString('hex'), username, broker_role: invite.role || 'user', keys: [], suspended: false};
+        users.data.users.push(user);
+      }
+      user.username = username;
+      user.broker_role = invite.role || user.broker_role || 'user';
+      user.pending = false;
+      user.keys = user.keys || [];
+      if (!assertUniqueBrokerUserKey(users, signed.public_key, username)) user.keys.push({public_key: signed.public_key, source: 'broker-invite'});
+      users.data.invites = invites.filter((item) => item.token_hash !== tokenHash);
+      await saveBrokerUsers(users);
+      await syncAllMembershipIndexes();
+      res.status(200).send(JSON.stringify({ok: true, user: username, role: user.broker_role, fingerprint: signed.fingerprint}));
+      return;
+    }
+    if (req.path === '/broker/users/invite/cancel' && req.method === 'POST') {
+      await requireBrokerAdmin(req);
+      const users = await loadBrokerUsers();
+      const username = String(body.user || body.username || '').trim().toLowerCase();
+      const invites = users.data.invites || [];
+      const next = invites.filter((item) => String(item.user || '').trim().toLowerCase() !== username);
+      if (next.length === invites.length) throw Object.assign(new Error('broker user invite is not pending or has expired'), {status: 404});
+      users.data.invites = next;
+      users.data.users = (users.data.users || []).filter((item) => {
+        if (String(item.username || '').trim().toLowerCase() !== username) return true;
+        return (item.keys || []).length > 0 || !item.pending;
+      });
+      await saveBrokerUsers(users);
+      await syncAllMembershipIndexes();
+      res.status(200).send(JSON.stringify({ok: true}));
+      return;
+    }
+    if (req.path === '/teams/create' && req.method === 'POST') {
+      const actor = await requireBrokerAdmin(req);
+      const name = String(body.name || '').trim();
+      if (!name) throw new Error('team name is required');
+      const id = body.id || body.team_id || ('t_' + crypto.randomBytes(6).toString('hex'));
+      const ref = repos.doc(teamDocID(id));
+      const snap = await ref.get();
+      if (snap.exists) throw Object.assign(new Error('team already exists'), {status: 409});
+      const team = {id, name, members: [], created_by: actor.user || '', created_at: new Date().toISOString()};
+      await ref.set(team, {merge: false});
+      res.status(200).send(JSON.stringify({ok: true, team}));
+      return;
+    }
+    if (req.path === '/teams/delete' && req.method === 'POST') {
+      await requireBrokerAdmin(req);
+      const teamID = String(body.team_id || body.id || body.name || '').trim();
+      if (!teamID) throw new Error('team_id is required');
+      const team = await loadTeam(teamID);
+      if (!team) throw Object.assign(new Error('team not found'), {status: 404});
+      if (team.data.id === coreTeamID || String(team.data.name || '').trim().toLowerCase() === coreTeamName) {
+        throw Object.assign(new Error('core team cannot be deleted'), {status: 403});
+      }
+      const snap = await repos.get();
+      const updates = [];
+      snap.forEach((doc) => {
+        if (String(doc.id || '').startsWith('_') || String(doc.id || '').startsWith('team:')) return;
+        const data = doc.data() || {};
+        const teams = data.teams || [];
+        const next = teams.filter((item) => (item.id || item.team_id) !== teamID);
+        if (next.length !== teams.length) {
+          data.teams = next;
+          updates.push(saveRepo({ref: doc.ref, data}));
+        }
+      });
+      updates.push(team.ref.delete());
+      await Promise.all(updates);
+      res.status(200).send(JSON.stringify({ok: true}));
+      return;
+    }
+    if (req.path === '/teams/resolve' && req.method === 'POST') {
+      const team = await loadTeamByName(body.name || body.team || body.team_name);
+      if (!team) throw Object.assign(new Error('team not found'), {status: 404});
+      res.status(200).send(JSON.stringify({team: team.data}));
+      return;
+    }
+    if (req.path === '/teams/list' && req.method === 'POST') {
+      await requireBrokerAdmin(req);
+      const snap = await repos.get();
+      res.status(200).send(JSON.stringify({teams: snap.docs.filter((doc) => String(doc.id || '').startsWith('team:')).map((doc) => doc.data() || {})}));
+      return;
+    }
+    if (req.path === '/teams/member/upsert' && req.method === 'POST') {
+      await requireBrokerAdmin(req);
+      const team = await loadTeam(body.team_id);
+      if (!team) throw Object.assign(new Error('team not found'), {status: 404});
+      const userID = String(body.user_id || '').trim();
+      const username = String(body.user || body.username || '').trim();
+      const role = normalizeRole(body.role || 'read');
+      if (!validRole(role)) throw new Error('invalid role');
+      if (!userID && !username) throw new Error('user is required');
+      let resolvedUserID = userID;
+      if (!resolvedUserID && username) {
+        const users = await loadBrokerUsers();
+        const user = (users.data.users || []).find((item) => String(item.username || '').toLowerCase() === username.toLowerCase());
+        if (!user) throw Object.assign(new Error('broker user not found'), {status: 404});
+        resolvedUserID = user.id;
+      }
+      team.data.members = (team.data.members || []).filter((item) => item.user_id !== resolvedUserID && String(item.username || '').toLowerCase() !== username.toLowerCase());
+      team.data.members.push({user_id: resolvedUserID, username, role, suspended: false});
+      await team.ref.set(team.data, {merge: false});
+      await syncReposForTeam(team.data.id);
+      res.status(200).send(JSON.stringify({ok: true, team: team.data}));
+      return;
+    }
+    if (req.path === '/teams/member/remove' && req.method === 'POST') {
+      await requireBrokerAdmin(req);
+      const team = await loadTeam(body.team_id);
+      if (!team) throw Object.assign(new Error('team not found'), {status: 404});
+      const userID = String(body.user_id || '').trim();
+      const username = String(body.user || body.username || '').trim().toLowerCase();
+      team.data.members = (team.data.members || []).filter((item) => item.user_id !== userID && String(item.username || '').toLowerCase() !== username);
+      await team.ref.set(team.data, {merge: false});
+      await syncReposForTeam(team.data.id);
+      res.status(200).send(JSON.stringify({ok: true, team: team.data}));
+      return;
+    }
+    if (req.path === '/repos/create' && req.method === 'POST') {
+      await requireBrokerAdmin(req);
+      if (await loadExistingRepo(body.repo)) throw Object.assign(new Error('repository already exists'), {status: 409});
+      const entry = await loadRepo(body.repo);
+      const user = body.admin_user || 'admin';
+      const role = normalizeRole(body.role || 'developer');
+      if (!validRole(role)) throw new Error('invalid role');
+      entry.data.repo = {...(entry.data.repo || {}), ...(body.repo || {})};
+      if (body.repo && body.repo.team_id) {
+        const team = await loadTeam(body.repo.team_id);
+        if (!team) throw Object.assign(new Error('team not found'), {status: 404});
+        entry.data.teams = entry.data.teams || [];
+        entry.data.teams.push({id: body.repo.team_id, role});
+      }
+      if (body.repo && body.repo.logical && !entry.data.repo.bucket) await ensurePhysicalRepo(entry);
+      for (const publicKey of body.public_keys || []) {
+        if (!assertUniqueRepoKey(entry, publicKey, user)) entry.data.keys.push({user, role, public_key: publicKey, source: body.source || '', suspended: false});
+      }
+      audit(entry, {type: 'repo_create', user});
+      await saveRepo(entry);
+      res.status(200).send(JSON.stringify({ok: true, repo: entry.data.repo, bucket_suffix: entry.data.bucket_suffix}));
+      return;
+    }
+    if (req.path === '/repos/get' && req.method === 'POST') {
+      const entry = await loadExistingRepo(body.repo);
+      if (!entry) throw Object.assign(new Error('repository not found'), {status: 404});
+      try {
+        await requireRead(req, entry);
+      } catch (err) {
+        try {
+          await requireBrokerAdmin(req);
+        } catch (_) {
+          throw err;
+        }
+      }
+      res.status(200).send(JSON.stringify({ok: true, repo: entry.data.repo || body.repo, teams: entry.data.teams || []}));
+      return;
+    }
     if (req.path === '/repos/upsert' && req.method === 'POST') {
-      const entry = await ensureRepo(body.repo);
-      requireAdmin(req, entry);
+      const entry = await loadExistingRepo(body.repo);
+      if (!entry) throw Object.assign(new Error('repository not found'), {status: 404});
+      await requireAdmin(req, entry);
       const user = body.admin_user || 'admin';
       const role = normalizeRole(body.role || 'admin');
       if (!validRole(role)) throw new Error('invalid role');
       entry.data.repo = {...(entry.data.repo || {}), ...(body.repo || {})};
+      if (body.repo && body.repo.team_id && !(entry.data.teams || []).find((t) => (t.id || t.team_id) === body.repo.team_id)) {
+        const team = await loadTeam(body.repo.team_id);
+        if (!team) throw Object.assign(new Error('team not found'), {status: 404});
+        entry.data.teams = entry.data.teams || [];
+        entry.data.teams.push({id: body.repo.team_id, role: body.role || 'developer'});
+      }
       if (body.repo && body.repo.logical && !entry.data.repo.bucket) await ensurePhysicalRepo(entry);
       for (const publicKey of body.public_keys || []) {
-        if (!entry.data.keys.find((k) => normalizeKey(k.public_key) === normalizeKey(publicKey))) entry.data.keys.push({user, role, public_key: publicKey, source: body.source || '', suspended: false});
+        if (!assertUniqueRepoKey(entry, publicKey, user)) entry.data.keys.push({user, role, public_key: publicKey, source: body.source || '', suspended: false});
       }
       audit(entry, {type: 'repo_upsert', user});
       await saveRepo(entry);
       res.status(200).send(JSON.stringify({ok: true, repo: entry.data.repo, bucket_suffix: entry.data.bucket_suffix}));
       return;
     }
+    if (req.path === '/repo/teams/list' && req.method === 'POST') {
+      const entry = await loadExistingRepo(body.repo);
+      if (!entry) throw Object.assign(new Error('repository not found'), {status: 404});
+      await requireAdmin(req, entry);
+      res.status(200).send(JSON.stringify({teams: entry.data.teams || []}));
+      return;
+    }
+    if (req.path === '/repo/teams/upsert' && req.method === 'POST') {
+      const entry = await loadExistingRepo(body.repo);
+      if (!entry) throw Object.assign(new Error('repository not found'), {status: 404});
+      await requireAdmin(req, entry);
+      const teamID = String(body.team_id || '').trim();
+      if (!teamID) throw new Error('team_id is required');
+      const team = await loadTeam(teamID);
+      if (!team) throw Object.assign(new Error('team not found'), {status: 404});
+      const role = normalizeRole(body.role || 'read');
+      if (!validRole(role)) throw new Error('invalid role');
+      entry.data.teams = (entry.data.teams || []).filter((item) => (item.id || item.team_id) !== teamID);
+      entry.data.teams.push({id: teamID, role});
+      await saveRepo(entry);
+      res.status(200).send(JSON.stringify({ok: true, teams: entry.data.teams}));
+      return;
+    }
+    if (req.path === '/repos/list' && req.method === 'POST') {
+      await requireBrokerAdmin(req);
+      const snap = await repos.get();
+      const out = [];
+      snap.forEach((doc) => {
+        if (String(doc.id || '').startsWith('_') || String(doc.id || '').startsWith('team:')) return;
+        const data = doc.data() || {};
+        const repo = data.repo || {};
+        if (!repo.logical) return;
+        out.push({repo, logical: repo.logical, teams: data.teams || []});
+      });
+      out.sort((a, b) => String(a.logical || '').localeCompare(String(b.logical || '')));
+      res.status(200).send(JSON.stringify({repos: out}));
+      return;
+    }
+    if (req.path === '/repo/teams/remove' && req.method === 'POST') {
+      const entry = await loadExistingRepo(body.repo);
+      if (!entry) throw Object.assign(new Error('repository not found'), {status: 404});
+      await requireAdmin(req, entry);
+      const teamID = String(body.team_id || '').trim();
+      entry.data.teams = (entry.data.teams || []).filter((item) => (item.id || item.team_id) !== teamID);
+      await saveRepo(entry);
+      res.status(200).send(JSON.stringify({ok: true, teams: entry.data.teams || []}));
+      return;
+    }
     if (req.path === '/repo/info' && req.method === 'POST') {
-      const entry = await ensureRepo(body.repo);
-      requireRead(req, entry);
+      const entry = await loadExistingRepo(body.repo);
+      if (!entry) throw Object.assign(new Error('repository not found'), {status: 404});
+      await requireRead(req, entry);
       res.status(200).send(JSON.stringify({
         repo: entry.data.repo || body.repo,
         description: entry.data.description || '',
@@ -766,7 +1375,7 @@ exports.broker = async (req, res) => {
     }
     if (req.path === '/repo/update' && req.method === 'POST') {
       const entry = await ensureRepo(body.repo);
-      requireAdmin(req, entry);
+      await requireAdmin(req, entry);
       if (Object.prototype.hasOwnProperty.call(body, 'description')) entry.data.description = String(body.description || '').trim();
       if (Object.prototype.hasOwnProperty.call(body, 'default_branch')) entry.data.default_branch = String(body.default_branch || '').trim() || 'main';
       if (Object.prototype.hasOwnProperty.call(body, 'visibility')) entry.data.visibility = body.visibility === 'public' ? 'public' : 'private';
@@ -787,8 +1396,7 @@ exports.broker = async (req, res) => {
     }
     if (req.path === '/repo/rename' && req.method === 'POST') {
       const entry = await ensureRepo(body.repo);
-      const key = signedKey(req, entry);
-      if (!key || key.role !== 'owner') throw Object.assign(new Error('owner SSH signature required'), {status: 403});
+      const key = await requireOwner(req, entry);
       const logical = normalizeLogicalRepo(body.logical);
       const newRepo = {...(entry.data.repo || body.repo), logical};
       const newRef = repos.doc(docID(newRepo));
@@ -809,8 +1417,7 @@ exports.broker = async (req, res) => {
     }
     if (req.path === '/repo/delete' && req.method === 'POST') {
       const entry = await ensureRepo(body.repo);
-      const key = signedKey(req, entry);
-      if (!key || key.role !== 'owner') throw Object.assign(new Error('owner SSH signature required'), {status: 403});
+      await requireOwner(req, entry);
       const repo = await ensurePhysicalRepo(entry);
       await deletePhysicalRepo(repo);
       await deleteRepoMetadata(entry);
@@ -819,26 +1426,27 @@ exports.broker = async (req, res) => {
     }
     if (req.path === '/keys/list' && req.method === 'POST') {
       const entry = await ensureRepo(body.repo);
-      requireAdmin(req, entry);
+      await requireAdmin(req, entry);
       res.status(200).send(JSON.stringify({keys: entry.data.keys}));
       return;
     }
     if (req.path === '/keys/add' && req.method === 'POST') {
       const entry = await ensureRepo(body.repo);
-      requireAdmin(req, entry);
+      await requireAdmin(req, entry);
       const user = body.user || 'admin';
       const role = normalizeRole(body.role || 'read');
       if (!validRole(role) || role === 'owner') throw new Error('invalid role');
       for (const publicKey of body.public_keys || []) {
-        if (!entry.data.keys.find((k) => normalizeKey(k.public_key) === normalizeKey(publicKey))) entry.data.keys.push({user, role, public_key: publicKey, source: body.source || '', suspended: false});
+        if (!assertUniqueRepoKey(entry, publicKey, user)) entry.data.keys.push({user, role, public_key: publicKey, source: body.source || '', suspended: false});
       }
       await saveRepo(entry);
       res.status(200).send(JSON.stringify({ok: true}));
       return;
     }
     if (req.path === '/keys/invite/create' && req.method === 'POST') {
-      const entry = await ensureRepo(body.repo);
-      requireAdmin(req, entry);
+      const entry = await loadExistingRepo(body.repo);
+      if (!entry) throw Object.assign(new Error('repository not found'), {status: 404});
+      await requireAdmin(req, entry);
       const user = String(body.user || '').trim();
       const role = normalizeRole(body.role || 'read');
       if (!user) throw new Error('user is required');
@@ -856,6 +1464,16 @@ exports.broker = async (req, res) => {
       res.status(200).send(JSON.stringify({ok: true, code, accept_command: 'bgit admin accept-invite ' + code}));
       return;
     }
+    if (req.path === '/keys/invite/list' && req.method === 'POST') {
+      const entry = await loadExistingRepo(body.repo);
+      if (!entry) throw Object.assign(new Error('repository not found'), {status: 404});
+      await requireAdmin(req, entry);
+      entry.data.invites = (entry.data.invites || []).filter((invite) => Date.parse(invite.expires_at || '') > Date.now());
+      await saveRepo(entry);
+      const invites = (entry.data.invites || []).map((invite) => ({user: invite.user || '', role: invite.role || 'read', expires_at: invite.expires_at || ''}));
+      res.status(200).send(JSON.stringify({invites}));
+      return;
+    }
     if (req.path === '/keys/invite/accept' && req.method === 'POST') {
       const entry = await ensureRepo(body.repo);
       const signed = submittedSignedKey(req);
@@ -864,7 +1482,7 @@ exports.broker = async (req, res) => {
       const invites = entry.data.invites || [];
       const invite = invites.find((item) => item.token_hash === tokenHash && Date.parse(item.expires_at || '') > Date.now());
       if (!invite) throw Object.assign(new Error('invite is not pending or has expired'), {status: 404});
-      const existing = (entry.data.keys || []).find((item) => normalizeKey(item.public_key) === normalizeKey(signed.public_key));
+      const existing = assertUniqueRepoKey(entry, signed.public_key, invite.user);
       if (existing) {
         existing.user = invite.user;
         existing.role = invite.role;
@@ -880,8 +1498,9 @@ exports.broker = async (req, res) => {
       return;
     }
     if (req.path === '/keys/invite/cancel' && req.method === 'POST') {
-      const entry = await ensureRepo(body.repo);
-      requireAdmin(req, entry);
+      const entry = await loadExistingRepo(body.repo);
+      if (!entry) throw Object.assign(new Error('repository not found'), {status: 404});
+      await requireAdmin(req, entry);
       const invites = entry.data.invites || [];
       const user = String(body.user || '').trim().toLowerCase();
       const tokenHash = body.token ? ownershipTransferTokenHash(body.token) : '';
@@ -898,7 +1517,7 @@ exports.broker = async (req, res) => {
     }
     if ((req.path === '/keys/remove' || req.path === '/keys/suspend') && req.method === 'POST') {
       const entry = await ensureRepo(body.repo);
-      requireAdmin(req, entry);
+      await requireAdmin(req, entry);
       const key = String(body.key || '').trim();
       const match = (k) => keyMatches(k, key);
       if (entry.data.keys.some((k) => match(k) && k.role === 'owner')) throw Object.assign(new Error('owners cannot be removed or suspended'), {status: 403});
@@ -922,7 +1541,7 @@ exports.broker = async (req, res) => {
     }
     if (req.path === '/keys/unsuspend' && req.method === 'POST') {
       const entry = await ensureRepo(body.repo);
-      requireAdmin(req, entry);
+      await requireAdmin(req, entry);
       const key = String(body.key || '').trim();
       const match = (k) => keyMatches(k, key);
       let changed = false;
@@ -938,9 +1557,9 @@ exports.broker = async (req, res) => {
       return;
     }
     if (req.path === '/owners/transfer/confirm' && req.method === 'POST') {
-      const entry = await ensureRepo(body.repo);
-      const key = signedKey(req, entry);
-      if (!key || key.role !== 'owner') throw Object.assign(new Error('owner SSH signature required'), {status: 403});
+      const entry = await loadExistingRepo(body.repo);
+      if (!entry) throw Object.assign(new Error('repository not found'), {status: 404});
+      const key = await requireOwner(req, entry);
       if (entry.data.owner_transfer && !ownershipTransferExpired(entry.data.owner_transfer)) {
         throw Object.assign(new Error('ownership transfer already pending; run bgit admin cancel-ownership-transfer to cancel it'), {status: 409});
       }
@@ -961,9 +1580,9 @@ exports.broker = async (req, res) => {
       return;
     }
     if (req.path === '/owners/transfer/cancel' && req.method === 'POST') {
-      const entry = await ensureRepo(body.repo);
-      const key = signedKey(req, entry);
-      if (!key || key.role !== 'owner') throw Object.assign(new Error('owner SSH signature required'), {status: 403});
+      const entry = await loadExistingRepo(body.repo);
+      if (!entry) throw Object.assign(new Error('repository not found'), {status: 404});
+      const key = await requireOwner(req, entry);
       delete entry.data.owner_transfer;
       audit(entry, {type: 'owner_transfer_cancel', user: key.user || ''});
       await saveRepo(entry);
@@ -982,7 +1601,7 @@ exports.broker = async (req, res) => {
       for (const item of entry.data.keys || []) {
         if (item.role === 'owner' && keyFingerprint(item.public_key) === ownerFingerprint) item.role = 'admin';
       }
-      const existing = (entry.data.keys || []).find((item) => normalizeKey(item.public_key) === normalizeKey(accepted.public_key));
+      const existing = assertUniqueRepoKey(entry, accepted.public_key, user);
       if (existing) {
         existing.role = 'owner';
         existing.user = user;
@@ -999,13 +1618,13 @@ exports.broker = async (req, res) => {
     }
     if (req.path === '/protection/list' && req.method === 'POST') {
       const entry = await ensureRepo(body.repo);
-      requireAdmin(req, entry);
+      await requireAdmin(req, entry);
       res.status(200).send(JSON.stringify({protections: entry.data.protections || []}));
       return;
     }
     if (req.path === '/protection/upsert' && req.method === 'POST') {
       const entry = await ensureRepo(body.repo);
-      requireAdmin(req, entry);
+      await requireAdmin(req, entry);
       entry.data.protections = (entry.data.protections || []).filter((p) => p.ref !== body.ref);
       entry.data.protections.push({ref: body.ref, require_pr: body.require_pr !== false, allow_overrides: !!body.allow_overrides});
       audit(entry, {type: 'protection_upsert', ref: body.ref});
@@ -1015,7 +1634,7 @@ exports.broker = async (req, res) => {
     }
     if (req.path === '/protection/remove' && req.method === 'POST') {
       const entry = await ensureRepo(body.repo);
-      requireAdmin(req, entry);
+      await requireAdmin(req, entry);
       entry.data.protections = (entry.data.protections || []).filter((p) => p.ref !== body.ref);
       audit(entry, {type: 'protection_remove', ref: body.ref});
       await saveRepo(entry);
@@ -1024,7 +1643,7 @@ exports.broker = async (req, res) => {
     }
     if (req.path === '/issues/list' && req.method === 'POST') {
       const entry = await ensureRepo(body.repo);
-      requireRead(req, entry);
+      await requireRead(req, entry);
       if (entry.data.issues_enabled === false) throw Object.assign(new Error('issues are disabled'), {status: 403});
       const issues = await listIssues(entry);
       res.status(200).send(JSON.stringify({issues}));
@@ -1032,7 +1651,7 @@ exports.broker = async (req, res) => {
     }
     if (req.path === '/issues/view' && req.method === 'POST') {
       const entry = await ensureRepo(body.repo);
-      requireRead(req, entry);
+      await requireRead(req, entry);
       if (entry.data.issues_enabled === false) throw Object.assign(new Error('issues are disabled'), {status: 403});
       const issue = await loadIssue(entry, body.id);
       if (!issue) throw Object.assign(new Error('issue not found'), {status: 404});
@@ -1042,7 +1661,7 @@ exports.broker = async (req, res) => {
     if (req.path === '/issues/create' && req.method === 'POST') {
       const entry = await ensureRepo(body.repo);
       if (entry.data.issues_enabled === false) throw Object.assign(new Error('issues are disabled'), {status: 403});
-      const key = requireIssueCreate(req, entry);
+      const key = await requireIssueCreate(req, entry);
       const title = String(body.title || '').trim();
       const issueBody = String(body.body || '').trim();
       if (!title) throw new Error('issue title is required');
@@ -1055,7 +1674,7 @@ exports.broker = async (req, res) => {
     if (req.path === '/issues/comment' && req.method === 'POST') {
       const entry = await ensureRepo(body.repo);
       if (entry.data.issues_enabled === false) throw Object.assign(new Error('issues are disabled'), {status: 403});
-      const key = requireIssueCreate(req, entry);
+      const key = await requireIssueCreate(req, entry);
       const issue = await loadIssue(entry, body.id);
       if (!issue) throw Object.assign(new Error('issue not found'), {status: 404});
       const comment = String(body.comment || '').trim();
@@ -1069,7 +1688,7 @@ exports.broker = async (req, res) => {
     }
     if (req.path === '/issues/close' || req.path === '/issues/reopen') {
       const entry = await ensureRepo(body.repo);
-      requireWrite(req, entry);
+      await requireWrite(req, entry);
       const issue = await loadIssue(entry, body.id);
       if (!issue) throw Object.assign(new Error('issue not found'), {status: 404});
       issue.status = req.path === '/issues/reopen' ? 'open' : 'closed';
@@ -1080,7 +1699,7 @@ exports.broker = async (req, res) => {
     }
     if (req.path === '/prs/create' && req.method === 'POST') {
       const entry = await ensureRepo(body.repo);
-      const key = requireWrite(req, entry);
+      const key = await requireWrite(req, entry);
       entry.data.refs = entry.data.refs || {};
       const pr = {...(body.pr || {})};
       pr.id = nextPRID(entry.data);
@@ -1098,19 +1717,19 @@ exports.broker = async (req, res) => {
     }
     if (req.path === '/prs/list' && req.method === 'POST') {
       const entry = await ensureRepo(body.repo);
-      requireRead(req, entry);
+      await requireRead(req, entry);
       res.status(200).send(JSON.stringify({prs: await listPRs(entry)}));
       return;
     }
     if (req.path === '/prs/sync' && req.method === 'POST') {
       const entry = await ensureRepo(body.repo);
-      requireRead(req, entry);
+      await requireRead(req, entry);
       res.status(200).send(JSON.stringify(await syncPRRecords(entry, body.known || {})));
       return;
     }
     if (req.path === '/prs/view' && req.method === 'POST') {
       const entry = await ensureRepo(body.repo);
-      requireRead(req, entry);
+      await requireRead(req, entry);
       const pr = await loadPR(entry, body.id);
       if (!pr) throw Object.assign(new Error('pull request not found'), {status: 404});
       res.status(200).send(JSON.stringify({pr}));
@@ -1118,7 +1737,7 @@ exports.broker = async (req, res) => {
     }
     if (req.path === '/prs/close' && req.method === 'POST') {
       const entry = await ensureRepo(body.repo);
-      const key = requireWrite(req, entry);
+      const key = await requireWrite(req, entry);
       const pr = await loadPR(entry, body.id);
       if (!pr) throw Object.assign(new Error('pull request not found'), {status: 404});
       pr.status = 'closed';
@@ -1133,7 +1752,7 @@ exports.broker = async (req, res) => {
     }
     if (req.path === '/prs/reopen' && req.method === 'POST') {
       const entry = await ensureRepo(body.repo);
-      const key = requireWrite(req, entry);
+      const key = await requireWrite(req, entry);
       const pr = await loadPR(entry, body.id);
       if (!pr) throw Object.assign(new Error('pull request not found'), {status: 404});
       pr.status = 'open';
@@ -1149,7 +1768,7 @@ exports.broker = async (req, res) => {
     if (req.path === '/prs/comment' && req.method === 'POST') {
       const entry = await ensureRepo(body.repo);
       if (repoIsReadOnly(entry)) throw Object.assign(new Error('repository is read-only'), {status: 403});
-      const key = requireRead(req, entry);
+      const key = await requireRead(req, entry);
       const pr = await loadPR(entry, body.id);
       if (!pr) throw Object.assign(new Error('pull request not found'), {status: 404});
       const comment = String(body.comment || '').trim();
@@ -1166,7 +1785,7 @@ exports.broker = async (req, res) => {
     if (req.path === '/prs/reply' && req.method === 'POST') {
       const entry = await ensureRepo(body.repo);
       if (repoIsReadOnly(entry)) throw Object.assign(new Error('repository is read-only'), {status: 403});
-      const key = requireRead(req, entry);
+      const key = await requireRead(req, entry);
       const pr = await loadPR(entry, body.id);
       if (!pr) throw Object.assign(new Error('pull request not found'), {status: 404});
       const comment = String(body.comment || '').trim();
@@ -1184,7 +1803,7 @@ exports.broker = async (req, res) => {
     }
     if (req.path === '/prs/review' && req.method === 'POST') {
       const entry = await ensureRepo(body.repo);
-      const key = requireWrite(req, entry);
+      const key = await requireWrite(req, entry);
       const pr = await loadPR(entry, body.id);
       if (!pr) throw Object.assign(new Error('pull request not found'), {status: 404});
       const state = String(body.review || '').trim();
@@ -1203,7 +1822,7 @@ exports.broker = async (req, res) => {
     if (req.path === '/prs/merge' && req.method === 'POST') {
       const entry = await ensureRepo(body.repo);
       if (repoIsReadOnly(entry)) throw Object.assign(new Error('repository is read-only'), {status: 403});
-      const key = signedKey(req, entry);
+      const key = await effectiveSignedKey(req, entry);
       if (!key || !roleAllows(key.role, 'merge')) throw Object.assign(new Error('merge SSH signature required'), {status: 403});
       const pr = await loadPR(entry, body.id);
       if (!pr) throw Object.assign(new Error('pull request not found'), {status: 404});
@@ -1232,7 +1851,7 @@ exports.broker = async (req, res) => {
     }
     if (req.path === '/auth/check' && req.method === 'POST') {
       const entry = await ensureRepo(body.repo);
-      const key = signedKey(req, entry);
+      const key = await effectiveSignedKey(req, entry);
       const operation = body.operation || '';
       const allowed = (operation === 'read' && repoIsPublic(entry)) || (!!key && roleAllows(key.role, operation));
       res.status(200).send(JSON.stringify({allowed, user: key && key.user || (allowed ? 'anonymous' : ''), role: key && key.role || (allowed ? 'read' : '')}));
@@ -1240,15 +1859,25 @@ exports.broker = async (req, res) => {
     }
     if (req.path === '/auth/status' && req.method === 'POST') {
       const entry = await ensureRepo(body.repo);
-      const key = signedKey(req, entry) || (repoIsPublic(entry) ? anonymousKey() : null);
+      let key = await effectiveSignedKey(req, entry) || (repoIsPublic(entry) ? anonymousKey() : null);
+      const brokerAdmin = await requireBrokerAdmin(req).catch(() => null);
+      if (!key && brokerAdmin) {
+        key = {user: brokerAdmin.user || '', role: '', broker_role: brokerAdmin.broker_role || 'admin', public_key: brokerAdmin.public_key || '', source: 'broker-admin'};
+      }
       if (!key) throw Object.assign(new Error('SSH signature required'), {status: 403});
+      const capabilities = roleCapabilities(key.role || '');
+      if (brokerAdmin) {
+        capabilities.admin_keys = true;
+        capabilities.manage_protection = true;
+        capabilities.broker_upgrade = true;
+      }
       res.status(200).send(JSON.stringify({
         broker_version: brokerVersion,
         repo: entry.data.repo || body.repo,
         identity: {user: key.user || '', source: key.source || '', key_fingerprint: key.public_key ? keyFingerprint(key.public_key) : '', public_key: key.public_key || ''},
         user: key.user || '',
         role: key.role || '',
-        capabilities: roleCapabilities(key.role || ''),
+        capabilities,
         resolved_at: new Date().toISOString(),
       }));
       return;
@@ -1269,7 +1898,7 @@ exports.broker = async (req, res) => {
     if (req.path === '/members/reindex' && req.method === 'POST') {
       if (body.repo && (body.repo.logical || body.repo.bucket || body.repo.prefix)) {
         const entry = await ensureRepo(body.repo);
-        requireAdmin(req, entry);
+        await requireAdmin(req, entry);
         await syncMembershipIndex(entry);
         res.status(200).send(JSON.stringify({ok: true, repositories: 1}));
         return;
@@ -1283,7 +1912,7 @@ exports.broker = async (req, res) => {
     if (req.path === '/objects/capability' && req.method === 'POST') {
       const entry = await ensureRepo(body.repo);
       const operation = body.operation || 'read';
-      const key = operation === 'read' ? requireRead(req, entry) : requireWrite(req, entry);
+      const key = operation === 'read' ? await requireRead(req, entry) : await requireWrite(req, entry);
       const repo = await ensurePhysicalRepo(entry);
       const capability = body.resumable ? await resumableUpload(repo, body.path) : await signedURL(repo, body.path, operation);
       audit(entry, {type: 'capability_issued', operation, path: body.path, user: key.user, role: key.role});
@@ -1293,7 +1922,7 @@ exports.broker = async (req, res) => {
     }
     if (req.path === '/objects/read' && req.method === 'POST') {
       const entry = await ensureRepo(body.repo);
-      requireRead(req, entry);
+      await requireRead(req, entry);
       const repo = await ensurePhysicalRepo(entry);
       const data = await readObject(repo, body.path);
       res.status(200).send(JSON.stringify({data}));
@@ -1301,7 +1930,7 @@ exports.broker = async (req, res) => {
     }
     if (req.path === '/objects/list' && req.method === 'POST') {
       const entry = await ensureRepo(body.repo);
-      requireRead(req, entry);
+      await requireRead(req, entry);
       const repo = await ensurePhysicalRepo(entry);
       const paths = await listObjects(repo, body.prefix);
       res.status(200).send(JSON.stringify({paths}));
@@ -1309,7 +1938,7 @@ exports.broker = async (req, res) => {
     }
     if (req.path === '/refs/update' && req.method === 'POST') {
       const entry = await ensureRepo(body.repo);
-      const key = requireWrite(req, entry);
+      const key = await requireWrite(req, entry);
       await updateRefCAS(body.repo, body.ref, body.old, body.new, key, {override: !!body.override});
       res.status(200).send(JSON.stringify({ok: true}));
       return;

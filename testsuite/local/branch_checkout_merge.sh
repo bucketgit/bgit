@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 source "$(dirname "$0")/../lib/testlib.sh"
-dir="$(new_workdir local branch)"
-"$BGIT" init --noninteractive --repo local-branch "$dir" --profile "$GCP_PROFILE" >/dev/null
-init_local_git_identity "$dir"
+init_output="$(init_bgit_repo gcp local-branch)"
+dir="$(printf "%s\n" "$init_output" | sed -n "1p")"
 commit_file "$dir" README.md base "base"
 run_in "$dir" checkout -b feature >/dev/null
 commit_file "$dir" feature.txt feature "feature"

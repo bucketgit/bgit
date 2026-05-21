@@ -66,9 +66,10 @@ bgit setup
 owner SSH keys, deploys or updates the broker, and writes global configuration to
 `~/.bgit/config.yaml`.
 
-Create a new repository:
+Create a broker repository, then attach a local checkout:
 
 ```bash
+bgit admin repo create --team core demo
 mkdir demo
 cd demo
 bgit init
@@ -82,7 +83,15 @@ bgit push
 Clone an existing broker-backed repository:
 
 ```bash
-bgit clone https://broker.example.com/team/demo.git ./demo
+bgit clone https://broker.example.com/demo.git ./demo
+```
+
+Flat clone URLs use the broker's default `core` team. The explicit form is also
+accepted:
+
+```bash
+bgit clone https://broker.example.com/core/demo.git ./demo
+bgit clone https://broker.example.com/core/demo/demo.git ./demo
 ```
 
 Inside an initialized checkout, normal Git commands also work for fetch and push
@@ -93,6 +102,30 @@ git fetch
 git push
 ```
 
+## Custom Domains
+
+BucketGit can discover brokers from DNS TXT records, so users can clone from a
+clean domain instead of a generated Cloud Run or Lambda Function URL.
+
+For `https://git.example.com/...`, publish records at `_bgit.git.example.com`.
+Discovery is exact-FQDN based; BucketGit does not fall back from
+`git.example.com` to `example.com`.
+
+```text
+v=bgit1 broker=https://broker.example.com team=t_abcd1234 name=platform
+```
+
+The `name` is the public path segment users type. The `team` value is the
+opaque broker team identifier. With the record above, both forms work:
+
+```bash
+bgit clone https://git.example.com/platform/demo.git ./demo
+bgit clone https://git.example.com/platform/demo/demo.git ./demo
+```
+
+BucketGit skips TXT discovery for direct broker URLs such as Cloud Run and AWS
+Lambda Function URLs.
+
 ## Common Commands
 
 ```bash
@@ -100,9 +133,10 @@ bgit setup
 bgit setup profile create --provider gcp work
 bgit setup profile create --provider aws work
 
+bgit admin repo create --team core demo
 bgit init
-bgit init --noninteractive --repo team/demo --profile work.europe-west1
-bgit clone https://broker.example.com/team/demo.git ./demo
+bgit init --noninteractive --repo demo --profile work.europe-west1 --team core
+bgit clone https://broker.example.com/demo.git ./demo
 bgit web
 
 bgit status
@@ -131,6 +165,9 @@ bgit issue view 1
 
 bgit whoami
 bgit repos mine
+
+bgit admin repo list
+bgit admin repo info
 ```
 
 ## Setup And Profiles
@@ -142,7 +179,8 @@ multiple regions.
 Examples:
 
 ```bash
-bgit init --noninteractive --repo app --profile work.europe-west1
+bgit admin repo create --team core app
+bgit init --noninteractive --repo app --profile work.europe-west1 --team core
 bgit push --profile work --region europe-west1
 ```
 
@@ -167,6 +205,10 @@ bgit setup profile create --provider aws work
 
 GCP setup uses `gcloud` configurations. AWS setup reads AWS config/credentials
 files and can use the AWS CLI when profile creation is requested.
+
+`bgit setup` seeds a default `core` team. Repositories are created explicitly
+with `bgit admin repo create` or through the setup broker-management UI; `bgit
+init` attaches a local checkout to an existing broker repository.
 
 ## Identity
 
@@ -195,27 +237,51 @@ an SSH signature.
 Useful admin commands:
 
 ```bash
+bgit admin repo list
+bgit admin repo info
+bgit admin repo create --team platform app
+
 bgit admin keys list
 bgit admin keys add --user ada --role developer --key ~/.ssh/ada.pub
 bgit admin keys import-github octocat --role triage
 bgit admin keys suspend KEY_OR_FINGERPRINT
 bgit admin keys remove KEY_OR_FINGERPRINT
 
-bgit admin invite-user --broker https://broker.example.com --user ada --role developer team/demo.git
+bgit admin invite-user --broker https://broker.example.com --user ada --role developer demo.git
 bgit admin accept-invite CODE
-bgit admin cancel-invite --broker https://broker.example.com --user ada team/demo.git
+bgit admin cancel-invite --broker https://broker.example.com --user ada demo.git
 
-bgit admin confirm-ownership-transfer --broker https://broker.example.com team/demo.git
+bgit admin invite-broker-user --broker https://broker.example.com --user ada --role user
+bgit admin accept-broker-invite CODE
+bgit admin cancel-broker-invite --broker https://broker.example.com --user ada
+
+bgit admin confirm-ownership-transfer --broker https://broker.example.com demo.git
 bgit admin accept-ownership-transfer CODE
-bgit admin cancel-ownership-transfer --broker https://broker.example.com team/demo.git
+bgit admin cancel-ownership-transfer --broker https://broker.example.com demo.git
 
 bgit admin protect add main
 bgit admin protect list
 bgit admin protect remove main
+
+bgit admin broker-users list
+bgit admin broker-users upsert ada --role user --key ~/.ssh/ada.pub
+bgit admin broker-users upsert ada --role user --suspended true
+bgit admin broker-users delete ada
+
+bgit admin teams create platform
+bgit admin teams delete TEAM_ID
+bgit admin teams member add TEAM_ID ada --role developer
+bgit admin teams member remove TEAM_ID ada
+bgit admin teams repo list
+bgit admin teams repo add TEAM_ID developer
+bgit admin teams repo remove TEAM_ID
 ```
 
 A repo can have at most one active pending invite per username. Invite
-cancellation is repo-scoped.
+cancellation is repo-scoped. Broker logical repository names are flat, such as
+`demo.git`; path-shaped clone URLs route through teams. Flat broker clone URLs
+use the default `core` team, while `bgit init` prompts for a team or requires
+`--team` in noninteractive mode.
 
 ## Repository Settings
 
@@ -289,7 +355,7 @@ The web assets are embedded into the `bgit` binary at build time.
 `bgit init` writes a Git remote like:
 
 ```text
-git@git.bucketgit.com:team/demo.git
+git@git.bucketgit.com:demo.git
 ```
 
 and configures:

@@ -512,7 +512,7 @@ h2 {
 }
 .repo-toolbar {
   position: relative;
-  z-index: 0;
+  z-index: 40;
   display: grid;
   grid-template-columns: minmax(0, auto) minmax(260px, 1fr);
   align-items: center;
@@ -608,6 +608,7 @@ h2 {
 }
 .code-menu {
   position: relative;
+  z-index: 70;
   flex: 0 0 auto;
 }
 .code-menu-button {
@@ -629,7 +630,7 @@ h2 {
   position: absolute;
   right: 0;
   top: calc(100% + 6px);
-  z-index: 20;
+  z-index: 80;
   width: min(440px, calc(100vw - 32px));
   border: 1px solid var(--border);
   border-radius: 8px;
@@ -1917,6 +1918,12 @@ h2 {
 .settings-section {
   padding: 16px;
   border-bottom: 1px solid var(--repo-border);
+}
+.settings-loading p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.45;
 }
 .settings-section:last-child {
   border-bottom: 0;

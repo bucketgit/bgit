@@ -85,13 +85,22 @@ init_local_git_identity() {
 }
 
 init_bgit_repo() {
+  local init_output dir
+  init_output="$(init_bgit_repo_no_owner_access "$@")"
+  dir="$(printf "%s\n" "$init_output" | sed -n "1p")"
+  add_key_to_repo "$dir" owner admin owner
+  printf '%s' "$init_output"
+}
+
+init_bgit_repo_no_owner_access() {
   local provider="$1"
   local suffix="$2"
   local profile repo dir
   profile="$(provider_profile "$provider")"
   repo="$(new_repo_name "$provider" "$suffix")"
   dir="$(new_workdir "$provider" "$suffix")"
-  expect_success "$BGIT" init --noninteractive --repo "$repo" --profile "$profile" "${CONFIG_ARGS[@]}" "$dir" >/dev/null
+  expect_success "$BGIT" --profile "$profile" admin repo create --team core "$repo" >/dev/null
+  expect_success "$BGIT" init --noninteractive --repo "$repo" --profile "$profile" --team core "${CONFIG_ARGS[@]}" "$dir" >/dev/null
   init_local_git_identity "$dir"
   printf '%s\n%s\n' "$dir" "$repo.git"
 }

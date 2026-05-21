@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 source "$(dirname "$0")/../lib/testlib.sh"
-dir="$(new_workdir local porcelain)"
-"$BGIT" init --noninteractive --repo local-porcelain "$dir" --profile "$GCP_PROFILE" >/dev/null
-init_local_git_identity "$dir"
+init_output="$(init_bgit_repo gcp local-porcelain)"
+dir="$(printf "%s\n" "$init_output" | sed -n "1p")"
 commit_file "$dir" README.md "alpha" "initial"
 run_in "$dir" tag v1 >/dev/null
 assert_contains "$(run_in "$dir" tag)" "v1"

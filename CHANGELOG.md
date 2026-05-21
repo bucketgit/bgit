@@ -4,6 +4,12 @@ All notable changes to `bgit` are documented in this file.
 
 This project follows semantic versioning.
 
+## 1.1.1
+
+Fixed
+
+- Assets reloading bugfix in bgit web
+
 ## 1.1.0
 
 Changed

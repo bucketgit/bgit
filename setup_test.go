@@ -786,8 +786,8 @@ func TestEnsureGcloudSetupProjectAccessRunsLoginOnUserProjectDenied(t *testing.T
 	bin := t.TempDir()
 	authMarker := filepath.Join(t.TempDir(), "authed")
 	writeFakeCLI(t, bin, "gcloud", []fakeCLIAction{
-		{match: "config get-value project", stdout: "hurozo"},
-		{match: "projects describe hurozo", stdout: "hurozo", missingStdout: "ERROR: USER_PROJECT_DENIED Caller does not have required permission", requireFile: authMarker, exitCode: 1},
+		{match: "config get-value project", stdout: "example-project"},
+		{match: "projects describe example-project", stdout: "example-project", missingStdout: "ERROR: USER_PROJECT_DENIED Caller does not have required permission", requireFile: authMarker, exitCode: 1},
 		{match: "auth login --configuration default --no-launch-browser", stdout: "https://example.test/oauth", touch: authMarker},
 	})
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
@@ -806,10 +806,10 @@ func TestEnsureGcloudSetupProjectAccessRepairsQuotaProject(t *testing.T) {
 	bin := t.TempDir()
 	quotaMarker := filepath.Join(t.TempDir(), "quota")
 	writeFakeCLI(t, bin, "gcloud", []fakeCLIAction{
-		{match: "config get-value project", stdout: "hurozo"},
-		{match: "projects describe hurozo", stdout: "hurozo", missingStdout: "ERROR: USER_PROJECT_DENIED Caller does not have required permission to use project aafje-490407", requireFile: quotaMarker, exitCode: 1},
-		{match: "config get-value billing/quota_project", stdout: "aafje-490407"},
-		{match: "config set billing/quota_project hurozo", touch: quotaMarker},
+		{match: "config get-value project", stdout: "example-project"},
+		{match: "projects describe example-project", stdout: "example-project", missingStdout: "ERROR: USER_PROJECT_DENIED Caller does not have required permission to use project quota-project-123", requireFile: quotaMarker, exitCode: 1},
+		{match: "config get-value billing/quota_project", stdout: "quota-project-123"},
+		{match: "config set billing/quota_project example-project", touch: quotaMarker},
 	})
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
 	var stdout bytes.Buffer
@@ -817,8 +817,8 @@ func TestEnsureGcloudSetupProjectAccessRepairsQuotaProject(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(stdout.String(), "uses quota project aafje-490407") ||
-		!strings.Contains(stdout.String(), "Set quota project to hurozo now?") {
+	if !strings.Contains(stdout.String(), "uses quota project quota-project-123") ||
+		!strings.Contains(stdout.String(), "Set quota project to example-project now?") {
 		t.Fatalf("stdout = %q", stdout.String())
 	}
 }
@@ -828,10 +828,10 @@ func TestEnsureGcloudSetupProjectAccessSelectsExistingProjectWhenUnset(t *testin
 	writeFakeCLI(t, bin, "gcloud", []fakeCLIAction{
 		{match: "config get-value project"},
 		{match: "config get-value account", stdout: "dennis@example.com"},
-		{match: "projects list", stdout: "hurozo Hurozo"},
-		{match: "config set project hurozo"},
-		{match: "config set billing/quota_project hurozo"},
-		{match: "projects describe hurozo", stdout: "hurozo"},
+		{match: "projects list", stdout: "example-project Example Project"},
+		{match: "config set project example-project"},
+		{match: "config set billing/quota_project example-project"},
+		{match: "projects describe example-project", stdout: "example-project"},
 	})
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
 	var stdout bytes.Buffer
@@ -840,7 +840,7 @@ func TestEnsureGcloudSetupProjectAccessSelectsExistingProjectWhenUnset(t *testin
 		t.Fatal(err)
 	}
 	if !strings.Contains(stdout.String(), "has no project configured") ||
-		!strings.Contains(stdout.String(), "1. hurozo - Hurozo") {
+		!strings.Contains(stdout.String(), "1. example-project - Example Project") {
 		t.Fatalf("stdout = %q", stdout.String())
 	}
 }
@@ -944,7 +944,7 @@ func TestEnsureGcloudSetupBillingLinksSelectedAccount(t *testing.T) {
 	billingMarker := filepath.Join(t.TempDir(), "billing")
 	writeFakeCLI(t, bin, "gcloud", []fakeCLIAction{
 		{match: "billing projects describe bgittest", stdout: "True", missingStdout: "False", requireFile: billingMarker, exitCode: 1},
-		{match: "billing accounts list", stdout: "billingAccounts/123 Hurozo Billing true"},
+		{match: "billing accounts list", stdout: "billingAccounts/123 Example Project Billing true"},
 		{match: "billing projects link bgittest --billing-account billingAccounts/123", touch: billingMarker},
 	})
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
@@ -968,7 +968,7 @@ func TestEnsureGcloudSetupBillingEnablesCloudBillingAPI(t *testing.T) {
 		{match: "billing projects describe bgittest --configuration dennis --quiet --format=value(billingEnabled)", stdout: "False", missingStdout: "ERROR: SERVICE_DISABLED Cloud Billing API has not been used in project bgittest before or it is disabled.", requireFile: apiMarker, exitCode: 1},
 		{match: "services enable cloudbilling.googleapis.com --project bgittest", touch: apiMarker},
 		{match: "services list --enabled --project=bgittest", stdout: "cloudbilling.googleapis.com"},
-		{match: "billing accounts list --configuration dennis --quiet", stdout: "billingAccounts/123 Hurozo Billing true"},
+		{match: "billing accounts list --configuration dennis --quiet", stdout: "billingAccounts/123 Example Project Billing true"},
 		{match: "billing projects link bgittest --billing-account billingAccounts/123", touch: billingMarker},
 	})
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))

@@ -21,7 +21,7 @@ import (
 
 const defaultBranch = "main"
 const defaultAuthMode = "gcloud"
-const brokerVersion = "1.0.1-dev"
+const brokerVersion = "1.1.0"
 
 var version = "dev"
 

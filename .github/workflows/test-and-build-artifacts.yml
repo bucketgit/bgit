@@ -31,6 +31,12 @@ on:
       - ".github/workflows/test-and-build-artifacts.yml"
       - ".github/workflows/test.yml"
   workflow_dispatch:
+    inputs:
+      speed_lane:
+        description: "Skip tests and integration; build and publish only"
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -42,7 +48,7 @@ concurrency:
 jobs:
   unit:
     name: Unit Tests (${{ matrix.os }})
-    if: github.ref == 'refs/heads/develop' || github.event_name == 'workflow_dispatch'
+    if: (github.ref == 'refs/heads/develop' || github.event_name == 'workflow_dispatch') && !(github.event_name == 'push' && contains(github.event.head_commit.message || '', '[speed-lane]')) && !(github.event_name == 'workflow_dispatch' && github.event.inputs.speed_lane == 'true')
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15
     permissions:
@@ -73,7 +79,7 @@ jobs:
     name: Build Multiarchitecture Artifacts
     needs:
       - unit
-    if: always() && (github.ref == 'refs/heads/main' || (github.event_name == 'pull_request' && github.base_ref == 'main' && github.head_ref == 'develop' && github.event.pull_request.head.repo.full_name == github.repository) || needs.unit.result == 'success')
+    if: always() && (github.ref == 'refs/heads/main' || (github.event_name == 'pull_request' && github.base_ref == 'main' && github.head_ref == 'develop' && github.event.pull_request.head.repo.full_name == github.repository) || needs.unit.result == 'success' || (github.event_name == 'push' && contains(github.event.head_commit.message || '', '[speed-lane]')) || (github.event_name == 'workflow_dispatch' && github.event.inputs.speed_lane == 'true'))
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     permissions:
@@ -211,7 +217,7 @@ jobs:
     name: Integration Tests (${{ matrix.os }})
     needs:
       - build
-    if: github.ref == 'refs/heads/develop' || github.event_name == 'workflow_dispatch'
+    if: (github.ref == 'refs/heads/develop' || github.event_name == 'workflow_dispatch') && !(github.event_name == 'push' && contains(github.event.head_commit.message || '', '[speed-lane]')) && !(github.event_name == 'workflow_dispatch' && github.event.inputs.speed_lane == 'true')
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     permissions:
@@ -298,7 +304,7 @@ jobs:
       - build
       - integration
     runs-on: ubuntu-24.04
-    if: always() && github.event_name == 'push' && ((github.ref == 'refs/heads/main' && needs.build.result == 'success') || (github.ref == 'refs/heads/develop' && needs.integration.result == 'success'))
+    if: always() && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && ((github.ref == 'refs/heads/main' && needs.build.result == 'success') || (github.ref == 'refs/heads/develop' && (needs.integration.result == 'success' || ((((github.event_name == 'push' && contains(github.event.head_commit.message || '', '[speed-lane]')) || (github.event_name == 'workflow_dispatch' && github.event.inputs.speed_lane == 'true')) && needs.build.result == 'success')))))
     timeout-minutes: 15
     permissions:
       contents: write

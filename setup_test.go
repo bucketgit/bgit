@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -155,6 +156,210 @@ func TestConfiguredSetupProfilesExpandConfiguredRegions(t *testing.T) {
 	}
 	if got[1].Name != "work" || got[1].Region != "europe-west1" || !got[1].Existing {
 		t.Fatalf("second profile = %#v", got[1])
+	}
+}
+
+func TestConfiguredSetupBrokersSortedAndDetected(t *testing.T) {
+	cfg := globalConfig{
+		GCPProfiles: []globalGCPProfile{{
+			Name:      "work",
+			ProjectID: "project-123",
+			Regions: []globalProfileRegion{{
+				Name:      "europe-west1",
+				BrokerURL: "https://gcp.example.test",
+			}},
+		}},
+		AWSProfiles: []globalAWSProfile{{
+			Name:      "prod",
+			AccountID: "123456789012",
+			Regions: []globalProfileRegion{{
+				Name:      "us-east-1",
+				BrokerURL: "https://aws.example.test",
+			}},
+		}},
+	}
+	got := configuredSetupBrokers(cfg)
+	if len(got) != 2 {
+		t.Fatalf("brokers = %#v", got)
+	}
+	if got[0].Provider != "s3" || got[0].Profile != "prod" || got[1].Provider != "gcs" || got[1].Profile != "work" {
+		t.Fatalf("unexpected broker order = %#v", got)
+	}
+	if !configuredSetupBrokerExists(cfg, "gcp", "work", "europe-west1") {
+		t.Fatalf("configured broker not detected")
+	}
+	if configuredSetupBrokerExists(cfg, "gcp", "work", "us-central1") {
+		t.Fatalf("unconfigured region detected")
+	}
+}
+
+func TestSetupBrokerHomeSelectsExistingBroker(t *testing.T) {
+	var stdout bytes.Buffer
+	action, broker, err := runSetupBrokerHomeWithRaw(bufio.NewReader(strings.NewReader(" ")), strings.NewReader(" "), &stdout, []setupConfiguredBroker{{
+		Provider:  "gcs",
+		Profile:   "work",
+		Region:    "europe-west1",
+		BrokerURL: "https://broker.example.test",
+		Detail:    "project-123",
+	}}, []string{"gcs"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if action != "broker" || broker.Profile != "work" || broker.Region != "europe-west1" {
+		t.Fatalf("action=%q broker=%#v", action, broker)
+	}
+	if !strings.Contains(stdout.String(), "Broker setups") || !strings.Contains(stdout.String(), "gcp:work.europe-west1") {
+		t.Fatalf("stdout = %q", stdout.String())
+	}
+}
+
+func TestSetupBrokerActionSelectsUpdate(t *testing.T) {
+	var stdout bytes.Buffer
+	action, err := runSetupBrokerActionWithRaw(bufio.NewReader(strings.NewReader("\x1b[B ")), strings.NewReader("\x1b[B "), &stdout, setupConfiguredBroker{
+		Provider:  "s3",
+		Profile:   "prod",
+		Region:    "us-east-1",
+		BrokerURL: "https://broker.example.test",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if action != "update" {
+		t.Fatalf("action = %q", action)
+	}
+	if !strings.Contains(stdout.String(), "update broker") {
+		t.Fatalf("stdout = %q", stdout.String())
+	}
+}
+
+func TestSetupBrokerActionLeftReturnsToBrokerList(t *testing.T) {
+	var stdout bytes.Buffer
+	action, err := runSetupBrokerActionWithRaw(bufio.NewReader(strings.NewReader("\x1b[D")), strings.NewReader("\x1b[D"), &stdout, setupConfiguredBroker{
+		Provider:  "gcs",
+		Profile:   "work",
+		Region:    "us-central1",
+		BrokerURL: "https://broker.example.test",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if action != "back" {
+		t.Fatalf("action = %q", action)
+	}
+}
+
+func TestSetupSelectRoleChoosesFromDropdown(t *testing.T) {
+	var stdout bytes.Buffer
+	got, ok, err := runSetupSelectWithRaw(bufio.NewReader(strings.NewReader("\x1b[B ")), strings.NewReader("\x1b[B "), &stdout, "Role", setupBrokerUserRoleChoices(), "user")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || got != "admin" {
+		t.Fatalf("ok=%v role=%q", ok, got)
+	}
+	if !strings.Contains(stdout.String(), "Role") || !strings.Contains(stdout.String(), "admin") {
+		t.Fatalf("stdout = %q", stdout.String())
+	}
+}
+
+func TestSetupBrokerManageLabelsAreUserFacing(t *testing.T) {
+	rendered := renderSetupBrokerManageWithStyle(setupBrokerManageState{Broker: setupConfiguredBroker{
+		Provider:  "gcs",
+		Profile:   "work",
+		Region:    "us-central1",
+		BrokerURL: "https://broker.example.test",
+	}}, false)
+	for _, want := range []string{"manage broker users", "team management"} {
+		if !strings.Contains(rendered, want) {
+			t.Fatalf("manage dialog missing %q:\n%s", want, rendered)
+		}
+	}
+	for _, reject := range []string{"upsert broker user", "list broker users", "create user invite", "grant team repo", "remove team repo"} {
+		if strings.Contains(rendered, reject) {
+			t.Fatalf("manage dialog contains technical label %q:\n%s", reject, rendered)
+		}
+	}
+	for _, reject := range []string{"transfer owner", "cancel owner transfer"} {
+		if strings.Contains(rendered, reject) {
+			t.Fatalf("owner transfer should live under broker users, found %q:\n%s", reject, rendered)
+		}
+	}
+}
+
+func TestSetupManagedTeamEscapeReturnsToPreviousMenu(t *testing.T) {
+	var stdout bytes.Buffer
+	msg, err := runSetupManagedTeamWithRaw(config{}, "core", "core", bufio.NewReader(strings.NewReader("\x1b")), strings.NewReader("\x1b"), &stdout)
+	if !errors.Is(err, errSetupBack) {
+		t.Fatalf("err = %v, want errSetupBack", err)
+	}
+	if msg != "" {
+		t.Fatalf("msg = %q", msg)
+	}
+	if !strings.Contains(stdout.String(), "Manage team") {
+		t.Fatalf("stdout = %q", stdout.String())
+	}
+}
+
+func TestSetupFormatsTeamTablesWithHeaders(t *testing.T) {
+	members := setupFormatTeamMembers(brokerTeamInfo{
+		Name: "core",
+		Members: []brokerTeamMember{{
+			Username: "owner",
+			Role:     "admin",
+		}},
+	})
+	if !strings.Contains(members, "User") || !strings.Contains(members, "Team role cap") || strings.Contains(members, "\tmax") {
+		t.Fatalf("members table = %q", members)
+	}
+	repos := setupFormatTeamRepositoriesForChoices([]setupChoice{{
+		Label: "demo",
+		Help:  "role cap developer",
+	}})
+	if !strings.Contains(repos, "Repository") || !strings.Contains(repos, "Role cap") || strings.Contains(repos, "\tcap") {
+		t.Fatalf("repos table = %q", repos)
+	}
+}
+
+func TestSetupSelectLeftAndRightArrows(t *testing.T) {
+	var stdout bytes.Buffer
+	got, ok, err := runSetupSelectWithRaw(bufio.NewReader(strings.NewReader("\x1b[C")), strings.NewReader("\x1b[C"), &stdout, "Role", setupBrokerUserRoleChoices(), "user")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || got != "user" {
+		t.Fatalf("right arrow ok=%v got=%q", ok, got)
+	}
+	stdout.Reset()
+	got, ok, err = runSetupSelectWithRaw(bufio.NewReader(strings.NewReader("\x1b[D")), strings.NewReader("\x1b[D"), &stdout, "Role", setupBrokerUserRoleChoices(), "user")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok || got != "" {
+		t.Fatalf("left arrow ok=%v got=%q", ok, got)
+	}
+}
+
+func TestSetupPendingUserNoteOnlyWhenPendingAndOutsideFrame(t *testing.T) {
+	withoutPending := renderSetupSelectWithStyle(setupSelectState{
+		Title: "Username",
+		Choices: []setupChoice{
+			{Label: "alice", Value: "alice"},
+		},
+	}, false)
+	if strings.Contains(withoutPending, "pending invite") {
+		t.Fatalf("unexpected pending note:\n%s", withoutPending)
+	}
+	withPending := renderSetupSelectWithStyle(setupSelectState{
+		Title: "Username",
+		Choices: []setupChoice{
+			{Label: "alice *", Value: "alice"},
+		},
+	}, false)
+	if !strings.Contains(withPending, "\n* pending invite or no accepted key yet\n") {
+		t.Fatalf("missing pending note below dialog:\n%s", withPending)
+	}
+	if strings.Contains(withPending, "| * pending invite or no accepted key yet") {
+		t.Fatalf("pending note rendered inside dialog:\n%s", withPending)
 	}
 }
 
@@ -432,11 +637,13 @@ func TestSetupCommandProvisionsGCPAndWritesGlobalConfig(t *testing.T) {
 	}
 	var ownerReq brokerOwnerRequest
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/owners/upsert" {
+		switch r.URL.Path {
+		case "/owners/upsert":
+			if err := json.NewDecoder(r.Body).Decode(&ownerReq); err != nil {
+				t.Fatal(err)
+			}
+		default:
 			t.Fatalf("unexpected broker path %s", r.URL.Path)
-		}
-		if err := json.NewDecoder(r.Body).Decode(&ownerReq); err != nil {
-			t.Fatal(err)
 		}
 		_, _ = w.Write([]byte(`{"ok":true}`))
 	}))
@@ -579,8 +786,8 @@ func TestEnsureGcloudSetupProjectAccessRunsLoginOnUserProjectDenied(t *testing.T
 	bin := t.TempDir()
 	authMarker := filepath.Join(t.TempDir(), "authed")
 	writeFakeCLI(t, bin, "gcloud", []fakeCLIAction{
-		{match: "config get-value project", stdout: "hurozo"},
-		{match: "projects describe hurozo", stdout: "hurozo", missingStdout: "ERROR: USER_PROJECT_DENIED Caller does not have required permission", requireFile: authMarker, exitCode: 1},
+		{match: "config get-value project", stdout: "example-project"},
+		{match: "projects describe example-project", stdout: "example-project", missingStdout: "ERROR: USER_PROJECT_DENIED Caller does not have required permission", requireFile: authMarker, exitCode: 1},
 		{match: "auth login --configuration default --no-launch-browser", stdout: "https://example.test/oauth", touch: authMarker},
 	})
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
@@ -599,10 +806,10 @@ func TestEnsureGcloudSetupProjectAccessRepairsQuotaProject(t *testing.T) {
 	bin := t.TempDir()
 	quotaMarker := filepath.Join(t.TempDir(), "quota")
 	writeFakeCLI(t, bin, "gcloud", []fakeCLIAction{
-		{match: "config get-value project", stdout: "hurozo"},
-		{match: "projects describe hurozo", stdout: "hurozo", missingStdout: "ERROR: USER_PROJECT_DENIED Caller does not have required permission to use project aafje-490407", requireFile: quotaMarker, exitCode: 1},
-		{match: "config get-value billing/quota_project", stdout: "aafje-490407"},
-		{match: "config set billing/quota_project hurozo", touch: quotaMarker},
+		{match: "config get-value project", stdout: "example-project"},
+		{match: "projects describe example-project", stdout: "example-project", missingStdout: "ERROR: USER_PROJECT_DENIED Caller does not have required permission to use project quota-project-123", requireFile: quotaMarker, exitCode: 1},
+		{match: "config get-value billing/quota_project", stdout: "quota-project-123"},
+		{match: "config set billing/quota_project example-project", touch: quotaMarker},
 	})
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
 	var stdout bytes.Buffer
@@ -610,8 +817,8 @@ func TestEnsureGcloudSetupProjectAccessRepairsQuotaProject(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(stdout.String(), "uses quota project aafje-490407") ||
-		!strings.Contains(stdout.String(), "Set quota project to hurozo now?") {
+	if !strings.Contains(stdout.String(), "uses quota project quota-project-123") ||
+		!strings.Contains(stdout.String(), "Set quota project to example-project now?") {
 		t.Fatalf("stdout = %q", stdout.String())
 	}
 }
@@ -621,10 +828,10 @@ func TestEnsureGcloudSetupProjectAccessSelectsExistingProjectWhenUnset(t *testin
 	writeFakeCLI(t, bin, "gcloud", []fakeCLIAction{
 		{match: "config get-value project"},
 		{match: "config get-value account", stdout: "dennis@example.com"},
-		{match: "projects list", stdout: "hurozo Hurozo"},
-		{match: "config set project hurozo"},
-		{match: "config set billing/quota_project hurozo"},
-		{match: "projects describe hurozo", stdout: "hurozo"},
+		{match: "projects list", stdout: "example-project Example Project"},
+		{match: "config set project example-project"},
+		{match: "config set billing/quota_project example-project"},
+		{match: "projects describe example-project", stdout: "example-project"},
 	})
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
 	var stdout bytes.Buffer
@@ -633,7 +840,7 @@ func TestEnsureGcloudSetupProjectAccessSelectsExistingProjectWhenUnset(t *testin
 		t.Fatal(err)
 	}
 	if !strings.Contains(stdout.String(), "has no project configured") ||
-		!strings.Contains(stdout.String(), "1. hurozo - Hurozo") {
+		!strings.Contains(stdout.String(), "1. example-project - Example Project") {
 		t.Fatalf("stdout = %q", stdout.String())
 	}
 }
@@ -737,7 +944,7 @@ func TestEnsureGcloudSetupBillingLinksSelectedAccount(t *testing.T) {
 	billingMarker := filepath.Join(t.TempDir(), "billing")
 	writeFakeCLI(t, bin, "gcloud", []fakeCLIAction{
 		{match: "billing projects describe bgittest", stdout: "True", missingStdout: "False", requireFile: billingMarker, exitCode: 1},
-		{match: "billing accounts list", stdout: "billingAccounts/123 Hurozo Billing true"},
+		{match: "billing accounts list", stdout: "billingAccounts/123 Example Project Billing true"},
 		{match: "billing projects link bgittest --billing-account billingAccounts/123", touch: billingMarker},
 	})
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
@@ -761,7 +968,7 @@ func TestEnsureGcloudSetupBillingEnablesCloudBillingAPI(t *testing.T) {
 		{match: "billing projects describe bgittest --configuration dennis --quiet --format=value(billingEnabled)", stdout: "False", missingStdout: "ERROR: SERVICE_DISABLED Cloud Billing API has not been used in project bgittest before or it is disabled.", requireFile: apiMarker, exitCode: 1},
 		{match: "services enable cloudbilling.googleapis.com --project bgittest", touch: apiMarker},
 		{match: "services list --enabled --project=bgittest", stdout: "cloudbilling.googleapis.com"},
-		{match: "billing accounts list --configuration dennis --quiet", stdout: "billingAccounts/123 Hurozo Billing true"},
+		{match: "billing accounts list --configuration dennis --quiet", stdout: "billingAccounts/123 Example Project Billing true"},
 		{match: "billing projects link bgittest --billing-account billingAccounts/123", touch: billingMarker},
 	})
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
@@ -874,5 +1081,253 @@ func TestBrokerDeleteGCPDeletesFunctionAndOptionalData(t *testing.T) {
 	}
 	if !strings.Contains(stdout.String(), "deleted GCP bgit broker") {
 		t.Fatalf("stdout = %q", stdout.String())
+	}
+}
+
+func TestSetupBrokerTeamRepoForActionPreservesTeamID(t *testing.T) {
+	repo, err := setupBrokerTeamRepoForAction(config{provider: "gcs"}, "mkt", "t_marketing")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if repo.Logical != "mkt.git" || repo.TeamID != "t_marketing" || repo.Provider != "gcs" {
+		t.Fatalf("repo = %#v", repo)
+	}
+}
+
+func TestSetupAvailableTeamUserChoicesGroupPendingAndExcludeMembers(t *testing.T) {
+	choices := setupBrokerUserChoicesFromUsers([]brokerUserInfo{{
+		Username:   "owner",
+		BrokerRole: "admin",
+		Keys:       []brokerKey{{PublicKey: "ssh-ed25519 AAAA owner"}},
+	}, {
+		Username:   "pending",
+		BrokerRole: "user",
+		Pending:    true,
+	}, {
+		Username:   "developer",
+		BrokerRole: "user",
+		Keys:       []brokerKey{{PublicKey: "ssh-ed25519 AAAA dev"}},
+	}}, map[string]struct{}{"owner": {}})
+	if len(choices) != 2 {
+		t.Fatalf("choices = %#v", choices)
+	}
+	if choices[0].Value != "developer" || choices[0].Group != "" {
+		t.Fatalf("first choice = %#v", choices[0])
+	}
+	if choices[1].Value != "pending" || choices[1].Group != "pending users:" || choices[1].Label != "- pending *" {
+		t.Fatalf("pending choice = %#v", choices[1])
+	}
+}
+
+func TestSetupAvailableRepoInviteUsersExcludeMembersAndPendingInvites(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/broker/users/list":
+			_, _ = w.Write([]byte(`{"users":[
+				{"username":"member","broker_role":"user","keys":[{"public_key":"ssh-ed25519 AAAA member"}]},
+				{"username":"pending","broker_role":"user","pending":true},
+				{"username":"available","broker_role":"user","keys":[{"public_key":"ssh-ed25519 AAAA available"}]}
+			]}`))
+		case "/keys/list":
+			_, _ = w.Write([]byte(`{"keys":[{"user":"member","role":"developer","public_key":"ssh-ed25519 AAAA member"}]}`))
+		case "/keys/invite/list":
+			_, _ = w.Write([]byte(`{"invites":[{"user":"pending","role":"read"}]}`))
+		default:
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	choices, err := setupAvailableRepoInviteUserChoices(config{brokerURL: server.URL, provider: "gcs"}, "demo", "t_core")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(choices) != 1 || choices[0].Value != "available" {
+		t.Fatalf("choices = %#v", choices)
+	}
+}
+
+func TestSetupBrokerUserManagementChoicesNestUsers(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/broker/users/list" {
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+		_, _ = w.Write([]byte(`{"users":[
+			{"username":"owner","broker_role":"owner","keys":[{"public_key":"ssh-ed25519 AAAA owner"}]},
+			{"username":"piet","broker_role":"user","pending":true},
+			{"username":"ada","broker_role":"admin","keys":[{"public_key":"ssh-ed25519 AAAA ada1"},{"public_key":"ssh-ed25519 AAAA ada2"}]}
+		]}`))
+	}))
+	defer server.Close()
+
+	choices, err := setupBrokerUserManagementChoices(config{brokerURL: server.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if choices[0].Value != "invite-user" {
+		t.Fatalf("first choice = %#v", choices[0])
+	}
+	var sawAda, sawPiet bool
+	for _, choice := range choices {
+		switch choice.Value {
+		case "user:ada":
+			sawAda = true
+			if choice.Group != "users:" || !strings.Contains(choice.Help, "admin") || !strings.Contains(choice.Help, "2 keys") {
+				t.Fatalf("ada choice = %#v", choice)
+			}
+		case "user:piet":
+			sawPiet = true
+			if choice.Group != "users:" || !strings.Contains(choice.Label, "*") || !strings.Contains(choice.Help, "pending") {
+				t.Fatalf("piet choice = %#v", choice)
+			}
+		}
+	}
+	if !sawAda || !sawPiet {
+		t.Fatalf("choices = %#v", choices)
+	}
+}
+
+func TestSetupBrokerOwnerUserOnlyShowsTransfer(t *testing.T) {
+	choices := setupBrokerUserActionChoices(brokerUserInfo{Username: "owner", BrokerRole: "owner", Keys: []brokerKey{{PublicKey: "ssh-ed25519 AAAA owner"}}})
+	if len(choices) != 2 || choices[0].Value != "transfer-owner" || choices[1].Value != "back" {
+		t.Fatalf("choices = %#v", choices)
+	}
+	for _, choice := range choices {
+		switch choice.Value {
+		case "edit-role", "suspend", "unsuspend", "delete":
+			t.Fatalf("owner should not expose %q: %#v", choice.Value, choices)
+		}
+	}
+}
+
+func TestSetupBrokerRegularUserShowsDelete(t *testing.T) {
+	choices := setupBrokerUserActionChoices(brokerUserInfo{Username: "ada", BrokerRole: "user", Keys: []brokerKey{{PublicKey: "ssh-ed25519 AAAA ada"}}})
+	var sawDelete bool
+	for _, choice := range choices {
+		if choice.Value == "delete" {
+			sawDelete = true
+		}
+	}
+	if !sawDelete {
+		t.Fatalf("choices missing delete: %#v", choices)
+	}
+}
+
+func TestSetupRepoUserManagementChoicesListsDirectUsers(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/keys/list":
+			_, _ = w.Write([]byte(`{"keys":[
+				{"user":"ada","role":"read","public_key":"ssh-ed25519 AAAA ada1"},
+				{"user":"ada","role":"developer","public_key":"ssh-ed25519 AAAA ada2"}
+			]}`))
+		default:
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	choices, err := setupRepoAccessManagementChoices(config{brokerURL: server.URL, provider: "gcs"}, "demo", "t_core")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var found bool
+	for _, choice := range choices {
+		if choice.Value == "user:ada" {
+			found = true
+			if choice.Group != "users:" || !strings.Contains(choice.Help, "developer") || !strings.Contains(choice.Help, "2 keys") {
+				t.Fatalf("ada choice = %#v", choice)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("choices = %#v", choices)
+	}
+}
+
+func TestSetupManagedTeamMenuUsesNestedUsersAndRepositories(t *testing.T) {
+	var stdout bytes.Buffer
+	msg, err := runSetupManagedTeamWithRaw(config{}, "core", "core", bufio.NewReader(strings.NewReader("\x1b")), strings.NewReader("\x1b"), &stdout)
+	if !errors.Is(err, errSetupBack) {
+		t.Fatalf("err = %v, want errSetupBack", err)
+	}
+	if msg != "" {
+		t.Fatalf("msg = %q", msg)
+	}
+	rendered := stdout.String()
+	for _, want := range []string{"manage users", "manage repositories"} {
+		if !strings.Contains(rendered, want) {
+			t.Fatalf("missing %q:\n%s", want, rendered)
+		}
+	}
+	for _, reject := range []string{"list members", "add member", "edit member role", "remove member"} {
+		if strings.Contains(rendered, reject) {
+			t.Fatalf("unexpected flat member action %q:\n%s", reject, rendered)
+		}
+	}
+}
+
+func TestSetupAvailableTeamUserSelectHandlesEmptyChoices(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/broker/users/list":
+			_, _ = w.Write([]byte(`{"users":[{"id":"u_owner","username":"owner","broker_role":"owner","keys":[{"public_key":"ssh-ed25519 AAAA owner"}]}]}`))
+		case "/teams/list":
+			_, _ = w.Write([]byte(`{"teams":[{"id":"t_core","name":"core","members":[{"user_id":"u_owner","username":"owner","role":"admin"}]}]}`))
+		default:
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	var stdout bytes.Buffer
+	got, ok, err := runSetupAvailableTeamUserSelect(config{brokerURL: server.URL}, "t_core", bufio.NewReader(strings.NewReader("\n")), strings.NewReader("\n"), &stdout, setupBreadcrumb("Manage team", "core", "Manage users", "Add user"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok || got != "" {
+		t.Fatalf("ok=%v got=%q", ok, got)
+	}
+	if !strings.Contains(stdout.String(), "No users are available to add.") {
+		t.Fatalf("stdout = %q", stdout.String())
+	}
+}
+
+func TestSetupAvailableRepoTeamChoicesExcludeAttachedTeams(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/teams/list":
+			_, _ = w.Write([]byte(`{"teams":[
+				{"id":"t_core","name":"core"},
+				{"id":"t_attached","name":"attached"},
+				{"id":"t_available","name":"available"}
+			]}`))
+		case "/repos/list":
+			_, _ = w.Write([]byte(`{"repos":[{"logical":"demo.git","repo":{"logical":"demo.git","team_id":"t_core"},"teams":[{"id":"t_attached","role":"read"}]}]}`))
+		case "/repo/teams/list":
+			_, _ = w.Write([]byte(`{"teams":[{"id":"t_attached","role":"read"}]}`))
+		default:
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	choices, err := setupAvailableRepoTeamChoices(config{brokerURL: server.URL, provider: "gcs"}, "demo", "t_core")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(choices) != 1 || choices[0].Value != "t_available" {
+		t.Fatalf("choices = %#v", choices)
+	}
+}
+
+func TestSetupAcceptCommandFromOutputOmitsSeparateCode(t *testing.T) {
+	output := "invite pending\n\nCode:\n  bgitinv_abc\n\nGive this command to the user:\n  bgit admin accept-invite bgitinv_abc\n"
+	got := setupAcceptCommandFromOutput(output)
+	if got != "bgit admin accept-invite bgitinv_abc" {
+		t.Fatalf("command = %q", got)
+	}
+	if strings.Contains(got, "\n") || strings.Contains(got, "Code:") {
+		t.Fatalf("unexpected redundant content in %q", got)
 	}
 }

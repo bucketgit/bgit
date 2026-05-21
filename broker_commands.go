@@ -8,11 +8,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 )
@@ -23,6 +25,7 @@ type brokerProfile struct {
 	Region        string
 	QualifiedName string
 	BrokerURL     string
+	TeamID        string
 }
 
 func brokerAdminCommand(cfg config, args []string, stdout io.Writer) error {
@@ -31,9 +34,13 @@ func brokerAdminCommand(cfg config, args []string, stdout io.Writer) error {
 
 func brokerAdminCommandWithInput(cfg config, args []string, stdin io.Reader, stdout io.Writer) error {
 	if len(args) == 0 {
-		return errors.New("usage: bgit admin keys|owner|protect|members|confirm-ownership-transfer|accept-ownership-transfer|cancel-ownership-transfer|invite-user|accept-invite|cancel-invite [args]\n\nCloud IAM administration moved to bgit direct admin.")
+		return errors.New("usage: bgit admin keys|broker-users|teams|repo create|repo|owner|protect|members|confirm-ownership-transfer|accept-ownership-transfer|cancel-ownership-transfer|invite-user|accept-invite|cancel-invite|invite-broker-user|accept-broker-invite|cancel-broker-invite [args]\n\nCloud IAM administration moved to bgit direct admin.")
 	}
 	switch args[0] {
+	case "broker-users":
+		return brokerUsersCommand(cfg, args[1:], stdout)
+	case "teams":
+		return brokerTeamsCommand(cfg, args[1:], stdout)
 	case "keys":
 		return brokerAdminKeysCommand(cfg, args[1:], stdin, stdout)
 	case "repo":
@@ -52,6 +59,12 @@ func brokerAdminCommandWithInput(cfg config, args []string, stdin io.Reader, std
 		return brokerAcceptInviteCommand(args[1:], stdout)
 	case "cancel-invite":
 		return brokerCancelInviteCommand(cfg, args[1:], stdout)
+	case "invite-broker-user":
+		return brokerInviteBrokerUserCommand(cfg, args[1:], stdout)
+	case "accept-broker-invite":
+		return brokerAcceptBrokerInviteCommand(args[1:], stdout)
+	case "cancel-broker-invite":
+		return brokerCancelBrokerInviteCommand(cfg, args[1:], stdout)
 	case "grant-read", "grant-write", "grant-admin", "make-public", "make-private":
 		return errors.New("cloud IAM administration moved to bgit direct admin")
 	default:
@@ -67,17 +80,373 @@ type brokerRepoAdminRequest struct {
 	ReadOnly      *bool      `json:"read_only,omitempty"`
 	IssuesEnabled *bool      `json:"issues_enabled,omitempty"`
 	Logical       string     `json:"logical,omitempty"`
+	TeamID        string     `json:"team_id,omitempty"`
+	Name          string     `json:"name,omitempty"`
+	UserID        string     `json:"user_id,omitempty"`
+	User          string     `json:"user,omitempty"`
+	Role          string     `json:"role,omitempty"`
+	BrokerRole    string     `json:"broker_role,omitempty"`
+	PublicKeys    []string   `json:"public_keys,omitempty"`
+	Suspended     bool       `json:"suspended,omitempty"`
+	BrokerURL     string     `json:"broker_url,omitempty"`
+	Token         string     `json:"token,omitempty"`
+}
+
+type brokerRepoListResponse struct {
+	Repos []brokerRepoInfo `json:"repos"`
+}
+
+type brokerRepoInfo struct {
+	Repo    brokerRepo            `json:"repo"`
+	Logical string                `json:"logical,omitempty"`
+	Teams   []brokerRepoTeamGrant `json:"teams,omitempty"`
+}
+
+type brokerAdminRepoInfoResponse struct {
+	Repo          brokerRepo `json:"repo"`
+	Description   string     `json:"description,omitempty"`
+	DefaultBranch string     `json:"default_branch,omitempty"`
+	Visibility    string     `json:"visibility,omitempty"`
+	ReadOnly      bool       `json:"read_only,omitempty"`
+	IssuesEnabled bool       `json:"issues_enabled,omitempty"`
+}
+
+type brokerRepoTeamsResponse struct {
+	Teams []brokerRepoTeamGrant `json:"teams"`
+}
+
+type brokerUsersResponse struct {
+	Users []brokerUserInfo `json:"users"`
+}
+
+type brokerUserInfo struct {
+	ID         string      `json:"id"`
+	Username   string      `json:"username"`
+	BrokerRole string      `json:"broker_role"`
+	Keys       []brokerKey `json:"keys,omitempty"`
+	Suspended  bool        `json:"suspended,omitempty"`
+	Pending    bool        `json:"pending,omitempty"`
+}
+
+type brokerRepoInvitesResponse struct {
+	Invites []brokerRepoInviteInfo `json:"invites"`
+}
+
+type brokerRepoInviteInfo struct {
+	User      string `json:"user"`
+	Role      string `json:"role"`
+	ExpiresAt string `json:"expires_at"`
+}
+
+type brokerTeamsResponse struct {
+	Teams []brokerTeamInfo `json:"teams"`
+}
+
+type brokerTeamInfo struct {
+	ID      string             `json:"id"`
+	Name    string             `json:"name"`
+	Members []brokerTeamMember `json:"members,omitempty"`
+}
+
+type brokerTeamMember struct {
+	UserID   string `json:"user_id,omitempty"`
+	Username string `json:"username,omitempty"`
+	Role     string `json:"role"`
+}
+
+func brokerUsersCommand(cfg config, args []string, stdout io.Writer) error {
+	brokerURL, err := brokerURLFromConfigOrDiscovery(cfg)
+	if err != nil {
+		return err
+	}
+	if len(args) == 1 && args[0] == "list" {
+		var resp brokerUsersResponse
+		if err := brokerPost(brokerURL, "/broker/users/list", brokerRepoAdminRequest{}, &resp); err != nil {
+			return err
+		}
+		printBrokerUsers(stdout, resp.Users)
+		return nil
+	}
+	if len(args) == 2 && args[0] == "delete" {
+		req := brokerRepoAdminRequest{User: args[1]}
+		if err := brokerPost(brokerURL, "/broker/users/delete", req, nil); err != nil {
+			return err
+		}
+		fmt.Fprintf(stdout, "deleted broker user %s\n", req.User)
+		return nil
+	}
+	if len(args) >= 2 && args[0] == "upsert" {
+		req := brokerRepoAdminRequest{User: args[1], BrokerRole: "user"}
+		for i := 2; i < len(args); i++ {
+			name, value, hasValue := strings.Cut(args[i], "=")
+			switch name {
+			case "--role":
+				var err error
+				value, i, err = optionValue(args, i, hasValue, value, name)
+				if err != nil {
+					return err
+				}
+				req.BrokerRole = strings.TrimSpace(value)
+			case "--key":
+				var err error
+				value, i, err = optionValue(args, i, hasValue, value, name)
+				if err != nil {
+					return err
+				}
+				keys, err := publicKeysFromArg(value)
+				if err != nil {
+					return err
+				}
+				req.PublicKeys = append(req.PublicKeys, keys...)
+			case "--suspended":
+				var err error
+				value, i, err = optionValue(args, i, hasValue, value, name)
+				if err != nil {
+					return err
+				}
+				req.Suspended, err = strconv.ParseBool(strings.TrimSpace(value))
+				if err != nil {
+					return fmt.Errorf("invalid --suspended value %q", value)
+				}
+			default:
+				return fmt.Errorf("unsupported broker-users upsert option %s", args[i])
+			}
+		}
+		var resp struct {
+			User brokerUserInfo `json:"user"`
+		}
+		if !validBrokerUserRole(req.BrokerRole) {
+			return fmt.Errorf("invalid broker role %q", req.BrokerRole)
+		}
+		if err := brokerPost(brokerURL, "/broker/users/upsert", req, &resp); err != nil {
+			return err
+		}
+		fmt.Fprintf(stdout, "upserted broker user %s as %s\n", resp.User.Username, resp.User.BrokerRole)
+		return nil
+	}
+	return errors.New("usage: bgit admin broker-users list | upsert USER [--role admin|user] [--key PATH_OR_PUBLIC_KEY] [--suspended true|false] | delete USER")
+}
+
+func printBrokerUsers(stdout io.Writer, users []brokerUserInfo) {
+	fmt.Fprintf(stdout, "%-18s  %-28s  %-8s  %-9s\n", "ID", "Username", "Role", "Status")
+	fmt.Fprintf(stdout, "%-18s  %-28s  %-8s  %-9s\n", strings.Repeat("-", 2), strings.Repeat("-", 8), strings.Repeat("-", 4), strings.Repeat("-", 6))
+	sort.Slice(users, func(i, j int) bool {
+		return firstNonEmpty(users[i].Username, users[i].ID) < firstNonEmpty(users[j].Username, users[j].ID)
+	})
+	for _, user := range users {
+		status := "active"
+		if user.Suspended {
+			status = "suspended"
+		} else if user.Pending || len(user.Keys) == 0 {
+			status = "pending"
+		}
+		fmt.Fprintf(stdout, "%-18s  %-28s  %-8s  %-9s\n", truncateSetupColumn(user.ID, 18), truncateSetupColumn(user.Username, 28), truncateSetupColumn(user.BrokerRole, 8), status)
+	}
+}
+
+func truncateSetupColumn(value string, width int) string {
+	value = strings.TrimSpace(value)
+	if len(value) <= width {
+		return value
+	}
+	if width <= 1 {
+		return value[:width]
+	}
+	return value[:width-1] + "…"
+}
+
+func validBrokerUserRole(role string) bool {
+	switch strings.TrimSpace(role) {
+	case "admin", "user":
+		return true
+	default:
+		return false
+	}
+}
+
+func validRepoRole(role string) bool {
+	role = normalizeBrokerRole(role)
+	return validBrokerRole(role)
+}
+
+func brokerTeamsCommand(cfg config, args []string, stdout io.Writer) error {
+	brokerURL, err := brokerURLFromConfigOrDiscovery(cfg)
+	if err != nil {
+		return err
+	}
+	if len(args) == 1 && args[0] == "list" {
+		var resp brokerTeamsResponse
+		if err := brokerPost(brokerURL, "/teams/list", brokerRepoAdminRequest{}, &resp); err != nil {
+			return err
+		}
+		for _, team := range resp.Teams {
+			members := make([]string, 0, len(team.Members))
+			for _, member := range team.Members {
+				members = append(members, firstNonEmpty(member.Username, member.UserID)+":"+member.Role)
+			}
+			memberText := fmt.Sprintf("%d member(s)", len(team.Members))
+			if len(members) > 0 {
+				memberText += "\t" + strings.Join(members, ",")
+			}
+			fmt.Fprintf(stdout, "%s\t%s\t%s\n", team.ID, team.Name, memberText)
+		}
+		return nil
+	}
+	if len(args) >= 2 && args[0] == "create" {
+		req := brokerRepoAdminRequest{Name: args[1]}
+		var resp struct {
+			Team brokerTeamInfo `json:"team"`
+		}
+		if err := brokerPost(brokerURL, "/teams/create", req, &resp); err != nil {
+			return err
+		}
+		fmt.Fprintf(stdout, "created team %s (%s)\n", resp.Team.Name, resp.Team.ID)
+		return nil
+	}
+	if len(args) == 2 && args[0] == "delete" {
+		req := brokerRepoAdminRequest{TeamID: args[1]}
+		if err := brokerPost(brokerURL, "/teams/delete", req, nil); err != nil {
+			return err
+		}
+		fmt.Fprintf(stdout, "deleted team %s\n", req.TeamID)
+		return nil
+	}
+	if len(args) >= 4 && args[0] == "member" && args[1] == "add" {
+		req := brokerRepoAdminRequest{TeamID: args[2], User: args[3], Role: "read"}
+		for i := 4; i < len(args); i++ {
+			name, value, hasValue := strings.Cut(args[i], "=")
+			if name != "--role" {
+				return fmt.Errorf("unsupported teams member add option %s", args[i])
+			}
+			var err error
+			value, i, err = optionValue(args, i, hasValue, value, name)
+			if err != nil {
+				return err
+			}
+			req.Role = normalizeBrokerRole(value)
+		}
+		if !validRepoRole(req.Role) {
+			return fmt.Errorf("invalid team member role %q", req.Role)
+		}
+		if err := brokerPost(brokerURL, "/teams/member/upsert", req, nil); err != nil {
+			return err
+		}
+		fmt.Fprintf(stdout, "added %s to team %s as %s\n", req.User, req.TeamID, req.Role)
+		return nil
+	}
+	if len(args) == 4 && args[0] == "member" && args[1] == "remove" {
+		req := brokerRepoAdminRequest{TeamID: args[2], User: args[3]}
+		if err := brokerPost(brokerURL, "/teams/member/remove", req, nil); err != nil {
+			return err
+		}
+		fmt.Fprintf(stdout, "removed %s from team %s\n", req.User, req.TeamID)
+		return nil
+	}
+	if len(args) == 2 && args[0] == "repo" && args[1] == "list" {
+		cfg, err := configForBrokerCommand(cfg)
+		if err != nil {
+			return err
+		}
+		var resp brokerRepoTeamsResponse
+		if err := brokerPost(cfg.brokerURL, "/repo/teams/list", brokerRepoAdminRequest{Repo: repoForBroker(cfg)}, &resp); err != nil {
+			return err
+		}
+		for _, team := range resp.Teams {
+			fmt.Fprintf(stdout, "%s\t%s\n", firstNonEmpty(team.ID, team.TeamID), team.Role)
+		}
+		return nil
+	}
+	if len(args) >= 4 && args[0] == "repo" && args[1] == "add" {
+		cfg, err := configForBrokerCommand(cfg)
+		if err != nil {
+			return err
+		}
+		role := normalizeBrokerRole(args[3])
+		if !validRepoRole(role) {
+			return fmt.Errorf("invalid repo team role %q", args[3])
+		}
+		req := brokerRepoAdminRequest{Repo: repoForBroker(cfg), TeamID: args[2], Role: role}
+		if err := brokerPost(cfg.brokerURL, "/repo/teams/upsert", req, nil); err != nil {
+			return err
+		}
+		fmt.Fprintf(stdout, "attached team %s to %s as %s\n", req.TeamID, cfg.logicalRepo, req.Role)
+		return nil
+	}
+	if len(args) == 3 && args[0] == "repo" && args[1] == "remove" {
+		cfg, err := configForBrokerCommand(cfg)
+		if err != nil {
+			return err
+		}
+		req := brokerRepoAdminRequest{Repo: repoForBroker(cfg), TeamID: args[2]}
+		if err := brokerPost(cfg.brokerURL, "/repo/teams/remove", req, nil); err != nil {
+			return err
+		}
+		fmt.Fprintf(stdout, "detached team %s from %s\n", req.TeamID, cfg.logicalRepo)
+		return nil
+	}
+	return errors.New("usage: bgit admin teams list|create NAME|delete TEAM|member add TEAM USER [--role ROLE]|member remove TEAM USER|repo list|repo add TEAM ROLE|repo remove TEAM")
+}
+
+func brokerURLFromConfigOrDiscovery(cfg config) (string, error) {
+	if strings.TrimSpace(cfg.brokerURL) != "" {
+		return strings.TrimSpace(cfg.brokerURL), nil
+	}
+	if local, err := configForBrokerCommand(cfg); err == nil && strings.TrimSpace(local.brokerURL) != "" {
+		return strings.TrimSpace(local.brokerURL), nil
+	}
+	return brokerURLForCommand(sshSetupOptions{})
 }
 
 func brokerAdminRepoCommand(cfg config, args []string, stdout io.Writer) error {
 	if len(args) == 0 {
-		return errors.New("usage: bgit admin repo visibility|readonly|issues|rename|delete [args]")
+		return errors.New("usage: bgit admin repo list|info|create|visibility|readonly|issues|rename|delete [args]")
+	}
+	if args[0] == "create" {
+		return brokerAdminRepoCreateCommand(cfg, args[1:], stdout)
+	}
+	if args[0] == "list" {
+		brokerURL, err := brokerURLFromConfigOrDiscovery(cfg)
+		if err != nil {
+			return err
+		}
+		var resp brokerRepoListResponse
+		if err := brokerPost(brokerURL, "/repos/list", brokerRepoAdminRequest{}, &resp); err != nil {
+			return err
+		}
+		for _, repo := range resp.Repos {
+			teamIDs := make([]string, 0, len(repo.Teams))
+			for _, team := range repo.Teams {
+				teamIDs = append(teamIDs, firstNonEmpty(team.ID, team.TeamID))
+			}
+			sort.Strings(teamIDs)
+			fmt.Fprintf(stdout, "%s\t%s\n", logicalRepoDisplayName(firstNonEmpty(repo.Logical, repo.Repo.Logical)), strings.Join(teamIDs, ","))
+		}
+		return nil
 	}
 	cfg, err := configForBrokerCommand(cfg)
 	if err != nil {
 		return err
 	}
 	switch args[0] {
+	case "info":
+		if len(args) != 1 {
+			return errors.New("usage: bgit admin repo info")
+		}
+		var resp brokerAdminRepoInfoResponse
+		if err := brokerPost(cfg.brokerURL, "/repo/info", brokerRepoAdminRequest{Repo: repoForBroker(cfg)}, &resp); err != nil {
+			return err
+		}
+		fmt.Fprintf(stdout, "repository: %s\n", logicalRepoDisplayName(resp.Repo.Logical))
+		fmt.Fprintf(stdout, "visibility: %s\n", firstNonEmpty(resp.Visibility, "private"))
+		fmt.Fprintf(stdout, "read-only: %t\n", resp.ReadOnly)
+		fmt.Fprintf(stdout, "issues: %t\n", resp.IssuesEnabled)
+		if resp.DefaultBranch != "" {
+			fmt.Fprintf(stdout, "default branch: %s\n", resp.DefaultBranch)
+		}
+		if resp.Description != "" {
+			fmt.Fprintf(stdout, "description: %s\n", resp.Description)
+		}
+		return nil
 	case "visibility":
 		if len(args) != 2 || (args[1] != "public" && args[1] != "private") {
 			return errors.New("usage: bgit admin repo visibility public|private")
@@ -139,6 +508,72 @@ func brokerAdminRepoCommand(cfg config, args []string, stdout io.Writer) error {
 	}
 }
 
+func brokerAdminRepoCreateCommand(cfg config, args []string, stdout io.Writer) error {
+	brokerURL := strings.TrimSpace(cfg.brokerURL)
+	team := ""
+	role := "developer"
+	repoName := ""
+	var err error
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		name, value, hasValue := strings.Cut(arg, "=")
+		switch name {
+		case "--broker":
+			value, i, err = optionValue(args, i, hasValue, value, name)
+			if err != nil {
+				return err
+			}
+			brokerURL = strings.TrimSpace(value)
+		case "--team":
+			value, i, err = optionValue(args, i, hasValue, value, name)
+			if err != nil {
+				return err
+			}
+			team = strings.TrimSpace(value)
+		case "--role":
+			value, i, err = optionValue(args, i, hasValue, value, name)
+			if err != nil {
+				return err
+			}
+			role = normalizeBrokerRole(value)
+		default:
+			if strings.HasPrefix(arg, "-") {
+				return fmt.Errorf("unsupported repo create option %s", arg)
+			}
+			if repoName != "" {
+				return errors.New("repo create accepts exactly one repository")
+			}
+			repoName = strings.TrimSpace(arg)
+		}
+	}
+	if brokerURL == "" {
+		brokerURL, err = brokerURLFromConfigOrDiscovery(cfg)
+		if err != nil {
+			return err
+		}
+	}
+	if repoName == "" || team == "" {
+		return errors.New("usage: bgit admin repo create --team TEAM [--role ROLE] [--broker URL] REPO")
+	}
+	if !validRepoRole(role) {
+		return fmt.Errorf("invalid repo team role %q", role)
+	}
+	teamID, err := resolveBrokerTeamName(brokerURL, team)
+	if err != nil {
+		return err
+	}
+	repo, err := brokerRepoForAdminTarget(cfg, repoName, teamID)
+	if err != nil {
+		return err
+	}
+	req := brokerRepoAdminRequest{Repo: repo, Role: role}
+	if err := brokerPost(brokerURL, "/repos/create", req, nil); err != nil {
+		return err
+	}
+	fmt.Fprintf(stdout, "created repository %s in team %s\n", logicalRepoDisplayName(repo.Logical), team)
+	return nil
+}
+
 func brokerMembersCommand(cfg config, args []string, stdout io.Writer) error {
 	if len(args) != 1 || args[0] != "reindex" {
 		return errors.New("usage: bgit admin members reindex")
@@ -191,6 +626,9 @@ func brokerInitCommand(args []string, stdin io.Reader, stdout io.Writer) error {
 		}
 		if strings.TrimSpace(repoName) == "" {
 			return errors.New("init --noninteractive requires --repo NAME")
+		}
+		if strings.TrimSpace(opts.team) == "" {
+			return errors.New("init --noninteractive requires --team TEAM")
 		}
 	}
 	global, path, err := loadGlobalConfigForInit(opts.configPath)
@@ -260,6 +698,21 @@ func brokerInitCommand(args []string, stdin io.Reader, stdout io.Writer) error {
 	if err != nil {
 		return err
 	}
+	teamID := strings.TrimSpace(opts.team)
+	if opts.interactive && teamID == "" {
+		teamID, err = brokerInitSelectTeam(stdin, stdout, profile)
+		if err != nil {
+			return err
+		}
+	}
+	if teamID == "" {
+		return errors.New("init requires --team TEAM")
+	}
+	teamID, err = resolveBrokerTeamName(profile.BrokerURL, teamID)
+	if err != nil {
+		return err
+	}
+	profile.TeamID = teamID
 	if identityName == "" && identityEmail == "" {
 		identity := initDialogInitialState(target, global, repoName, opts.profile)
 		identityName = identity.IdentityName
@@ -273,24 +726,44 @@ func brokerCloneCommand(args []string, stdin io.Reader, stdout io.Writer) error 
 	if err != nil {
 		return err
 	}
+	discoveredTeamID := ""
 	if opts.brokerURL == "" {
-		brokerURL, parsedRepo, ok, err := parseBrokerCloneURL(repoName)
+		brokerURL, parsedRepo, teamID, ok, err := discoverBrokerCloneURL(repoName)
 		if err != nil {
 			return err
 		}
 		if ok {
 			opts.brokerURL = brokerURL
 			repoName = parsedRepo
+			discoveredTeamID = teamID
+		}
+	}
+	if opts.brokerURL == "" {
+		brokerURL, parsedRepo, teamName, ok, err := parseBrokerCloneURL(repoName)
+		if err != nil {
+			return err
+		}
+		if ok {
+			opts.brokerURL = brokerURL
+			repoName = parsedRepo
+			if teamName != "" {
+				teamID, err := resolveBrokerTeamName(brokerURL, teamName)
+				if err != nil {
+					return err
+				}
+				discoveredTeamID = teamID
+			}
 		}
 	}
 	if strings.TrimSpace(repoName) == "" {
-		return errors.New("usage: bgit clone <repo> [directory] [--profile PROFILE]\n       bgit clone https://broker.example.com/app.git [directory]\n       bgit clone --broker https://broker.example.com app.git [directory]")
+		return errors.New("usage: bgit clone <repo> [directory] [--profile PROFILE]\n       bgit clone https://broker.example.com/app.git [directory]\n       bgit clone https://broker.example.com/team/app.git [directory]\n       bgit clone https://broker.example.com/team/app/app.git [directory]\n       bgit clone --broker https://broker.example.com app.git [directory]")
 	}
 	if opts.brokerURL != "" {
 		profile, err := brokerProfileForCloneURL(opts.brokerURL)
 		if err != nil {
 			return err
 		}
+		profile.TeamID = discoveredTeamID
 		return brokerCloneWithProfile(opts, repoName, profile, stdout)
 	}
 	global, _, err := loadGlobalConfigForInit(opts.configPath)
@@ -320,6 +793,9 @@ func brokerCloneWithProfile(opts brokerInitOptions, repoName string, profile bro
 	target := opts.directory
 	if target == "" {
 		target = strings.TrimSuffix(filepath.Base(strings.Trim(repoName, "/")), ".git")
+	}
+	if strings.TrimSpace(profile.TeamID) == "" {
+		profile.TeamID = coreTeamID
 	}
 	if err := initBrokerWorktree(target, repoName, profile, "", "", io.Discard); err != nil {
 		return err
@@ -443,6 +919,17 @@ func fetchGitHubPublicKeys(ctx context.Context, username string) ([]string, erro
 	return splitPublicKeyLines(string(data)), nil
 }
 
+func publicKeysFromArg(value string) ([]string, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return nil, errors.New("public key is required")
+	}
+	if data, err := os.ReadFile(expandHome(value)); err == nil {
+		return splitPublicKeyLines(string(data)), nil
+	}
+	return splitPublicKeyLines(value), nil
+}
+
 func configForBrokerCommand(base config) (config, error) {
 	cfg := base
 	if localCfg, err := readLocalConfig("."); err == nil {
@@ -498,6 +985,8 @@ type ownerTransferCodePayload struct {
 	BrokerURL string     `json:"broker_url"`
 	Repo      brokerRepo `json:"repo"`
 	Token     string     `json:"token"`
+	User      string     `json:"user,omitempty"`
+	Role      string     `json:"role,omitempty"`
 }
 
 func brokerOwnerCommand(cfg config, args []string, stdout io.Writer) error {
@@ -532,7 +1021,7 @@ func brokerConfirmOwnershipTransferCommand(cfg config, args []string, stdout io.
 	if err := brokerPost(brokerURL, "/owners/transfer/confirm", brokerOwnerTransferRequest{Repo: repo, BrokerURL: brokerURL}, &resp); err != nil {
 		return err
 	}
-	fmt.Fprintf(stdout, "ownership transfer pending for %s\n\nGive this command to the new owner:\n  %s\n\nCancel with:\n  %s\n", repo.Logical, resp.AcceptCommand, resp.CancelCommand)
+	fmt.Fprintf(stdout, "ownership transfer pending for %s\n\nCode:\n  %s\n\nGive this command to the new owner:\n  %s\n\nCancel with:\n  %s\n", repo.Logical, resp.Code, resp.AcceptCommand, resp.CancelCommand)
 	return nil
 }
 
@@ -633,6 +1122,7 @@ func parseOwnershipTransferCode(code string) (ownerTransferCodePayload, error) {
 func brokerInviteUserCommand(cfg config, args []string, stdout io.Writer) error {
 	brokerURL := ""
 	repoName := ""
+	teamID := ""
 	user := ""
 	role := "read"
 	var err error
@@ -658,6 +1148,12 @@ func brokerInviteUserCommand(cfg config, args []string, stdout io.Writer) error 
 				return err
 			}
 			role = normalizeBrokerRole(value)
+		case "--team":
+			value, i, err = optionValue(args, i, hasValue, value, name)
+			if err != nil {
+				return err
+			}
+			teamID = strings.TrimSpace(value)
 		default:
 			if strings.HasPrefix(arg, "-") {
 				return fmt.Errorf("unsupported invite-user option %s", arg)
@@ -669,21 +1165,20 @@ func brokerInviteUserCommand(cfg config, args []string, stdout io.Writer) error 
 		}
 	}
 	if brokerURL == "" || repoName == "" || user == "" {
-		return errors.New("usage: bgit admin invite-user --broker URL --user USER [--role ROLE] REPO")
+		return errors.New("usage: bgit admin invite-user --broker URL [--team TEAM] --user USER [--role ROLE] REPO")
 	}
 	if !validBrokerRole(role) || role == "owner" {
 		return fmt.Errorf("invalid role %q", role)
 	}
-	logical, err := normalizeLogicalRepoName(repoName)
+	repo, err := brokerRepoForAdminTarget(cfg, repoName, teamID)
 	if err != nil {
 		return err
 	}
-	repo := brokerRepo{Provider: "gcs", Logical: logical, Origin: "git@" + defaultSSHHost + ":" + logical}
 	var resp brokerOwnerTransferResponse
 	if err := brokerPost(brokerURL, "/keys/invite/create", brokerOwnerTransferRequest{Repo: repo, BrokerURL: brokerURL, User: user, Role: role}, &resp); err != nil {
 		return err
 	}
-	fmt.Fprintf(stdout, "invite pending for %s as %s on %s\n\nGive this command to the user:\n  %s\n", user, role, repo.Logical, resp.AcceptCommand)
+	fmt.Fprintf(stdout, "invite pending for %s as %s on %s\n\nCode:\n  %s\n\nGive this command to the user:\n  %s\n", user, role, repo.Logical, resp.Code, resp.AcceptCommand)
 	return nil
 }
 
@@ -704,15 +1199,14 @@ func brokerAcceptInviteCommand(args []string, stdout io.Writer) error {
 }
 
 func brokerCancelInviteCommand(cfg config, args []string, stdout io.Writer) error {
-	brokerURL, repoName, user, err := parseCancelInviteTarget(cfg, args)
+	brokerURL, repoName, teamID, user, err := parseCancelInviteTarget(cfg, args)
 	if err != nil {
 		return err
 	}
-	logical, err := normalizeLogicalRepoName(repoName)
+	repo, err := brokerRepoForAdminTarget(cfg, repoName, teamID)
 	if err != nil {
 		return err
 	}
-	repo := brokerRepo{Provider: "gcs", Logical: logical, Origin: "git@" + defaultSSHHost + ":" + logical}
 	if err := brokerPost(brokerURL, "/keys/invite/cancel", brokerOwnerTransferRequest{Repo: repo, User: user}, nil); err != nil {
 		return err
 	}
@@ -720,9 +1214,82 @@ func brokerCancelInviteCommand(cfg config, args []string, stdout io.Writer) erro
 	return nil
 }
 
-func parseCancelInviteTarget(cfg config, args []string) (string, string, string, error) {
+func brokerInviteBrokerUserCommand(cfg config, args []string, stdout io.Writer) error {
 	brokerURL := ""
-	repoName := ""
+	user := ""
+	role := "user"
+	var err error
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		name, value, hasValue := strings.Cut(arg, "=")
+		switch name {
+		case "--broker":
+			value, i, err = optionValue(args, i, hasValue, value, name)
+			if err != nil {
+				return err
+			}
+			brokerURL = strings.TrimSpace(value)
+		case "--user":
+			value, i, err = optionValue(args, i, hasValue, value, name)
+			if err != nil {
+				return err
+			}
+			user = strings.TrimSpace(value)
+		case "--role":
+			value, i, err = optionValue(args, i, hasValue, value, name)
+			if err != nil {
+				return err
+			}
+			role = strings.TrimSpace(value)
+		default:
+			if strings.HasPrefix(arg, "-") {
+				return fmt.Errorf("unsupported invite-broker-user option %s", arg)
+			}
+			if user != "" {
+				return errors.New("invite-broker-user accepts exactly one username")
+			}
+			user = strings.TrimSpace(arg)
+		}
+	}
+	if brokerURL == "" {
+		var err error
+		brokerURL, err = brokerURLFromConfigOrDiscovery(cfg)
+		if err != nil {
+			return err
+		}
+	}
+	if user == "" {
+		return errors.New("usage: bgit admin invite-broker-user --broker URL --user USER [--role admin|user]")
+	}
+	if !validBrokerUserRole(role) {
+		return fmt.Errorf("invalid broker role %q", role)
+	}
+	var resp brokerOwnerTransferResponse
+	if err := brokerPost(brokerURL, "/broker/users/invite/create", brokerRepoAdminRequest{User: user, BrokerRole: role, BrokerURL: brokerURL}, &resp); err != nil {
+		return err
+	}
+	fmt.Fprintf(stdout, "broker user invite pending for %s as %s\n\nCode:\n  %s\n\nGive this command to the user:\n  %s\n", user, role, resp.Code, resp.AcceptCommand)
+	return nil
+}
+
+func brokerAcceptBrokerInviteCommand(args []string, stdout io.Writer) error {
+	if len(args) != 1 {
+		return errors.New("usage: bgit admin accept-broker-invite CODE")
+	}
+	payload, err := parseBrokerUserInviteCode(args[0])
+	if err != nil {
+		return err
+	}
+	var resp brokerOwnerTransferResponse
+	if err := brokerPost(payload.BrokerURL, "/broker/users/invite/accept", brokerRepoAdminRequest{User: payload.User, Token: payload.Token}, &resp); err != nil {
+		return err
+	}
+	fmt.Fprintf(stdout, "accepted broker invite for %s as %s with key %s\n", resp.User, resp.Role, resp.Fingerprint)
+	return nil
+}
+
+func brokerCancelBrokerInviteCommand(cfg config, args []string, stdout io.Writer) error {
+	brokerURL := ""
 	user := ""
 	var err error
 	for i := 0; i < len(args); i++ {
@@ -732,21 +1299,75 @@ func parseCancelInviteTarget(cfg config, args []string) (string, string, string,
 		case "--broker":
 			value, i, err = optionValue(args, i, hasValue, value, name)
 			if err != nil {
-				return "", "", "", err
+				return err
 			}
 			brokerURL = strings.TrimSpace(value)
 		case "--user":
 			value, i, err = optionValue(args, i, hasValue, value, name)
 			if err != nil {
-				return "", "", "", err
+				return err
 			}
 			user = strings.TrimSpace(value)
 		default:
 			if strings.HasPrefix(arg, "-") {
-				return "", "", "", fmt.Errorf("unsupported cancel-invite option %s", arg)
+				return fmt.Errorf("unsupported cancel-broker-invite option %s", arg)
+			}
+			if user != "" {
+				return errors.New("cancel-broker-invite accepts exactly one username")
+			}
+			user = strings.TrimSpace(arg)
+		}
+	}
+	if brokerURL == "" {
+		brokerURL, err = brokerURLFromConfigOrDiscovery(cfg)
+		if err != nil {
+			return err
+		}
+	}
+	if user == "" {
+		return errors.New("usage: bgit admin cancel-broker-invite --broker URL --user USER")
+	}
+	if err := brokerPost(brokerURL, "/broker/users/invite/cancel", brokerRepoAdminRequest{User: user}, nil); err != nil {
+		return err
+	}
+	fmt.Fprintf(stdout, "cancelled broker invite for %s\n", user)
+	return nil
+}
+
+func parseCancelInviteTarget(cfg config, args []string) (string, string, string, string, error) {
+	brokerURL := ""
+	repoName := ""
+	teamID := ""
+	user := ""
+	var err error
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		name, value, hasValue := strings.Cut(arg, "=")
+		switch name {
+		case "--broker":
+			value, i, err = optionValue(args, i, hasValue, value, name)
+			if err != nil {
+				return "", "", "", "", err
+			}
+			brokerURL = strings.TrimSpace(value)
+		case "--user":
+			value, i, err = optionValue(args, i, hasValue, value, name)
+			if err != nil {
+				return "", "", "", "", err
+			}
+			user = strings.TrimSpace(value)
+		case "--team":
+			value, i, err = optionValue(args, i, hasValue, value, name)
+			if err != nil {
+				return "", "", "", "", err
+			}
+			teamID = strings.TrimSpace(value)
+		default:
+			if strings.HasPrefix(arg, "-") {
+				return "", "", "", "", fmt.Errorf("unsupported cancel-invite option %s", arg)
 			}
 			if repoName != "" {
-				return "", "", "", errors.New("cancel-invite accepts exactly one repository")
+				return "", "", "", "", errors.New("cancel-invite accepts exactly one repository")
 			}
 			repoName = strings.TrimSpace(arg)
 		}
@@ -762,9 +1383,25 @@ func parseCancelInviteTarget(cfg config, args []string) (string, string, string,
 		}
 	}
 	if brokerURL == "" || repoName == "" || user == "" {
-		return "", "", "", errors.New("usage: bgit admin cancel-invite --broker URL --user USER REPO")
+		return "", "", "", "", errors.New("usage: bgit admin cancel-invite --broker URL [--team TEAM] --user USER REPO")
 	}
-	return brokerURL, repoName, user, nil
+	return brokerURL, repoName, teamID, user, nil
+}
+
+func brokerRepoForAdminTarget(cfg config, repoName, teamID string) (brokerRepo, error) {
+	logical, err := normalizeLogicalRepoName(repoName)
+	if err != nil {
+		return brokerRepo{}, err
+	}
+	local := cfg
+	local.logicalRepo = logical
+	local.prefix = logical
+	local.origin = "git@" + defaultSSHHost + ":" + logical
+	local.provider = firstNonEmpty(local.provider, "gcs")
+	if strings.TrimSpace(teamID) != "" {
+		local.teamID = strings.TrimSpace(teamID)
+	}
+	return repoForBroker(local), nil
 }
 
 func parseInviteCode(code string) (ownerTransferCodePayload, error) {
@@ -783,6 +1420,26 @@ func parseInviteCode(code string) (ownerTransferCodePayload, error) {
 	}
 	if strings.TrimSpace(payload.BrokerURL) == "" || strings.TrimSpace(payload.Token) == "" || strings.TrimSpace(payload.Repo.Logical) == "" {
 		return ownerTransferCodePayload{}, errors.New("invalid invite code")
+	}
+	return payload, nil
+}
+
+func parseBrokerUserInviteCode(code string) (ownerTransferCodePayload, error) {
+	code = strings.TrimSpace(code)
+	if !strings.HasPrefix(code, "bgituser_") {
+		return ownerTransferCodePayload{}, errors.New("invalid broker user invite code")
+	}
+	raw := strings.TrimPrefix(code, "bgituser_")
+	data, err := base64.RawURLEncoding.DecodeString(raw)
+	if err != nil {
+		return ownerTransferCodePayload{}, errors.New("invalid broker user invite code")
+	}
+	var payload ownerTransferCodePayload
+	if err := json.Unmarshal(data, &payload); err != nil {
+		return ownerTransferCodePayload{}, errors.New("invalid broker user invite code")
+	}
+	if strings.TrimSpace(payload.BrokerURL) == "" || strings.TrimSpace(payload.Token) == "" || strings.TrimSpace(payload.User) == "" {
+		return ownerTransferCodePayload{}, errors.New("invalid broker user invite code")
 	}
 	return payload, nil
 }
@@ -1280,6 +1937,7 @@ type brokerInitOptions struct {
 	noninteractive bool
 	profile        string
 	region         string
+	team           string
 	repo           string
 	brokerURL      string
 	configPath     string
@@ -1311,6 +1969,13 @@ func parseBrokerInitArgs(args []string) (brokerInitOptions, string, error) {
 				return opts, "", err
 			}
 			opts.region = value
+		case "--team":
+			var err error
+			value, i, err = optionValue(args, i, hasValue, value, name)
+			if err != nil {
+				return opts, "", err
+			}
+			opts.team = value
 		case "--repo":
 			var err error
 			value, i, err = optionValue(args, i, hasValue, value, name)
@@ -1366,33 +2031,146 @@ func parseBrokerInitArgs(args []string) (brokerInitOptions, string, error) {
 	}
 }
 
-func parseBrokerCloneURL(raw string) (string, string, bool, error) {
+func parseBrokerCloneURL(raw string) (string, string, string, bool, error) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" || (!strings.HasPrefix(raw, "http://") && !strings.HasPrefix(raw, "https://")) {
-		return "", "", false, nil
+		return "", "", "", false, nil
 	}
 	parsed, err := url.Parse(raw)
 	if err != nil {
-		return "", "", true, fmt.Errorf("parse broker clone URL: %w", err)
+		return "", "", "", true, fmt.Errorf("parse broker clone URL: %w", err)
 	}
 	if parsed.Scheme != "http" && parsed.Scheme != "https" {
-		return "", "", true, fmt.Errorf("unsupported broker clone URL scheme %q", parsed.Scheme)
+		return "", "", "", true, fmt.Errorf("unsupported broker clone URL scheme %q", parsed.Scheme)
 	}
 	if parsed.Host == "" {
-		return "", "", true, errors.New("broker clone URL must include a host")
+		return "", "", "", true, errors.New("broker clone URL must include a host")
 	}
 	if parsed.RawQuery != "" || parsed.Fragment != "" {
-		return "", "", true, errors.New("broker clone URL must not include query parameters or a fragment")
+		return "", "", "", true, errors.New("broker clone URL must not include query parameters or a fragment")
 	}
-	repoName := strings.Trim(parsed.Path, "/")
-	if repoName == "" {
-		return "", "", true, errors.New("broker clone URL must include a logical repository path")
+	parts := strings.Split(strings.Trim(parsed.Path, "/"), "/")
+	if len(parts) == 0 || parts[0] == "" {
+		return "", "", "", true, errors.New("broker clone URL must include a logical repository path")
 	}
-	logical, err := normalizeLogicalRepoName(repoName)
+	if len(parts) > 3 {
+		return "", "", "", true, errors.New("broker clone URL accepts repo.git, team/repo.git, or team/repo/repo.git")
+	}
+	teamName := ""
+	repoPart := parts[len(parts)-1]
+	if len(parts) >= 2 {
+		teamName = strings.TrimSpace(parts[0])
+	}
+	logical, err := normalizeLogicalRepoName(repoPart)
 	if err != nil {
-		return "", "", true, err
+		return "", "", "", true, err
 	}
-	return parsed.Scheme + "://" + parsed.Host, logical, true, nil
+	if len(parts) == 3 && strings.TrimSuffix(parts[1], ".git") != strings.TrimSuffix(logical, ".git") {
+		return "", "", "", true, errors.New("broker clone URL middle repo segment must match the repository name")
+	}
+	return parsed.Scheme + "://" + parsed.Host, logical, teamName, true, nil
+}
+
+var lookupTXT = net.LookupTXT
+
+func discoverBrokerCloneURL(raw string) (string, string, string, bool, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || (!strings.HasPrefix(raw, "http://") && !strings.HasPrefix(raw, "https://")) {
+		return "", "", "", false, nil
+	}
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.Host == "" {
+		return "", "", "", false, err
+	}
+	if isDirectBrokerHost(parsed.Hostname()) {
+		return "", "", "", false, nil
+	}
+	parts := strings.Split(strings.Trim(parsed.Path, "/"), "/")
+	if len(parts) < 2 {
+		return "", "", "", false, nil
+	}
+	teamName := strings.TrimSpace(parts[0])
+	logical, err := normalizeLogicalRepoName(parts[len(parts)-1])
+	if err != nil {
+		return "", "", "", false, err
+	}
+	if len(parts) == 3 && strings.TrimSuffix(parts[1], ".git") != strings.TrimSuffix(logical, ".git") {
+		return "", "", "", false, nil
+	}
+	if len(parts) > 3 {
+		return "", "", "", false, nil
+	}
+	records, err := lookupTXT("_bgit." + parsed.Hostname())
+	if err != nil {
+		return "", "", "", false, nil
+	}
+	for _, record := range records {
+		if broker, teamID := brokerDiscoveryFromTXTRecord(record, teamName); broker != "" {
+			return broker, logical, teamID, true, nil
+		}
+	}
+	return "", "", "", false, nil
+}
+
+func brokerURLFromTXTRecord(record string) string {
+	broker, _ := brokerDiscoveryFromTXTRecord(record, "")
+	return broker
+}
+
+func brokerDiscoveryFromTXTRecord(record, teamName string) (string, string) {
+	fields := strings.Fields(strings.TrimSpace(record))
+	if len(fields) == 0 || fields[0] != "v=bgit1" {
+		return "", ""
+	}
+	broker := ""
+	teamID := ""
+	name := ""
+	for _, field := range fields[1:] {
+		if strings.HasPrefix(field, "broker=") {
+			broker = strings.TrimRight(strings.TrimPrefix(field, "broker="), "/")
+		}
+		if strings.HasPrefix(field, "team=") {
+			teamID = strings.TrimSpace(strings.TrimPrefix(field, "team="))
+		}
+		if strings.HasPrefix(field, "name=") {
+			name = strings.TrimSpace(strings.TrimPrefix(field, "name="))
+		}
+	}
+	if broker == "" {
+		return "", ""
+	}
+	if teamName == "" {
+		return broker, teamID
+	}
+	if name == teamName || teamID == teamName {
+		return broker, firstNonEmpty(teamID, teamName)
+	}
+	return "", ""
+}
+
+func resolveBrokerTeamName(brokerURL, teamName string) (string, error) {
+	teamName = strings.TrimSpace(teamName)
+	if teamName == "" || teamName == coreTeamName || teamName == coreTeamID {
+		return coreTeamID, nil
+	}
+	var resp struct {
+		Team brokerTeamInfo `json:"team"`
+	}
+	if err := brokerPost(brokerURL, "/teams/resolve", brokerRepoAdminRequest{Name: teamName}, &resp); err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(resp.Team.ID) == "" {
+		return "", fmt.Errorf("team %q not found", teamName)
+	}
+	return resp.Team.ID, nil
+}
+
+func isDirectBrokerHost(host string) bool {
+	host = strings.ToLower(strings.TrimSpace(host))
+	return strings.HasSuffix(host, ".lambda-url.us-east-1.on.aws") ||
+		strings.Contains(host, ".lambda-url.") && strings.HasSuffix(host, ".on.aws") ||
+		strings.HasSuffix(host, ".run.app") ||
+		strings.HasSuffix(host, ".cloudfunctions.net")
 }
 
 func brokerProfileForCloneURL(brokerURL string) (brokerProfile, error) {
@@ -1549,6 +2327,64 @@ func brokerInitPrompt(stdin io.Reader, stdout io.Writer, initial initDialogConfi
 		reader = bufio.NewReader(stdin)
 	}
 	return runInitDialogWithRaw(reader, stdin, stdout, initial, profiles)
+}
+
+func brokerInitSelectTeam(stdin io.Reader, stdout io.Writer, profile brokerProfile) (string, error) {
+	teams, err := brokerInitTeamChoices(profile)
+	if err != nil {
+		return "", err
+	}
+	if len(teams) == 0 {
+		return "", errors.New("no teams available for selected broker")
+	}
+	reader, ok := stdin.(*bufio.Reader)
+	if !ok {
+		reader = bufio.NewReader(stdin)
+	}
+	value, ok, err := runSetupSelectWithRaw(reader, stdin, stdout, "Select team", teams, "")
+	if err != nil {
+		return "", err
+	}
+	if !ok || strings.TrimSpace(value) == "" {
+		return "", errors.New("init canceled")
+	}
+	return value, nil
+}
+
+func brokerInitTeamChoices(profile brokerProfile) ([]setupChoice, error) {
+	var resp brokerTeamsResponse
+	if err := brokerPost(profile.BrokerURL, "/teams/list", brokerRepoAdminRequest{}, &resp); err != nil {
+		repos, repoErr := brokerReposMineAllKeys(context.Background(), profile.BrokerURL)
+		if repoErr != nil {
+			return nil, err
+		}
+		seen := map[string]bool{}
+		var choices []setupChoice
+		for _, repo := range repos {
+			teamID := strings.TrimSpace(repo.Repo.TeamID)
+			if teamID == "" {
+				teamID = coreTeamID
+			}
+			if seen[teamID] {
+				continue
+			}
+			seen[teamID] = true
+			choices = append(choices, setupChoice{Label: teamID, Value: teamID})
+		}
+		sort.Slice(choices, func(i, j int) bool { return choices[i].Label < choices[j].Label })
+		return choices, nil
+	}
+	choices := make([]setupChoice, 0, len(resp.Teams))
+	for _, team := range resp.Teams {
+		label := firstNonEmpty(strings.TrimSpace(team.Name), strings.TrimSpace(team.ID))
+		value := strings.TrimSpace(team.ID)
+		if value == "" {
+			continue
+		}
+		choices = append(choices, setupChoice{Label: label, Value: value})
+	}
+	sort.Slice(choices, func(i, j int) bool { return choices[i].Label < choices[j].Label })
+	return choices, nil
 }
 
 type initDialogState struct {
@@ -2038,6 +2874,16 @@ func initBrokerWorktree(target, repoName string, profile brokerProfile, identity
 	if err != nil {
 		return err
 	}
+	repoName, err = normalizeLogicalRepoName(repoName)
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(profile.TeamID) == "" {
+		return errors.New("init requires a selected team")
+	}
+	if err := brokerRequireExistingLogicalRepo(profile.BrokerURL, profile.Provider, repoName, profile.TeamID); err != nil {
+		return err
+	}
 	if err := os.MkdirAll(absTarget, 0o755); err != nil {
 		return err
 	}
@@ -2045,10 +2891,6 @@ func initBrokerWorktree(target, repoName string, profile brokerProfile, identity
 		if _, fallbackErr := runGit(absTarget, "init"); fallbackErr != nil {
 			return err
 		}
-	}
-	repoName, err = normalizeLogicalRepoName(repoName)
-	if err != nil {
-		return err
 	}
 	remoteURL := fmt.Sprintf("git@%s:%s", defaultSSHHost, repoName)
 	sshCommand := gitSSHCommandForExecutable()
@@ -2059,6 +2901,9 @@ func initBrokerWorktree(target, repoName string, profile brokerProfile, identity
 		{"bucketgit.provider", profile.Provider},
 		{"bucketgit.logicalRepo", repoName},
 		{"core.sshCommand", sshCommand},
+	}
+	if strings.TrimSpace(profile.TeamID) != "" {
+		pairs = append(pairs, []string{"bucketgit.team", strings.TrimSpace(profile.TeamID)})
 	}
 	if strings.TrimSpace(identityName) != "" {
 		pairs = append(pairs, []string{"user.name", strings.TrimSpace(identityName)})
@@ -2080,12 +2925,27 @@ func initBrokerWorktree(target, repoName string, profile brokerProfile, identity
 	if err := setGitBranchTracking(absTarget, defaultBranch, "origin"); err != nil {
 		return err
 	}
-	if err := brokerUpsertLogicalRepo(profile.BrokerURL, profile.Provider, repoName); err != nil {
-		fmt.Fprintf(stdout, "broker repo registration skipped: %v\n", err)
-	}
 	fmt.Fprintf(stdout, "Initialized broker-backed BucketGit repository in %s/\n", filepath.Join(absTarget, ".git"))
 	fmt.Fprintf(stdout, "configured origin %s\n", remoteURL)
 	return nil
+}
+
+func brokerRequireExistingLogicalRepo(brokerURL, provider, logicalRepo, teamID string) error {
+	logical, err := normalizeLogicalRepoName(logicalRepo)
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(teamID) == "" {
+		return errors.New("team is required")
+	}
+	cfg := config{
+		provider:    provider,
+		prefix:      logical,
+		logicalRepo: logical,
+		origin:      fmt.Sprintf("git@%s:%s", defaultSSHHost, logical),
+		teamID:      strings.TrimSpace(teamID),
+	}
+	return brokerPost(brokerURL, "/repos/get", brokerRepoRequest{Repo: repoForBroker(cfg)}, nil)
 }
 
 func gitSSHCommandForExecutable() string {

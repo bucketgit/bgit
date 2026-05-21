@@ -4,6 +4,19 @@ All notable changes to `bgit` are documented in this file.
 
 This project follows semantic versioning.
 
+## 1.1.0
+
+Changed
+
+- Added broker users, broker admins, teams, team-to-repository grants, and
+  exact-FQDN TXT discovery for team clone URLs.
+- `bgit setup` now seeds the default `core` team, and flat repository flows map
+  through `core` while still accepting explicit team clone URLs.
+- `bgit setup` now starts from configured brokers, with explicit new, update,
+  manage, and delete paths instead of mixing broker creation and redeploys.
+- Broker user creation now uses an invite/accept flow, setup management fields
+  use selectable roles/users/teams/repos, and invalid roles are rejected.
+
 ## 1.0.1
 
 Changed

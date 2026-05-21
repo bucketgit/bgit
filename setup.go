@@ -39,6 +39,7 @@ type setupOptions struct {
 	region     string
 	keys       []string
 	noAgent    bool
+	action     string
 }
 
 type setupProfile struct {
@@ -81,6 +82,14 @@ type brokerOwnerRequest struct {
 	PublicKeys []string `json:"public_keys,omitempty"`
 }
 
+type setupConfiguredBroker struct {
+	Provider  string
+	Profile   string
+	Region    string
+	BrokerURL string
+	Detail    string
+}
+
 func setupCommand(ctx context.Context, base config, args []string, stdin io.Reader, stdout io.Writer) error {
 	if len(args) >= 2 && args[0] == "profile" && args[1] == "create" {
 		return setupProfileCreateCommand(args[2:], stdin, stdout)
@@ -117,6 +126,74 @@ func setupCommand(ctx context.Context, base config, args []string, stdin io.Read
 	}
 	profiles = markConfiguredSetupProfiles(profiles, global)
 	profiles = filterSetupProfiles(profiles, opts.provider, opts.profiles, opts.region)
+	interactiveBrokerMenu := !opts.yes && len(opts.profiles) == 0 && opts.provider == "" && opts.region == ""
+	if interactiveBrokerMenu {
+	brokerMenu:
+		for {
+			action, broker, err := runSetupBrokerHomeWithRaw(interactiveReader, stdin, stdout, configuredSetupBrokers(global), setupAvailableCreateProviders())
+			if err != nil {
+				return err
+			}
+			if action == "broker" {
+				for {
+					action, err = runSetupBrokerActionWithRaw(interactiveReader, stdin, stdout, broker)
+					if err != nil {
+						return err
+					}
+					if action == "back" {
+						continue brokerMenu
+					}
+					if action != "manage" {
+						break
+					}
+					err = runSetupBrokerManageWithRaw(base, interactiveReader, stdin, stdout, broker)
+					if errors.Is(err, errSetupBack) {
+						continue
+					}
+					if err != nil {
+						return err
+					}
+					return setupReturnToMenuOrQuit(ctx, base, args, stdin, stdout, interactiveReader)
+				}
+			}
+			switch action {
+			case "cancel":
+				return nil
+			case "back":
+				continue brokerMenu
+			case "manage":
+				if err := runSetupBrokerManageWithRaw(base, interactiveReader, stdin, stdout, broker); err != nil {
+					return err
+				}
+				return setupReturnToMenuOrQuit(ctx, base, args, stdin, stdout, interactiveReader)
+			case "delete":
+				ok, err := runSetupBrokerDeleteConfirmWithRaw(interactiveReader, stdin, stdout, broker)
+				if err != nil {
+					return err
+				}
+				if !ok {
+					continue brokerMenu
+				}
+				if err := brokerDeleteCommand(ctx, base, []string{"--provider", setupProviderLabel(broker.Provider), "--profile", broker.Profile, "--region", broker.Region, "--yes"}, stdin, stdout); err != nil {
+					return err
+				}
+				return setupReturnToMenuOrQuit(ctx, base, args, stdin, stdout, interactiveReader)
+			case "update":
+				opts.action = "update"
+				opts.provider = broker.Provider
+				opts.profiles = []string{broker.Profile}
+				opts.region = broker.Region
+				profiles = filterSetupProfiles(markConfiguredSetupProfiles(profilesWithoutConfiguredExpansion(profiles), global), opts.provider, opts.profiles, opts.region)
+				break brokerMenu
+			case "new":
+				opts.action = "new"
+				break brokerMenu
+			default:
+				opts.action = "upsert"
+				break brokerMenu
+			}
+		}
+	}
 	if len(profiles) == 0 {
 		if opts.yes {
 			return errors.New("no cloud profiles found; install/configure gcloud or AWS CLI profiles first")
@@ -139,7 +216,10 @@ selectAgain:
 			DefaultCreate:           firstSetupRequestedProfile(opts),
 			DefaultCreateByProvider: setupCreateProfileDefaults(profiles, opts),
 		}
-		if !opts.yes {
+		if opts.action == "update" {
+			selection.Profiles = profiles
+			selection.Keys = nil
+		} else if !opts.yes {
 			selected, err := runSetupDialogWithRaw(interactiveReader, stdin, stdout, selection)
 			if err != nil {
 				return err
@@ -177,6 +257,9 @@ selectAgain:
 				return err
 			}
 			fmt.Fprintf(stdout, "wrote BucketGit config %s\n", path)
+			if interactiveBrokerMenu {
+				return setupReturnToMenuOrQuit(ctx, base, args, stdin, stdout, interactiveReader)
+			}
 			return nil
 		}
 		var publicKeys []string
@@ -255,13 +338,34 @@ selectAgain:
 			return err
 		}
 		fmt.Fprintf(stdout, "wrote BucketGit config %s\n", path)
-		fmt.Fprintln(stdout)
-		fmt.Fprintln(stdout, "Next steps:")
-		fmt.Fprintln(stdout, "  bgit init")
-		fmt.Fprintln(stdout, "  bgit init --noninteractive --repo my-repo --profile PROFILE")
-		fmt.Fprintln(stdout, "  git push -u origin main")
+		if opts.action != "update" {
+			fmt.Fprintln(stdout)
+			fmt.Fprintln(stdout, "Next steps:")
+			fmt.Fprintln(stdout, "  bgit init")
+			fmt.Fprintln(stdout, "  bgit init --noninteractive --repo my-repo --profile PROFILE")
+			fmt.Fprintln(stdout, "  git push -u origin main")
+		}
+		if interactiveBrokerMenu {
+			return setupReturnToMenuOrQuit(ctx, base, args, stdin, stdout, interactiveReader)
+		}
 		return nil
 	}
+}
+
+func setupReturnToMenuOrQuit(ctx context.Context, base config, args []string, stdin io.Reader, stdout io.Writer, reader *bufio.Reader) error {
+	fmt.Fprintln(stdout)
+	fmt.Fprint(stdout, "Press <enter> to return to the menu or press <q> to quit. ")
+	line, err := reader.ReadString('\n')
+	if err != nil && !errors.Is(err, io.EOF) {
+		return err
+	}
+	if errors.Is(err, io.EOF) && strings.TrimSpace(line) == "" {
+		return nil
+	}
+	if strings.EqualFold(strings.TrimSpace(line), "q") {
+		return nil
+	}
+	return setupCommand(ctx, base, args, stdin, stdout)
 }
 
 func setupProfileCreateCommand(args []string, stdin io.Reader, stdout io.Writer) error {
@@ -364,8 +468,111 @@ func setupCreateProfileDefaults(profiles []setupProfile, opts setupOptions) map[
 	return defaults
 }
 
+func configuredSetupBrokers(cfg globalConfig) []setupConfiguredBroker {
+	var brokers []setupConfiguredBroker
+	for _, profile := range cfg.GCPProfiles {
+		for _, region := range profile.Regions {
+			if strings.TrimSpace(region.BrokerURL) == "" {
+				continue
+			}
+			brokers = append(brokers, setupConfiguredBroker{
+				Provider:  "gcs",
+				Profile:   profile.Name,
+				Region:    region.Name,
+				BrokerURL: region.BrokerURL,
+				Detail:    firstNonEmpty(profile.ProjectID, profile.Account, profile.ServiceAccount),
+			})
+		}
+	}
+	for _, profile := range cfg.AWSProfiles {
+		for _, region := range profile.Regions {
+			if strings.TrimSpace(region.BrokerURL) == "" {
+				continue
+			}
+			brokers = append(brokers, setupConfiguredBroker{
+				Provider:  "s3",
+				Profile:   profile.Name,
+				Region:    region.Name,
+				BrokerURL: region.BrokerURL,
+				Detail:    firstNonEmpty(profile.AccountID, profile.ARN),
+			})
+		}
+	}
+	sort.Slice(brokers, func(i, j int) bool {
+		a := setupBrokerQualifiedName(brokers[i])
+		b := setupBrokerQualifiedName(brokers[j])
+		if a == b {
+			return brokers[i].BrokerURL < brokers[j].BrokerURL
+		}
+		return a < b
+	})
+	return brokers
+}
+
+func configuredSetupBrokerExists(cfg globalConfig, provider, profile, region string) bool {
+	provider = normalizeSetupProvider(provider)
+	profile = strings.TrimSpace(profile)
+	region = strings.TrimSpace(region)
+	for _, broker := range configuredSetupBrokers(cfg) {
+		if broker.Provider == provider && broker.Profile == profile && broker.Region == region {
+			return true
+		}
+	}
+	return false
+}
+
+func profilesWithoutConfiguredExpansion(profiles []setupProfile) []setupProfile {
+	seen := map[string]struct{}{}
+	var out []setupProfile
+	for _, profile := range profiles {
+		key := profile.Provider + "\x00" + profile.Name
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		profile.Existing = false
+		profile.ConfiguredRegions = nil
+		out = append(out, profile)
+	}
+	return out
+}
+
+func setupBrokerQualifiedName(broker setupConfiguredBroker) string {
+	name := setupProviderLabel(broker.Provider) + ":" + broker.Profile
+	if strings.TrimSpace(broker.Region) != "" {
+		name += "." + broker.Region
+	}
+	return name
+}
+
+func printSetupBrokerManagement(stdout io.Writer, broker setupConfiguredBroker) {
+	fmt.Fprintf(stdout, "Manage %s\n", setupBrokerQualifiedName(broker))
+	fmt.Fprintf(stdout, "Broker: %s\n\n", broker.BrokerURL)
+	profileArgs := fmt.Sprintf("--profile %s --region %s", broker.Profile, broker.Region)
+	fmt.Fprintln(stdout, "Common broker management commands:")
+	fmt.Fprintf(stdout, "  bgit %s admin broker-users list\n", profileArgs)
+	fmt.Fprintf(stdout, "  bgit %s admin invite-broker-user USER --role user\n", profileArgs)
+	fmt.Fprintf(stdout, "  bgit %s admin teams list\n", profileArgs)
+	fmt.Fprintf(stdout, "  bgit %s admin teams create TEAM\n", profileArgs)
+	fmt.Fprintf(stdout, "  bgit admin invite-user --broker %s --team TEAM --user USER --role developer REPO\n", broker.BrokerURL)
+	fmt.Fprintf(stdout, "  bgit admin confirm-ownership-transfer --broker %s REPO\n", broker.BrokerURL)
+}
+
+func setupBrokerConfig(base config, broker setupConfiguredBroker) config {
+	cfg := base
+	cfg.provider = broker.Provider
+	cfg.gcloudConfiguration = broker.Profile
+	cfg.gcloudConfigurationExplicit = broker.Profile != ""
+	cfg.region = broker.Region
+	cfg.brokerURL = broker.BrokerURL
+	return cfg
+}
+
 func setupProvisionSelectedProfile(base config, path, now string, profile setupProfile, opts setupOptions, publicKeys []string, global *globalConfig, stdout io.Writer) error {
 	_ = path
+	if opts.action == "new" && configuredSetupBrokerExists(*global, profile.Provider, profile.Name, profile.Region) {
+		return fmt.Errorf("%s:%s.%s already has a broker; choose Update broker to redeploy it", setupProviderLabel(profile.Provider), profile.Name, profile.Region)
+	}
 	cfg := base
 	cfg.provider = profile.Provider
 	cfg.gcloudConfiguration = profile.Name
@@ -379,6 +586,8 @@ func setupProvisionSelectedProfile(base config, path, now string, profile setupP
 			return err
 		}
 		fmt.Fprintf(stdout, "imported %d owner key(s) into broker %s\n", len(publicKeys), brokerURL)
+	} else if err := brokerEnsureCoreTeam(brokerURL); err != nil {
+		return err
 	}
 	switch profile.Provider {
 	case "gcs":
@@ -1826,24 +2035,25 @@ func runSetupRegionDialogWithRaw(reader *bufio.Reader, rawInput io.Reader, stdou
 		case 'q', 'Q':
 			return nil, errSetupBack
 		case 0x1b:
-			next, err := reader.ReadByte()
+			last, ok, err := setupReadEscapeSequence(reader)
 			if err != nil {
+				return nil, err
+			}
+			if !ok {
 				return nil, errSetupBack
 			}
-			if next == '[' {
-				last, err := reader.ReadByte()
-				if err != nil {
-					return nil, errSetupBack
+			switch last {
+			case 'A':
+				state.up()
+			case 'B':
+				state.down()
+			case 'C':
+				if regions, ok := state.activate(); ok {
+					return regions, nil
 				}
-				switch last {
-				case 'A':
-					state.up()
-				case 'B':
-					state.down()
-				}
-				continue
+			case 'D':
+				return nil, errSetupBack
 			}
-			return nil, errSetupBack
 		}
 	}
 }
@@ -2132,32 +2342,39 @@ func runSetupDialogWithRaw(reader *bufio.Reader, rawInput io.Reader, stdout io.W
 				state.message = ""
 				continue
 			}
-			next, err := reader.ReadByte()
+			last, ok, err := setupReadEscapeSequence(reader)
 			if err != nil {
+				return setupSelection{}, err
+			}
+			if !ok {
 				if state.createProvider != "" {
 					state.cancelCreateProfile()
 					continue
 				}
 				return setupSelection{}, errors.New("setup canceled")
 			}
-			if next == '[' {
-				last, err := reader.ReadByte()
-				if err != nil {
+			switch last {
+			case 'A':
+				state.up()
+			case 'B':
+				state.down()
+			case 'C':
+				if selected, ok := state.activate(); ok {
+					return selected, nil
+				} else if state.button == 1 {
 					return setupSelection{}, errors.New("setup canceled")
 				}
-				switch last {
-				case 'A':
-					state.up()
-				case 'B':
-					state.down()
+			case 'D':
+				if state.createProvider != "" {
+					state.cancelCreateProfile()
+					continue
 				}
-				continue
+				return setupSelection{}, errors.New("setup canceled")
+			default:
+				if state.createProvider != "" {
+					state.cancelCreateProfile()
+				}
 			}
-			if state.createProvider != "" {
-				state.cancelCreateProfile()
-				continue
-			}
-			return setupSelection{}, errors.New("setup canceled")
 		default:
 			if state.editingCreate && b >= 32 && b <= 126 {
 				state.appendCreateByte(b)
@@ -2231,6 +2448,2996 @@ type setupDialogVisibleItem struct {
 	ProfileIndex int
 	KeyIndex     int
 	Label        string
+}
+
+type setupBrokerHomeState struct {
+	Brokers         []setupConfiguredBroker
+	CreateProviders []string
+	Cursor          int
+	Scroll          int
+	Button          int
+	Message         string
+}
+
+type setupBrokerActionState struct {
+	Broker  setupConfiguredBroker
+	Cursor  int
+	Button  int
+	Message string
+}
+
+type setupBrokerManageState struct {
+	Broker  setupConfiguredBroker
+	Cursor  int
+	Scroll  int
+	Button  int
+	Message string
+}
+
+type setupBrokerManageAction struct {
+	ID    string
+	Label string
+	Help  string
+}
+
+type setupTextField struct {
+	Label    string
+	Value    string
+	Secret   bool
+	Required bool
+}
+
+type setupTextFormState struct {
+	Title        string
+	Fields       []setupTextField
+	Cursor       int
+	Button       int
+	Editing      bool
+	EditOriginal string
+	Message      string
+}
+
+type setupChoice struct {
+	Label string
+	Value string
+	Help  string
+	Group string
+}
+
+type setupSelectState struct {
+	Title   string
+	Choices []setupChoice
+	Cursor  int
+	Scroll  int
+	Button  int
+	Message string
+}
+
+type setupMultiSelectState struct {
+	Title    string
+	Choices  []setupChoice
+	Selected []bool
+	Cursor   int
+	Scroll   int
+	Button   int
+	Message  string
+}
+
+func runSetupBrokerHomeWithRaw(reader *bufio.Reader, rawInput io.Reader, stdout io.Writer, brokers []setupConfiguredBroker, createProviders []string) (string, setupConfiguredBroker, error) {
+	rawMode, restore, err := setupDialogRawMode(rawInput)
+	if err != nil {
+		return "", setupConfiguredBroker{}, err
+	}
+	defer restore()
+	state := setupBrokerHomeState{Brokers: brokers, CreateProviders: createProviders, Button: -1}
+	for {
+		fmt.Fprint(stdout, renderSetupBrokerHomeFrame(state, rawMode))
+		b, err := reader.ReadByte()
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return "cancel", setupConfiguredBroker{}, nil
+			}
+			return "", setupConfiguredBroker{}, err
+		}
+		switch b {
+		case 0x03:
+			return "", setupConfiguredBroker{}, errors.New("setup canceled")
+		case 0x04:
+			action, broker, ok := state.activate()
+			if ok {
+				return action, broker, nil
+			}
+		case '\r', '\n', ' ':
+			action, broker, ok := state.activate()
+			if ok {
+				return action, broker, nil
+			}
+		case '\t':
+			state.tab()
+		case 'q', 'Q':
+			return "cancel", setupConfiguredBroker{}, nil
+		case 0x1b:
+			last, ok, err := setupReadEscapeSequence(reader)
+			if err != nil {
+				return "", setupConfiguredBroker{}, err
+			}
+			if !ok {
+				return "cancel", setupConfiguredBroker{}, nil
+			}
+			switch last {
+			case 'A':
+				state.up()
+			case 'B':
+				state.down()
+			case 'C':
+				action, broker, ok := state.activate()
+				if ok {
+					return action, broker, nil
+				}
+			case 'D':
+				return "cancel", setupConfiguredBroker{}, nil
+			}
+		}
+	}
+}
+
+func (s *setupBrokerHomeState) rows() int {
+	rows := len(s.Brokers)
+	if len(s.CreateProviders) > 0 {
+		rows++
+	}
+	if rows == 0 {
+		rows = 1
+	}
+	return rows
+}
+
+func (s *setupBrokerHomeState) visibleRange() (int, int) {
+	const maxRows = 10
+	rows := s.rows()
+	if s.Cursor < s.Scroll {
+		s.Scroll = s.Cursor
+	}
+	if s.Cursor >= s.Scroll+maxRows {
+		s.Scroll = s.Cursor - maxRows + 1
+	}
+	if s.Scroll < 0 {
+		s.Scroll = 0
+	}
+	if s.Scroll > rows-maxRows {
+		s.Scroll = maxSetupDialogInt(0, rows-maxRows)
+	}
+	end := minSetupDialogInt(s.Scroll+maxRows, rows)
+	return s.Scroll, end
+}
+
+func (s *setupBrokerHomeState) up() {
+	if s.rows() == 0 {
+		return
+	}
+	s.Button = -1
+	s.Message = ""
+	if s.Cursor == 0 {
+		s.Cursor = s.rows() - 1
+		return
+	}
+	s.Cursor--
+}
+
+func (s *setupBrokerHomeState) down() {
+	if s.rows() == 0 {
+		return
+	}
+	s.Button = -1
+	s.Message = ""
+	s.Cursor = (s.Cursor + 1) % s.rows()
+}
+
+func (s *setupBrokerHomeState) tab() {
+	s.Message = ""
+	if s.Button == 1 {
+		s.Button = -1
+		s.Cursor = 0
+		return
+	}
+	if s.Button < 0 {
+		s.Button = 0
+		return
+	}
+	s.Button = (s.Button + 1) % 2
+}
+
+func (s *setupBrokerHomeState) activate() (string, setupConfiguredBroker, bool) {
+	if s.Button == 0 {
+		return "new", setupConfiguredBroker{}, true
+	}
+	if s.Button == 1 {
+		return "cancel", setupConfiguredBroker{}, true
+	}
+	if len(s.Brokers) == 0 {
+		if len(s.CreateProviders) == 0 {
+			s.Message = "Install gcloud or AWS CLI to create a broker."
+			return "", setupConfiguredBroker{}, false
+		}
+		return "new", setupConfiguredBroker{}, true
+	}
+	if s.Cursor < len(s.Brokers) {
+		return "broker", s.Brokers[s.Cursor], true
+	}
+	return "new", setupConfiguredBroker{}, true
+}
+
+func renderSetupBrokerHomeFrame(state setupBrokerHomeState, rawMode bool) string {
+	rendered := renderSetupBrokerHomeWithStyle(state, rawMode)
+	if !rawMode {
+		return rendered
+	}
+	rendered = strings.ReplaceAll(rendered, "\n", "\r\n")
+	return "\x1b[?25l\x1b[H\x1b[2J" + rendered
+}
+
+func renderSetupBrokerHomeWithStyle(state setupBrokerHomeState, style bool) string {
+	width := setupDialogDynamicWidth(58, setupBreadcrumb("Broker setups"), "Up/Down move  Right/Enter select  Tab buttons")
+	for _, broker := range state.Brokers {
+		width = setupDialogDynamicWidth(width, setupBrokerQualifiedName(broker)+" "+firstNonEmpty(broker.Detail, strings.TrimPrefix(strings.TrimPrefix(broker.BrokerURL, "https://"), "http://")))
+	}
+	var lines []string
+	lines = append(lines,
+		setupDialogBorder(width),
+		setupDialogTitleRow(width),
+		setupDialogBorder(width),
+		setupDialogRowWidth(setupBreadcrumb("Broker setups"), width),
+		setupDialogRowWidth("", width),
+	)
+	start, end := state.visibleRange()
+	rows := state.rows()
+	for row := start; row < end; row++ {
+		marker := " "
+		if state.Button < 0 && state.Cursor == row {
+			marker = ">"
+		}
+		rowStyle := setupDialogSectionStyle(style, state.Button < 0 && state.Cursor == row)
+		switch {
+		case row < len(state.Brokers):
+			broker := state.Brokers[row]
+			detail := firstNonEmpty(broker.Detail, strings.TrimPrefix(strings.TrimPrefix(broker.BrokerURL, "https://"), "http://"))
+			lines = append(lines, setupDialogRowStyledWidth(fmt.Sprintf("%s %-24s %s", marker, setupBrokerQualifiedName(broker), detail), width, rowStyle))
+		case len(state.CreateProviders) > 0:
+			lines = append(lines, setupDialogRowStyledWidth(fmt.Sprintf("%s new broker", marker), width, rowStyle))
+		default:
+			lines = append(lines, setupDialogRowStyledWidth("  no brokers configured", width, rowStyle))
+		}
+	}
+	if rows > 10 {
+		lines = append(lines, setupDialogRowWidth(setupBrokerScrollBar(start, end, rows), width))
+	}
+	if state.Message != "" {
+		lines = append(lines, setupDialogRowStyledWidth(state.Message, width, setupDialogANSI(style, "33")))
+	}
+	okStyle := ""
+	exitStyle := ""
+	if style && state.Button == 0 {
+		okStyle = "\x1b[44;97m"
+	}
+	if style && state.Button == 1 {
+		exitStyle = "\x1b[44;97m"
+	}
+	lines = append(lines,
+		setupDialogRowWidth("", width),
+		setupDialogBorder(width),
+		setupDialogRowWidth(setupDialogButton("[ New ]", okStyle)+"    "+setupDialogButton("[ Exit ]", exitStyle), width),
+		setupDialogRowWidth("Up/Down move  Right/Enter select  Tab buttons", width),
+		setupDialogRowWidth("Left/Esc cancel  Ctrl-C cancel", width),
+		setupDialogBorder(width),
+	)
+	return strings.Join(lines, "\n") + "\n"
+}
+
+func setupBrokerScrollBar(start, end, total int) string {
+	const width = 24
+	if total <= 0 {
+		return "scroll [" + strings.Repeat("-", width) + "]"
+	}
+	thumb := maxSetupDialogInt(1, width*(end-start)/total)
+	pos := 0
+	if total > end-start {
+		pos = (width - thumb) * start / (total - (end - start))
+	}
+	var b strings.Builder
+	b.WriteString("scroll [")
+	for i := 0; i < width; i++ {
+		if i >= pos && i < pos+thumb {
+			b.WriteByte('#')
+		} else {
+			b.WriteByte('-')
+		}
+	}
+	b.WriteString(fmt.Sprintf("] %d-%d of %d", start+1, end, total))
+	return b.String()
+}
+
+func runSetupBrokerActionWithRaw(reader *bufio.Reader, rawInput io.Reader, stdout io.Writer, broker setupConfiguredBroker) (string, error) {
+	rawMode, restore, err := setupDialogRawMode(rawInput)
+	if err != nil {
+		return "", err
+	}
+	defer restore()
+	state := setupBrokerActionState{Broker: broker, Button: -1}
+	for {
+		fmt.Fprint(stdout, renderSetupBrokerActionFrame(state, rawMode))
+		b, err := reader.ReadByte()
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return "cancel", nil
+			}
+			return "", err
+		}
+		switch b {
+		case 0x03:
+			return "", errors.New("setup canceled")
+		case 0x04:
+			action, ok := state.activate()
+			if ok {
+				return action, nil
+			}
+		case '\r', '\n', ' ':
+			action, ok := state.activate()
+			if ok {
+				return action, nil
+			}
+		case '\t':
+			state.tab()
+		case 'q', 'Q':
+			return "cancel", nil
+		case 0x1b:
+			last, ok, err := setupReadEscapeSequence(reader)
+			if err != nil {
+				return "", err
+			}
+			if !ok {
+				return "back", nil
+			}
+			switch last {
+			case 'A':
+				state.up()
+			case 'B':
+				state.down()
+			case 'C':
+				action, ok := state.activate()
+				if ok {
+					return action, nil
+				}
+			case 'D':
+				return "back", nil
+			}
+		}
+	}
+}
+
+func (s *setupBrokerActionState) rows() int { return 4 }
+
+func (s *setupBrokerActionState) up() {
+	s.Button = -1
+	s.Message = ""
+	if s.Cursor == 0 {
+		s.Cursor = s.rows() - 1
+		return
+	}
+	s.Cursor--
+}
+
+func (s *setupBrokerActionState) down() {
+	s.Button = -1
+	s.Message = ""
+	s.Cursor = (s.Cursor + 1) % s.rows()
+}
+
+func (s *setupBrokerActionState) tab() {
+	s.Message = ""
+	if s.Button == 1 {
+		s.Button = -1
+		s.Cursor = 0
+		return
+	}
+	if s.Button < 0 {
+		s.Button = 0
+		return
+	}
+	s.Button = (s.Button + 1) % 2
+}
+
+func (s *setupBrokerActionState) activate() (string, bool) {
+	if s.Button == 1 {
+		return "back", true
+	}
+	if s.Button == 0 {
+		return "manage", true
+	}
+	switch s.Cursor {
+	case 0:
+		return "manage", true
+	case 1:
+		return "update", true
+	case 2:
+		return "delete", true
+	default:
+		return "back", true
+	}
+}
+
+func renderSetupBrokerActionFrame(state setupBrokerActionState, rawMode bool) string {
+	rendered := renderSetupBrokerActionWithStyle(state, rawMode)
+	if !rawMode {
+		return rendered
+	}
+	rendered = strings.ReplaceAll(rendered, "\n", "\r\n")
+	return "\x1b[?25l\x1b[H\x1b[2J" + rendered
+}
+
+func renderSetupBrokerActionWithStyle(state setupBrokerActionState, style bool) string {
+	const width = 76
+	actions := []struct {
+		Label string
+		Help  string
+	}{
+		{"manage broker", "users, teams, invites, and ownership commands"},
+		{"update broker", "redeploy stack/function for this profile and region"},
+		{"delete broker", "decommission broker infrastructure"},
+		{"back", "return to shell without changes"},
+	}
+	var lines []string
+	lines = append(lines,
+		setupDialogBorder(width),
+		setupDialogRowWidth("BUCKETGIT SETUP", width),
+		setupDialogBorder(width),
+		setupDialogRowWidth("Broker "+setupBrokerQualifiedName(state.Broker), width),
+		setupDialogRowWidth(strings.TrimPrefix(strings.TrimPrefix(state.Broker.BrokerURL, "https://"), "http://"), width),
+		setupDialogRowWidth("", width),
+	)
+	for i, action := range actions {
+		marker := " "
+		if state.Button < 0 && state.Cursor == i {
+			marker = ">"
+		}
+		rowStyle := setupDialogSectionStyle(style, state.Button < 0 && state.Cursor == i)
+		lines = append(lines, setupDialogWrappedActionRows(marker, action.Label, action.Help, 15, width, rowStyle)...)
+	}
+	okStyle := ""
+	exitStyle := ""
+	if style && state.Button == 0 {
+		okStyle = "\x1b[44;97m"
+	}
+	if style && state.Button == 1 {
+		exitStyle = "\x1b[44;97m"
+	}
+	lines = append(lines,
+		setupDialogRowWidth("", width),
+		setupDialogBorder(width),
+		setupDialogRowWidth(setupDialogButton("[ Manage ]", okStyle)+"    "+setupDialogButton("[ Back ]", exitStyle), width),
+		setupDialogRowWidth("Up/Down move  Right/Enter select  Tab buttons", width),
+		setupDialogRowWidth("Left/Esc back  Ctrl-C cancel", width),
+		setupDialogBorder(width),
+	)
+	return strings.Join(lines, "\n") + "\n"
+}
+
+func setupBrokerManageActions() []setupBrokerManageAction {
+	return []setupBrokerManageAction{
+		{ID: "users-manage", Label: "manage broker users", Help: "invite users and manage broker roles"},
+		{ID: "teams-manage", Label: "team management", Help: "create teams, manage members, and repository access"},
+		{ID: "back", Label: "back", Help: "return to shell"},
+	}
+}
+
+func runSetupBrokerManageWithRaw(base config, reader *bufio.Reader, rawInput io.Reader, stdout io.Writer, broker setupConfiguredBroker) error {
+	rawMode, restore, err := setupDialogRawMode(rawInput)
+	if err != nil {
+		return err
+	}
+	defer restore()
+	state := setupBrokerManageState{Broker: broker, Button: -1}
+	cfg := setupBrokerConfig(base, broker)
+	for {
+		fmt.Fprint(stdout, renderSetupBrokerManageFrame(state, rawMode))
+		b, err := reader.ReadByte()
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return nil
+			}
+			return err
+		}
+		switch b {
+		case 0x03:
+			return errors.New("setup canceled")
+		case 0x04:
+			action, ok := state.activate()
+			if ok {
+				if action == "back" {
+					return errSetupBack
+				}
+				msg, err := runSetupBrokerManageAction(cfg, broker, action, reader, rawInput, stdout)
+				if err != nil {
+					state.Message = err.Error()
+				} else {
+					state.Message = msg
+				}
+			}
+		case '\r', '\n', ' ':
+			action, ok := state.activate()
+			if ok {
+				if action == "back" {
+					return errSetupBack
+				}
+				msg, err := runSetupBrokerManageAction(cfg, broker, action, reader, rawInput, stdout)
+				if err != nil {
+					state.Message = err.Error()
+				} else {
+					state.Message = msg
+				}
+			}
+		case '\t':
+			state.tab()
+		case 'q', 'Q':
+			return nil
+		case 0x1b:
+			last, ok, err := setupReadEscapeSequence(reader)
+			if err != nil {
+				return err
+			}
+			if !ok {
+				return errSetupBack
+			}
+			switch last {
+			case 'A':
+				state.up()
+			case 'B':
+				state.down()
+			case 'C':
+				action, ok := state.activate()
+				if ok {
+					if action == "back" {
+						return errSetupBack
+					}
+					msg, err := runSetupBrokerManageAction(cfg, broker, action, reader, rawInput, stdout)
+					if err != nil {
+						state.Message = err.Error()
+					} else {
+						state.Message = msg
+					}
+				}
+			case 'D':
+				return errSetupBack
+			}
+		}
+	}
+}
+
+func (s *setupBrokerManageState) rows() int { return len(setupBrokerManageActions()) }
+
+func (s *setupBrokerManageState) visibleRange() (int, int) {
+	const maxRows = 10
+	rows := s.rows()
+	if s.Cursor < s.Scroll {
+		s.Scroll = s.Cursor
+	}
+	if s.Cursor >= s.Scroll+maxRows {
+		s.Scroll = s.Cursor - maxRows + 1
+	}
+	if s.Scroll < 0 {
+		s.Scroll = 0
+	}
+	if s.Scroll > rows-maxRows {
+		s.Scroll = maxSetupDialogInt(0, rows-maxRows)
+	}
+	return s.Scroll, minSetupDialogInt(s.Scroll+maxRows, rows)
+}
+
+func (s *setupBrokerManageState) up() {
+	if s.rows() == 0 {
+		return
+	}
+	s.Button = -1
+	s.Message = ""
+	if s.Cursor == 0 {
+		s.Cursor = s.rows() - 1
+		return
+	}
+	s.Cursor--
+}
+
+func (s *setupBrokerManageState) down() {
+	if s.rows() == 0 {
+		return
+	}
+	s.Button = -1
+	s.Message = ""
+	s.Cursor = (s.Cursor + 1) % s.rows()
+}
+
+func (s *setupBrokerManageState) tab() {
+	s.Message = ""
+	if s.Button == 1 {
+		s.Button = -1
+		s.Cursor = 0
+		return
+	}
+	if s.Button < 0 {
+		s.Button = 0
+		return
+	}
+	s.Button = (s.Button + 1) % 2
+}
+
+func (s *setupBrokerManageState) activate() (string, bool) {
+	if s.Button == 1 {
+		return "back", true
+	}
+	actions := setupBrokerManageActions()
+	if s.Button == 0 {
+		if s.Cursor >= 0 && s.Cursor < len(actions) {
+			return actions[s.Cursor].ID, true
+		}
+		return "back", true
+	}
+	if s.Cursor >= 0 && s.Cursor < len(actions) {
+		return actions[s.Cursor].ID, true
+	}
+	return "", false
+}
+
+func renderSetupBrokerManageFrame(state setupBrokerManageState, rawMode bool) string {
+	rendered := renderSetupBrokerManageWithStyle(state, rawMode)
+	if !rawMode {
+		return rendered
+	}
+	rendered = strings.ReplaceAll(rendered, "\n", "\r\n")
+	return "\x1b[?25l\x1b[H\x1b[2J" + rendered
+}
+
+func renderSetupBrokerManageWithStyle(state setupBrokerManageState, style bool) string {
+	const width = 76
+	actions := setupBrokerManageActions()
+	start, end := state.visibleRange()
+	var lines []string
+	lines = append(lines,
+		setupDialogBorder(width),
+		setupDialogRowWidth("BUCKETGIT SETUP", width),
+		setupDialogBorder(width),
+		setupDialogRowWidth("Manage "+setupBrokerQualifiedName(state.Broker), width),
+		setupDialogRowWidth(strings.TrimPrefix(strings.TrimPrefix(state.Broker.BrokerURL, "https://"), "http://"), width),
+		setupDialogRowWidth("", width),
+	)
+	for i := start; i < end; i++ {
+		action := actions[i]
+		marker := " "
+		if state.Button < 0 && state.Cursor == i {
+			marker = ">"
+		}
+		rowStyle := setupDialogSectionStyle(style, state.Button < 0 && state.Cursor == i)
+		lines = append(lines, setupDialogWrappedActionRows(marker, action.Label, action.Help, 20, width, rowStyle)...)
+	}
+	if len(actions) > 10 {
+		lines = append(lines, setupDialogRowWidth(setupBrokerScrollBar(start, end, len(actions)), width))
+	}
+	if state.Message != "" {
+		lines = append(lines, setupDialogRowStyledWidth(state.Message, width, setupDialogANSI(style, "33")))
+	}
+	okStyle := ""
+	backStyle := ""
+	if style && state.Button == 0 {
+		okStyle = "\x1b[44;97m"
+	}
+	if style && state.Button == 1 {
+		backStyle = "\x1b[44;97m"
+	}
+	lines = append(lines,
+		setupDialogRowWidth("", width),
+		setupDialogBorder(width),
+		setupDialogRowWidth(setupDialogButton("[ OK ]", okStyle)+"    "+setupDialogButton("[ Back ]", backStyle), width),
+		setupDialogRowWidth("Up/Down move  Right/Enter select  Tab buttons", width),
+		setupDialogRowWidth("Left/Esc back  Ctrl-C cancel", width),
+		setupDialogBorder(width),
+	)
+	return strings.Join(lines, "\n") + "\n"
+}
+
+func runSetupBrokerManageAction(cfg config, broker setupConfiguredBroker, action string, reader *bufio.Reader, rawInput io.Reader, stdout io.Writer) (string, error) {
+	switch action {
+	case "users-manage":
+		msg, err := runSetupBrokerUsersWithRaw(cfg, broker, reader, rawInput, stdout)
+		if errors.Is(err, errSetupBack) {
+			return "No changes made.", nil
+		}
+		return msg, err
+	case "teams-manage":
+		return runSetupTeamManagementWithRaw(cfg, reader, rawInput, stdout)
+	case "back":
+		return "No changes made.", nil
+	default:
+		return "", fmt.Errorf("unknown broker management action %q", action)
+	}
+}
+
+func runSetupBrokerUsersWithRaw(cfg config, broker setupConfiguredBroker, reader *bufio.Reader, rawInput io.Reader, stdout io.Writer) (string, error) {
+	title := setupBreadcrumb("Manage broker users")
+	for {
+		choices, err := setupBrokerUserManagementChoices(cfg)
+		if err != nil {
+			return "", err
+		}
+		action, ok, err := runSetupSelectWithRaw(reader, rawInput, stdout, title, choices, "")
+		if err != nil {
+			return "", err
+		}
+		if !ok || action == "back" {
+			return "", errSetupBack
+		}
+		if action == "invite-user" {
+			msg, err := runSetupBrokerUserInviteWithRaw(cfg, broker, reader, rawInput, stdout)
+			if err != nil {
+				return "", err
+			}
+			if msg == "No changes made." {
+				continue
+			}
+			return msg, nil
+		}
+		if action == "noop" {
+			continue
+		}
+		if user, ok := strings.CutPrefix(action, "user:"); ok {
+			msg, err := runSetupBrokerUserWithRaw(cfg, broker, user, reader, rawInput, stdout)
+			if errors.Is(err, errSetupBack) {
+				continue
+			}
+			return msg, err
+		}
+	}
+}
+
+func setupBrokerUserManagementChoices(cfg config) ([]setupChoice, error) {
+	users, err := setupBrokerUsers(cfg)
+	if err != nil {
+		return nil, err
+	}
+	choices := []setupChoice{{Label: "invite user", Value: "invite-user", Help: "create a broker invite command"}}
+	if len(users) == 0 {
+		choices = append(choices, setupChoice{Label: "no broker users", Value: "noop", Group: "users:"})
+	} else {
+		sort.Slice(users, func(i, j int) bool {
+			return strings.ToLower(firstNonEmpty(users[i].Username, users[i].ID)) < strings.ToLower(firstNonEmpty(users[j].Username, users[j].ID))
+		})
+		for _, user := range users {
+			username := firstNonEmpty(user.Username, user.ID)
+			if username == "" {
+				continue
+			}
+			label := username
+			if user.Pending || len(user.Keys) == 0 {
+				label += " *"
+			}
+			choices = append(choices, setupChoice{Label: label, Value: "user:" + username, Help: setupBrokerUserStatus(user), Group: "users:"})
+		}
+	}
+	choices = append(choices, setupChoice{Label: "back", Value: "back", Help: "return to broker management"})
+	return choices, nil
+}
+
+func runSetupBrokerUserInviteWithRaw(cfg config, broker setupConfiguredBroker, reader *bufio.Reader, rawInput io.Reader, stdout io.Writer) (string, error) {
+	var out bytes.Buffer
+	fields, ok, err := runSetupTextFormWithRaw(reader, rawInput, stdout, setupBreadcrumb("Manage broker users", "Invite user"), []setupTextField{
+		{Label: "Username", Required: true},
+	})
+	if err != nil || !ok {
+		return "No changes made.", err
+	}
+	role, ok, err := runSetupSelectWithRaw(reader, rawInput, stdout, setupBreadcrumb("Manage broker users", fields[0], "Role"), setupBrokerUserRoleChoices(), "user")
+	if err != nil || !ok {
+		return "No changes made.", err
+	}
+	if err := brokerAdminCommandWithInput(cfg, []string{"invite-broker-user", "--broker", broker.BrokerURL, "--user", fields[0], "--role", role}, strings.NewReader(""), &out); err != nil {
+		return "", err
+	}
+	return runSetupPlainCommandOutputWithRaw(reader, stdout, "Create user invite", setupAcceptCommandFromOutput(out.String()))
+}
+
+func runSetupBrokerUserWithRaw(cfg config, broker setupConfiguredBroker, username string, reader *bufio.Reader, rawInput io.Reader, stdout io.Writer) (string, error) {
+	for {
+		user, ok, err := setupBrokerUserByName(cfg, username)
+		if err != nil {
+			return "", err
+		}
+		if !ok {
+			return "", fmt.Errorf("broker user %s not found", username)
+		}
+		choices := setupBrokerUserActionChoices(user)
+		action, selected, err := runSetupSelectWithRaw(reader, rawInput, stdout, setupBreadcrumb("Manage broker users", username), choices, "")
+		if err != nil {
+			return "", err
+		}
+		if !selected || action == "back" {
+			return "", errSetupBack
+		}
+		msg, err := runSetupBrokerUserAction(cfg, broker, user, action, reader, rawInput, stdout)
+		if err != nil {
+			return "", err
+		}
+		if action == "delete" {
+			if _, err := runSetupBrokerOutputWithRaw(reader, rawInput, stdout, "Delete broker user", msg); err != nil {
+				return "", err
+			}
+			return "No changes made.", errSetupBack
+		}
+		if msg == "No changes made." {
+			continue
+		}
+		return msg, nil
+	}
+}
+
+func setupBrokerUserActionChoices(user brokerUserInfo) []setupChoice {
+	if user.BrokerRole == "owner" {
+		return []setupChoice{
+			{Label: "transfer ownership", Value: "transfer-owner", Help: "create an ownership transfer command"},
+			{Label: "back", Value: "back", Help: "return to broker users"},
+		}
+	}
+	choices := []setupChoice{{Label: "edit role", Value: "edit-role", Help: "change broker role"}}
+	if user.Suspended {
+		choices = append(choices, setupChoice{Label: "unsuspend user", Value: "unsuspend", Help: "restore broker access"})
+	} else {
+		choices = append(choices, setupChoice{Label: "suspend user", Value: "suspend", Help: "deny broker access"})
+	}
+	if user.Pending || len(user.Keys) == 0 {
+		choices = append(choices, setupChoice{Label: "cancel invite", Value: "cancel-invite", Help: "cancel pending broker invite"})
+	}
+	choices = append(choices, setupChoice{Label: "delete user", Value: "delete", Help: "remove broker user and repository/team access"})
+	choices = append(choices, setupChoice{Label: "back", Value: "back", Help: "return to broker users"})
+	return choices
+}
+
+func runSetupBrokerUserAction(cfg config, broker setupConfiguredBroker, user brokerUserInfo, action string, reader *bufio.Reader, rawInput io.Reader, stdout io.Writer) (string, error) {
+	var out bytes.Buffer
+	username := firstNonEmpty(user.Username, user.ID)
+	role := firstNonEmpty(user.BrokerRole, "user")
+	switch action {
+	case "transfer-owner":
+		repo, ok, err := runSetupRepoSelect(cfg, reader, rawInput, stdout, setupBreadcrumb("Manage broker users", username, "Transfer ownership"))
+		if err != nil || !ok {
+			return "No changes made.", err
+		}
+		if err := brokerAdminCommandWithInput(cfg, []string{"confirm-ownership-transfer", "--broker", broker.BrokerURL, repo}, strings.NewReader(""), &out); err != nil {
+			return "", err
+		}
+		return runSetupPlainCommandOutputWithRaw(reader, stdout, "Owner transfer", setupAcceptCommandFromOutput(out.String()))
+	case "edit-role":
+		nextRole, ok, err := runSetupSelectWithRaw(reader, rawInput, stdout, setupBreadcrumb("Manage broker users", username, "Role"), setupBrokerUserRoleChoices(), role)
+		if err != nil || !ok {
+			return "No changes made.", err
+		}
+		if err := brokerAdminCommandWithInput(cfg, []string{"broker-users", "upsert", username, "--role", nextRole}, strings.NewReader(""), &out); err != nil {
+			return "", err
+		}
+		return strings.TrimSpace(out.String()), nil
+	case "suspend":
+		if err := brokerAdminCommandWithInput(cfg, []string{"broker-users", "upsert", username, "--role", role, "--suspended", "true"}, strings.NewReader(""), &out); err != nil {
+			return "", err
+		}
+		return "suspended broker user " + username, nil
+	case "unsuspend":
+		if err := brokerAdminCommandWithInput(cfg, []string{"broker-users", "upsert", username, "--role", role, "--suspended", "false"}, strings.NewReader(""), &out); err != nil {
+			return "", err
+		}
+		return "unsuspended broker user " + username, nil
+	case "cancel-invite":
+		if err := brokerAdminCommandWithInput(cfg, []string{"cancel-broker-invite", "--broker", broker.BrokerURL, "--user", username}, strings.NewReader(""), &out); err != nil {
+			return "", err
+		}
+		return strings.TrimSpace(out.String()), nil
+	case "delete":
+		if err := brokerAdminCommandWithInput(cfg, []string{"broker-users", "delete", username}, strings.NewReader(""), &out); err != nil {
+			return "", err
+		}
+		return strings.TrimSpace(out.String()), nil
+	default:
+		return "", fmt.Errorf("unknown broker user action %q", action)
+	}
+}
+
+func setupBrokerRepoConfig(cfg config, repo string) (config, error) {
+	logical, err := normalizeLogicalRepoName(repo)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.logicalRepo = logical
+	cfg.prefix = logical
+	return cfg, nil
+}
+
+func runSetupTeamManagementWithRaw(cfg config, reader *bufio.Reader, rawInput io.Reader, stdout io.Writer) (string, error) {
+	for {
+		choices, err := setupTeamManagementChoices(cfg)
+		if err != nil {
+			return "", err
+		}
+		action, ok, err := runSetupSelectWithRaw(reader, rawInput, stdout, setupBreadcrumb("Team management"), choices, "")
+		if err != nil || !ok || action == "back" {
+			return "No changes made.", err
+		}
+		switch action {
+		case "create":
+			msg, err := runSetupTeamCreateWithRaw(cfg, reader, rawInput, stdout)
+			if err != nil {
+				return "", err
+			}
+			if msg == "No changes made." {
+				continue
+			}
+			return msg, nil
+		default:
+			team, ok := strings.CutPrefix(action, "team:")
+			if !ok {
+				return "", fmt.Errorf("unknown team management action %q", action)
+			}
+			teamInfo, _ := setupBrokerTeamInfo(cfg, team)
+			msg, err := runSetupManagedTeamWithRaw(cfg, team, setupTeamDisplayName(team, teamInfo), reader, rawInput, stdout)
+			if errors.Is(err, errSetupBack) {
+				continue
+			}
+			return msg, err
+		}
+	}
+}
+
+func setupTeamManagementChoices(cfg config) ([]setupChoice, error) {
+	teams, err := setupBrokerTeamChoices(cfg)
+	if err != nil {
+		return nil, err
+	}
+	choices := []setupChoice{
+		{Label: "create team", Value: "create", Help: "create a team namespace"},
+	}
+	for _, team := range teams {
+		team.Value = "team:" + team.Value
+		choices = append(choices, team)
+	}
+	choices = append(choices, setupChoice{Label: "back", Value: "back", Help: "return to broker management"})
+	return choices, nil
+}
+
+func runSetupTeamCreateWithRaw(cfg config, reader *bufio.Reader, rawInput io.Reader, stdout io.Writer) (string, error) {
+	var out bytes.Buffer
+	fields, ok, err := runSetupTextFormWithRaw(reader, rawInput, stdout, "Create team", []setupTextField{{Label: "Team name", Required: true}})
+	if err != nil || !ok {
+		return "No changes made.", err
+	}
+	if err := brokerAdminCommandWithInput(cfg, []string{"teams", "create", fields[0]}, strings.NewReader(""), &out); err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(out.String()), nil
+}
+
+func runSetupManagedTeamWithRaw(cfg config, teamID, teamName string, reader *bufio.Reader, rawInput io.Reader, stdout io.Writer) (string, error) {
+	teamLabel := firstNonEmpty(teamName, teamID)
+	title := setupBreadcrumb("Manage team", teamLabel)
+	for {
+		action, ok, err := runSetupSelectWithRaw(reader, rawInput, stdout, title, []setupChoice{
+			{Label: "manage users", Value: "members-manage", Help: "add, edit, or remove team users"},
+			{Label: "manage repositories", Value: "repos-manage", Help: "create and manage team repositories"},
+			{Label: "back", Value: "back", Help: "return to team management"},
+		}, "")
+		if err != nil {
+			return "", err
+		}
+		if !ok || action == "back" {
+			return "", errSetupBack
+		}
+		msg, err := runSetupManagedTeamAction(cfg, teamID, teamLabel, action, reader, rawInput, stdout)
+		if err != nil {
+			return "", err
+		}
+		if msg == "No changes made." {
+			continue
+		}
+		return msg, nil
+	}
+}
+
+func runSetupManagedTeamAction(cfg config, teamID, teamName, action string, reader *bufio.Reader, rawInput io.Reader, stdout io.Writer) (string, error) {
+	switch action {
+	case "members-manage":
+		msg, err := runSetupManagedTeamUsersWithRaw(cfg, teamID, teamName, reader, rawInput, stdout)
+		if errors.Is(err, errSetupBack) {
+			return "No changes made.", nil
+		}
+		return msg, err
+	case "repos-manage":
+		msg, err := runSetupManagedTeamRepositoriesWithRaw(cfg, teamID, teamName, reader, rawInput, stdout)
+		if errors.Is(err, errSetupBack) {
+			return "No changes made.", nil
+		}
+		return msg, err
+	case "repos-list":
+		if _, err := runSetupBrokerOutputWithRaw(reader, rawInput, stdout, setupBreadcrumb("Manage team", teamName, "Repositories"), setupFormatTeamRepositories(cfg, teamID)); err != nil {
+			return "", err
+		}
+		return "No changes made.", nil
+	default:
+		return "", fmt.Errorf("unknown team management action %q", action)
+	}
+}
+
+func runSetupManagedTeamUsersWithRaw(cfg config, teamID, teamName string, reader *bufio.Reader, rawInput io.Reader, stdout io.Writer) (string, error) {
+	title := setupBreadcrumb("Manage team", teamName, "Manage users")
+	for {
+		choices, err := setupTeamUserManagementChoices(cfg, teamID)
+		if err != nil {
+			return "", err
+		}
+		action, ok, err := runSetupSelectWithRaw(reader, rawInput, stdout, title, choices, "")
+		if err != nil {
+			return "", err
+		}
+		if !ok || action == "back" {
+			return "", errSetupBack
+		}
+		if action == "add-user" {
+			msg, err := runSetupManagedTeamUserAdd(cfg, teamID, teamName, reader, rawInput, stdout)
+			if err != nil {
+				return "", err
+			}
+			if msg == "No changes made." {
+				continue
+			}
+			return msg, nil
+		}
+		if action == "noop" {
+			continue
+		}
+		if user, ok := strings.CutPrefix(action, "user:"); ok {
+			msg, err := runSetupManagedTeamUserWithRaw(cfg, teamID, teamName, user, reader, rawInput, stdout)
+			if errors.Is(err, errSetupBack) {
+				continue
+			}
+			return msg, err
+		}
+	}
+}
+
+func setupTeamUserManagementChoices(cfg config, teamID string) ([]setupChoice, error) {
+	team, err := setupBrokerTeamInfo(cfg, teamID)
+	if err != nil {
+		return nil, err
+	}
+	choices := []setupChoice{{Label: "add user", Value: "add-user", Help: "add a user with a team role cap"}}
+	if len(team.Members) == 0 {
+		choices = append(choices, setupChoice{Label: "no team users", Value: "noop", Group: "users:"})
+	} else {
+		for _, member := range team.Members {
+			user := firstNonEmpty(member.Username, member.UserID)
+			if user == "" {
+				continue
+			}
+			choices = append(choices, setupChoice{Label: user, Value: "user:" + user, Help: "role cap " + firstNonEmpty(member.Role, "read"), Group: "users:"})
+		}
+	}
+	choices = append(choices, setupChoice{Label: "back", Value: "back", Help: "return to team"})
+	return choices, nil
+}
+
+func runSetupManagedTeamUserAdd(cfg config, teamID, teamName string, reader *bufio.Reader, rawInput io.Reader, stdout io.Writer) (string, error) {
+	var out bytes.Buffer
+	user, ok, err := runSetupAvailableTeamUserSelect(cfg, teamID, reader, rawInput, stdout, setupBreadcrumb("Manage team", teamName, "Manage users", "Add user"))
+	if err != nil || !ok {
+		return "No changes made.", err
+	}
+	role, ok, err := runSetupSelectWithRaw(reader, rawInput, stdout, setupBreadcrumb("Manage team", teamName, "Manage users", user, "Team role cap"), setupRepoRoleCapChoices(), "developer")
+	if err != nil || !ok {
+		return "No changes made.", err
+	}
+	if err := brokerAdminCommandWithInput(cfg, []string{"teams", "member", "add", teamID, user, "--role", role}, strings.NewReader(""), &out); err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(out.String()), nil
+}
+
+func runSetupManagedTeamUserWithRaw(cfg config, teamID, teamName, user string, reader *bufio.Reader, rawInput io.Reader, stdout io.Writer) (string, error) {
+	title := setupBreadcrumb("Manage team", teamName, "Manage users", user)
+	for {
+		action, ok, err := runSetupSelectWithRaw(reader, rawInput, stdout, title, []setupChoice{
+			{Label: "edit role cap", Value: "edit", Help: "change this user's team role cap"},
+			{Label: "remove user", Value: "remove", Help: "remove this user from the team"},
+			{Label: "back", Value: "back", Help: "return to users"},
+		}, "")
+		if err != nil {
+			return "", err
+		}
+		if !ok || action == "back" {
+			return "", errSetupBack
+		}
+		msg, err := runSetupManagedTeamUserAction(cfg, teamID, teamName, user, action, reader, rawInput, stdout)
+		if err != nil {
+			return "", err
+		}
+		if msg == "No changes made." {
+			continue
+		}
+		return msg, nil
+	}
+}
+
+func runSetupManagedTeamUserAction(cfg config, teamID, teamName, user, action string, reader *bufio.Reader, rawInput io.Reader, stdout io.Writer) (string, error) {
+	var out bytes.Buffer
+	switch action {
+	case "edit":
+		role, ok, err := runSetupSelectWithRaw(reader, rawInput, stdout, setupBreadcrumb("Manage team", teamName, "Manage users", user, "Team role cap"), setupRepoRoleCapChoices(), "developer")
+		if err != nil || !ok {
+			return "No changes made.", err
+		}
+		if err := brokerAdminCommandWithInput(cfg, []string{"teams", "member", "add", teamID, user, "--role", role}, strings.NewReader(""), &out); err != nil {
+			return "", err
+		}
+		return strings.TrimSpace(out.String()), nil
+	case "remove":
+		if err := brokerAdminCommandWithInput(cfg, []string{"teams", "member", "remove", teamID, user}, strings.NewReader(""), &out); err != nil {
+			return "", err
+		}
+		return strings.TrimSpace(out.String()), nil
+	default:
+		return "", fmt.Errorf("unknown team user action %q", action)
+	}
+}
+
+func runSetupManagedTeamRepositoriesWithRaw(cfg config, teamID, teamName string, reader *bufio.Reader, rawInput io.Reader, stdout io.Writer) (string, error) {
+	title := setupBreadcrumb("Manage team", teamName, "Repositories")
+	for {
+		choices, err := setupBrokerTeamRepositoryMenuChoices(cfg, teamID)
+		if err != nil {
+			return "", err
+		}
+		action, ok, err := runSetupSelectWithRaw(reader, rawInput, stdout, title, choices, "")
+		if err != nil {
+			return "", err
+		}
+		if !ok || action == "back" {
+			return "", errSetupBack
+		}
+		if action == "create" {
+			msg, err := runSetupTeamRepositoryCreateWithRaw(cfg, teamID, teamName, reader, rawInput, stdout)
+			if err != nil {
+				return "", err
+			}
+			if msg == "No changes made." {
+				continue
+			}
+			return msg, nil
+		}
+		if repo, ok := strings.CutPrefix(action, "repo:"); ok {
+			msg, err := runSetupManagedTeamRepositoryWithRaw(cfg, teamID, teamName, repo, reader, rawInput, stdout)
+			if errors.Is(err, errSetupBack) {
+				continue
+			}
+			if err != nil {
+				return "", err
+			}
+			if msg == "No changes made." {
+				continue
+			}
+			return msg, nil
+		}
+	}
+}
+
+func runSetupTeamRepositoryCreateWithRaw(cfg config, teamID, teamName string, reader *bufio.Reader, rawInput io.Reader, stdout io.Writer) (string, error) {
+	fields, ok, err := runSetupTextFormWithRaw(reader, rawInput, stdout, setupBreadcrumb("Manage team", teamName, "Repositories", "Create repository"), []setupTextField{
+		{Label: "Repository", Required: true},
+	})
+	if err != nil || !ok {
+		return "No changes made.", err
+	}
+	logical, err := normalizeLogicalRepoName(fields[0])
+	if err != nil {
+		return "", err
+	}
+	role, ok, err := runSetupSelectWithRaw(reader, rawInput, stdout, setupBreadcrumb("Manage team", teamName, "Repositories", logicalRepoDisplayName(logical), "Role cap"), setupRepoRoleCapChoices(), "developer")
+	if err != nil || !ok {
+		return "No changes made.", err
+	}
+	brokerURL, err := brokerURLFromConfigOrDiscovery(cfg)
+	if err != nil {
+		return "", err
+	}
+	actionCfg, err := setupBrokerRepoConfig(cfg, logical)
+	if err != nil {
+		return "", err
+	}
+	actionCfg.provider = firstNonEmpty(actionCfg.provider, cfg.provider, "gcs")
+	actionCfg.brokerURL = brokerURL
+	actionCfg.teamID = teamID
+	req := brokerRepoAdminRequest{Repo: repoForBroker(actionCfg), Role: role}
+	if err := brokerPost(brokerURL, "/repos/create", req, nil); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("created repository %s and granted %s %s access", logicalRepoDisplayName(logical), firstNonEmpty(teamName, teamID), role), nil
+}
+
+func setupBrokerTeamRepositoryMenuChoices(cfg config, teamID string) ([]setupChoice, error) {
+	repos, err := setupBrokerTeamRepoChoices(cfg, teamID)
+	if err != nil {
+		return nil, err
+	}
+	choices := []setupChoice{
+		{Label: "create repository", Value: "create", Help: "create a repository for this team"},
+	}
+	for _, repo := range repos {
+		repo.Value = "repo:" + repo.Value
+		choices = append(choices, repo)
+	}
+	choices = append(choices, setupChoice{Label: "back", Value: "back", Help: "return to team"})
+	return choices, nil
+}
+
+func runSetupManagedTeamRepositoryWithRaw(cfg config, teamID, teamName, repo string, reader *bufio.Reader, rawInput io.Reader, stdout io.Writer) (string, error) {
+	repoName := logicalRepoDisplayName(repo)
+	for {
+		action, ok, err := runSetupSelectWithRaw(reader, rawInput, stdout, setupBreadcrumb("Manage team", teamName, "Repositories", repoName), []setupChoice{
+			{Label: "manage access", Value: "access-manage", Help: "users, invites, and team sharing"},
+			{Label: "edit role cap", Value: "repos-edit", Help: "change this team's repository role cap"},
+			{Label: "remove access", Value: "repos-remove", Help: "detach this repository from this team"},
+			{Label: "back", Value: "back", Help: "return to repositories"},
+		}, "")
+		if err != nil {
+			return "", err
+		}
+		if !ok || action == "back" {
+			return "", errSetupBack
+		}
+		msg, err := runSetupManagedTeamRepositoryAction(cfg, teamID, teamName, repo, action, reader, rawInput, stdout)
+		if err != nil {
+			return "", err
+		}
+		if msg == "No changes made." {
+			continue
+		}
+		return msg, nil
+	}
+}
+
+func runSetupManagedTeamRepositoryAction(cfg config, teamID, teamName, repo, action string, reader *bufio.Reader, rawInput io.Reader, stdout io.Writer) (string, error) {
+	var out bytes.Buffer
+	repoName := logicalRepoDisplayName(repo)
+	switch action {
+	case "access-manage":
+		msg, err := runSetupManagedTeamRepositoryAccessWithRaw(cfg, teamID, teamName, repo, reader, rawInput, stdout)
+		if errors.Is(err, errSetupBack) {
+			return "No changes made.", nil
+		}
+		return msg, err
+	case "invite-user":
+		user, ok, err := runSetupAvailableRepoInviteUserSelect(cfg, repo, teamID, reader, rawInput, stdout, setupBreadcrumb("Manage team", teamName, "Repositories", repoName, "Invite user"))
+		if err != nil || !ok {
+			return "No changes made.", err
+		}
+		role, ok, err := runSetupSelectWithRaw(reader, rawInput, stdout, setupBreadcrumb("Manage team", teamName, "Repositories", repoName, "Role"), setupRepoRoleChoices(), "developer")
+		if err != nil || !ok {
+			return "No changes made.", err
+		}
+		brokerURL, err := brokerURLFromConfigOrDiscovery(cfg)
+		if err != nil {
+			return "", err
+		}
+		brokerRepo, err := setupBrokerTeamRepoForAction(cfg, repo, teamID)
+		if err != nil {
+			return "", err
+		}
+		var resp brokerOwnerTransferResponse
+		if err := brokerPost(brokerURL, "/keys/invite/create", brokerOwnerTransferRequest{Repo: brokerRepo, BrokerURL: brokerURL, User: user, Role: role}, &resp); err != nil {
+			return "", err
+		}
+		return runSetupPlainCommandOutputWithRaw(reader, stdout, setupBreadcrumb("Manage team", teamName, "Repositories", repoName, "Invite user"), resp.AcceptCommand)
+	case "cancel-invite":
+		brokerRepo, err := setupBrokerTeamRepoForAction(cfg, repo, teamID)
+		if err != nil {
+			return "", err
+		}
+		user, ok, err := runSetupPendingRepoInviteSelect(cfg, brokerRepo, reader, rawInput, stdout, setupBreadcrumb("Manage team", teamName, "Repositories", repoName, "Pending invite"))
+		if err != nil || !ok {
+			return "No changes made.", err
+		}
+		brokerURL, err := brokerURLFromConfigOrDiscovery(cfg)
+		if err != nil {
+			return "", err
+		}
+		if err := brokerPost(brokerURL, "/keys/invite/cancel", brokerOwnerTransferRequest{Repo: brokerRepo, User: user}, nil); err != nil {
+			return "", err
+		}
+		fmt.Fprintf(&out, "cancelled invite for %s on %s\n", user, brokerRepo.Logical)
+		return strings.TrimSpace(out.String()), nil
+	case "grant-team":
+		targetTeamID, ok, err := runSetupAvailableRepoTeamSelect(cfg, repo, teamID, reader, rawInput, stdout, setupBreadcrumb("Manage team", teamName, "Repositories", repoName, "Grant team access"))
+		if err != nil || !ok {
+			return "No changes made.", err
+		}
+		role, ok, err := runSetupSelectWithRaw(reader, rawInput, stdout, setupBreadcrumb("Manage team", teamName, "Repositories", repoName, "Team role cap"), setupRepoRoleCapChoices(), "developer")
+		if err != nil || !ok {
+			return "No changes made.", err
+		}
+		actionCfg, err := setupBrokerRepoConfig(cfg, repo)
+		if err != nil {
+			return "", err
+		}
+		actionCfg.provider = firstNonEmpty(actionCfg.provider, cfg.provider, "gcs")
+		actionCfg.teamID = strings.TrimSpace(teamID)
+		if err := brokerAdminCommandWithInput(actionCfg, []string{"teams", "repo", "add", targetTeamID, role}, strings.NewReader(""), &out); err != nil {
+			return "", err
+		}
+		return strings.TrimSpace(out.String()), nil
+	case "repos-edit":
+		return runSetupTeamRepoAccessUpsert(cfg, teamID, teamName, repo, reader, rawInput, stdout)
+	case "repos-remove":
+		actionCfg, err := setupBrokerRepoConfig(cfg, repo)
+		if err != nil {
+			return "", err
+		}
+		if err := brokerAdminCommandWithInput(actionCfg, []string{"teams", "repo", "remove", teamID}, strings.NewReader(""), &out); err != nil {
+			return "", err
+		}
+		return strings.TrimSpace(out.String()), nil
+	default:
+		return "", fmt.Errorf("unknown team repository action %q", action)
+	}
+}
+
+func runSetupManagedTeamRepositoryAccessWithRaw(cfg config, teamID, teamName, repo string, reader *bufio.Reader, rawInput io.Reader, stdout io.Writer) (string, error) {
+	repoName := logicalRepoDisplayName(repo)
+	title := setupBreadcrumb("Manage team", teamName, "Repositories", repoName, "Manage access")
+	for {
+		choices, err := setupRepoAccessManagementChoices(cfg, repo, teamID)
+		if err != nil {
+			return "", err
+		}
+		action, ok, err := runSetupSelectWithRaw(reader, rawInput, stdout, title, choices, "")
+		if err != nil {
+			return "", err
+		}
+		if !ok || action == "back" {
+			return "", errSetupBack
+		}
+		if action == "invite-user" || action == "cancel-invite" || action == "grant-team" {
+			msg, err := runSetupManagedTeamRepositoryAction(cfg, teamID, teamName, repo, action, reader, rawInput, stdout)
+			if err != nil {
+				return "", err
+			}
+			if msg == "No changes made." {
+				continue
+			}
+			return msg, nil
+		}
+		if action == "noop" {
+			continue
+		}
+		if user, ok := strings.CutPrefix(action, "user:"); ok {
+			msg, err := runSetupManagedTeamRepositoryUserWithRaw(cfg, teamID, teamName, repo, user, reader, rawInput, stdout)
+			if errors.Is(err, errSetupBack) {
+				continue
+			}
+			return msg, err
+		}
+	}
+}
+
+func setupRepoAccessManagementChoices(cfg config, repo, teamID string) ([]setupChoice, error) {
+	choices := []setupChoice{
+		{Label: "invite user", Value: "invite-user", Help: "create an invite for this repository"},
+		{Label: "cancel invite", Value: "cancel-invite", Help: "cancel a pending invite by username"},
+		{Label: "grant team access", Value: "grant-team", Help: "share this repository with another team"},
+	}
+	users, err := setupRepoUsers(cfg, repo, teamID)
+	if err != nil {
+		return nil, err
+	}
+	if len(users) > 0 {
+		for _, user := range users {
+			label := user.User
+			help := "role " + user.Role
+			if user.KeyCount > 1 {
+				help = fmt.Sprintf("role %s, %d keys", user.Role, user.KeyCount)
+			}
+			choices = append(choices, setupChoice{Label: label, Value: "user:" + user.User, Help: help, Group: "users:"})
+		}
+	} else {
+		choices = append(choices, setupChoice{Label: "no repository users", Value: "noop", Help: "", Group: "users:"})
+	}
+	choices = append(choices, setupChoice{Label: "back", Value: "back", Help: "return to repository"})
+	return choices, nil
+}
+
+func runSetupAvailableRepoTeamSelect(cfg config, repo, currentTeamID string, reader *bufio.Reader, rawInput io.Reader, stdout io.Writer, title string) (string, bool, error) {
+	choices, err := setupAvailableRepoTeamChoices(cfg, repo, currentTeamID)
+	if err != nil {
+		return "", false, err
+	}
+	if len(choices) == 0 {
+		if _, err := runSetupBrokerOutputWithRaw(reader, rawInput, stdout, title, "No teams are available to grant access."); err != nil {
+			return "", false, err
+		}
+		return "", false, nil
+	}
+	return runSetupSelectWithRaw(reader, rawInput, stdout, title, choices, "")
+}
+
+func setupAvailableRepoTeamChoices(cfg config, repo, currentTeamID string) ([]setupChoice, error) {
+	brokerURL, err := brokerURLFromConfigOrDiscovery(cfg)
+	if err != nil {
+		return nil, err
+	}
+	var teamsResp brokerTeamsResponse
+	if err := brokerPost(brokerURL, "/teams/list", brokerRepoAdminRequest{}, &teamsResp); err != nil {
+		return nil, err
+	}
+	repos, err := setupBrokerRepos(cfg)
+	if err != nil {
+		return nil, err
+	}
+	logical, err := normalizeLogicalRepoName(repo)
+	if err != nil {
+		return nil, err
+	}
+	attached := map[string]struct{}{}
+	for _, item := range repos {
+		itemLogical := firstNonEmpty(item.Logical, item.Repo.Logical)
+		if itemLogical != logical {
+			continue
+		}
+		for _, grant := range item.Teams {
+			id := firstNonEmpty(grant.ID, grant.TeamID)
+			if id != "" {
+				attached[id] = struct{}{}
+			}
+		}
+		if item.Repo.TeamID != "" {
+			attached[item.Repo.TeamID] = struct{}{}
+		}
+	}
+	repoTeams, err := setupBrokerRepoTeamIDs(cfg, repo, currentTeamID)
+	if err != nil {
+		return nil, err
+	}
+	for _, id := range repoTeams {
+		attached[id] = struct{}{}
+	}
+	if currentTeamID != "" {
+		attached[currentTeamID] = struct{}{}
+	}
+	var choices []setupChoice
+	for _, team := range teamsResp.Teams {
+		id := strings.TrimSpace(team.ID)
+		if id == "" {
+			continue
+		}
+		if _, ok := attached[id]; ok {
+			continue
+		}
+		choices = append(choices, setupChoice{Label: setupTeamDisplayName(id, team), Value: id, Help: fmt.Sprintf("%d member(s)", len(team.Members))})
+	}
+	sort.Slice(choices, func(i, j int) bool { return choices[i].Label < choices[j].Label })
+	return choices, nil
+}
+
+func setupBrokerRepoTeamIDs(cfg config, repo, teamID string) ([]string, error) {
+	brokerURL, err := brokerURLFromConfigOrDiscovery(cfg)
+	if err != nil {
+		return nil, err
+	}
+	brokerRepo, err := setupBrokerTeamRepoForAction(cfg, repo, teamID)
+	if err != nil {
+		return nil, err
+	}
+	var resp struct {
+		Teams []brokerRepoTeamGrant `json:"teams"`
+	}
+	if err := brokerPost(brokerURL, "/repo/teams/list", brokerRepoInfoRequest{Repo: brokerRepo}, &resp); err != nil {
+		return nil, err
+	}
+	ids := make([]string, 0, len(resp.Teams))
+	for _, grant := range resp.Teams {
+		id := firstNonEmpty(grant.ID, grant.TeamID)
+		if id != "" {
+			ids = append(ids, id)
+		}
+	}
+	return ids, nil
+}
+
+type setupRepoUser struct {
+	User      string
+	Role      string
+	KeyCount  int
+	PublicKey []string
+}
+
+func setupRepoUsers(cfg config, repo, teamID string) ([]setupRepoUser, error) {
+	keys, err := setupRepoKeys(cfg, repo, teamID)
+	if err != nil {
+		return nil, err
+	}
+	byUser := map[string]*setupRepoUser{}
+	for _, key := range keys {
+		user := strings.TrimSpace(key.User)
+		if user == "" {
+			user = "unknown"
+		}
+		mapKey := strings.ToLower(user)
+		entry := byUser[mapKey]
+		if entry == nil {
+			entry = &setupRepoUser{User: user, Role: firstNonEmpty(key.Role, "read")}
+			byUser[mapKey] = entry
+		}
+		entry.KeyCount++
+		entry.PublicKey = append(entry.PublicKey, key.PublicKey)
+		entry.Role = strongerSetupRepoRole(entry.Role, firstNonEmpty(key.Role, "read"))
+	}
+	users := make([]setupRepoUser, 0, len(byUser))
+	for _, user := range byUser {
+		users = append(users, *user)
+	}
+	sort.Slice(users, func(i, j int) bool { return users[i].User < users[j].User })
+	return users, nil
+}
+
+func setupRepoKeys(cfg config, repo, teamID string) ([]brokerKey, error) {
+	brokerURL, err := brokerURLFromConfigOrDiscovery(cfg)
+	if err != nil {
+		return nil, err
+	}
+	actionCfg, err := setupBrokerRepoConfig(cfg, repo)
+	if err != nil {
+		return nil, err
+	}
+	actionCfg.provider = firstNonEmpty(actionCfg.provider, cfg.provider, "gcs")
+	actionCfg.teamID = strings.TrimSpace(teamID)
+	return brokerListKeys(brokerURL, actionCfg)
+}
+
+func strongerSetupRepoRole(a, b string) string {
+	if setupRepoRoleRank(b) > setupRepoRoleRank(a) {
+		return b
+	}
+	return a
+}
+
+func setupRepoRoleRank(role string) int {
+	switch normalizeBrokerRole(role) {
+	case "owner":
+		return 6
+	case "admin":
+		return 5
+	case "maintainer":
+		return 4
+	case "developer":
+		return 3
+	case "triage":
+		return 2
+	case "read":
+		return 1
+	default:
+		return 0
+	}
+}
+
+func runSetupManagedTeamRepositoryUserWithRaw(cfg config, teamID, teamName, repo, user string, reader *bufio.Reader, rawInput io.Reader, stdout io.Writer) (string, error) {
+	repoName := logicalRepoDisplayName(repo)
+	title := setupBreadcrumb("Manage team", teamName, "Repositories", repoName, user)
+	for {
+		action, ok, err := runSetupSelectWithRaw(reader, rawInput, stdout, title, []setupChoice{
+			{Label: "edit role cap", Value: "user-edit", Help: "change repository role for this user"},
+			{Label: "suspend access", Value: "user-suspend", Help: "suspend this user's direct keys"},
+			{Label: "remove access", Value: "user-remove", Help: "remove this user's direct keys"},
+			{Label: "back", Value: "back", Help: "return to users"},
+		}, "")
+		if err != nil {
+			return "", err
+		}
+		if !ok || action == "back" {
+			return "", errSetupBack
+		}
+		msg, err := runSetupManagedTeamRepositoryUserAction(cfg, teamID, teamName, repo, user, action, reader, rawInput, stdout)
+		if err != nil {
+			return "", err
+		}
+		if msg == "No changes made." {
+			continue
+		}
+		return msg, nil
+	}
+}
+
+func runSetupManagedTeamRepositoryUserAction(cfg config, teamID, teamName, repo, user, action string, reader *bufio.Reader, rawInput io.Reader, stdout io.Writer) (string, error) {
+	repoName := logicalRepoDisplayName(repo)
+	keys, err := setupRepoKeysForUser(cfg, repo, teamID, user)
+	if err != nil {
+		return "", err
+	}
+	if len(keys) == 0 {
+		return "No repository access found for " + user + ".", nil
+	}
+	brokerURL, err := brokerURLFromConfigOrDiscovery(cfg)
+	if err != nil {
+		return "", err
+	}
+	actionCfg, err := setupBrokerRepoConfig(cfg, repo)
+	if err != nil {
+		return "", err
+	}
+	actionCfg.provider = firstNonEmpty(actionCfg.provider, cfg.provider, "gcs")
+	actionCfg.teamID = strings.TrimSpace(teamID)
+	switch action {
+	case "user-edit":
+		role, ok, err := runSetupSelectWithRaw(reader, rawInput, stdout, setupBreadcrumb("Manage team", teamName, "Repositories", repoName, user, "Role"), setupRepoRoleChoices(), "developer")
+		if err != nil || !ok {
+			return "No changes made.", err
+		}
+		for _, key := range keys {
+			if err := brokerPost(brokerURL, "/keys/remove", brokerKeyRequest{Repo: repoForBroker(actionCfg), Key: key.PublicKey}, nil); err != nil {
+				return "", err
+			}
+		}
+		publicKeys := make([]string, 0, len(keys))
+		for _, key := range keys {
+			publicKeys = append(publicKeys, key.PublicKey)
+		}
+		if err := brokerAddKeysWithSource(brokerURL, actionCfg, user, role, "setup", publicKeys); err != nil {
+			return "", err
+		}
+		return fmt.Sprintf("updated %s on %s to %s", user, logicalRepoDisplayName(repo), role), nil
+	case "user-suspend", "user-remove":
+		path := "/keys/suspend"
+		verb := "suspended"
+		if action == "user-remove" {
+			path = "/keys/remove"
+			verb = "removed"
+		}
+		for _, key := range keys {
+			if err := brokerPost(brokerURL, path, brokerKeyRequest{Repo: repoForBroker(actionCfg), Key: key.PublicKey}, nil); err != nil {
+				return "", err
+			}
+		}
+		return fmt.Sprintf("%s access for %s on %s", verb, user, logicalRepoDisplayName(repo)), nil
+	default:
+		return "", fmt.Errorf("unknown repository user action %q", action)
+	}
+}
+
+func setupRepoKeysForUser(cfg config, repo, teamID, user string) ([]brokerKey, error) {
+	keys, err := setupRepoKeys(cfg, repo, teamID)
+	if err != nil {
+		return nil, err
+	}
+	var out []brokerKey
+	for _, key := range keys {
+		if strings.EqualFold(strings.TrimSpace(key.User), strings.TrimSpace(user)) {
+			out = append(out, key)
+		}
+	}
+	return out, nil
+}
+
+func runSetupPendingRepoInviteSelect(cfg config, repo brokerRepo, reader *bufio.Reader, rawInput io.Reader, stdout io.Writer, title string) (string, bool, error) {
+	choices, err := setupPendingRepoInviteChoices(cfg, repo)
+	if err != nil {
+		return "", false, err
+	}
+	if len(choices) == 0 {
+		if _, err := runSetupBrokerOutputWithRaw(reader, rawInput, stdout, title, "No pending invites."); err != nil {
+			return "", false, err
+		}
+		return "", false, nil
+	}
+	return runSetupSelectWithRaw(reader, rawInput, stdout, title, choices, "")
+}
+
+func setupPendingRepoInviteChoices(cfg config, repo brokerRepo) ([]setupChoice, error) {
+	brokerURL, err := brokerURLFromConfigOrDiscovery(cfg)
+	if err != nil {
+		return nil, err
+	}
+	var resp brokerRepoInvitesResponse
+	if err := brokerPost(brokerURL, "/keys/invite/list", brokerOwnerTransferRequest{Repo: repo}, &resp); err != nil {
+		return nil, err
+	}
+	choices := make([]setupChoice, 0, len(resp.Invites))
+	for _, invite := range resp.Invites {
+		user := strings.TrimSpace(invite.User)
+		if user == "" {
+			continue
+		}
+		choices = append(choices, setupChoice{Label: user, Value: user, Help: firstNonEmpty(invite.Role, "read")})
+	}
+	sort.Slice(choices, func(i, j int) bool { return choices[i].Label < choices[j].Label })
+	return choices, nil
+}
+
+func setupBrokerTeamRepoForAction(cfg config, repo, teamID string) (brokerRepo, error) {
+	actionCfg, err := setupBrokerRepoConfig(cfg, repo)
+	if err != nil {
+		return brokerRepo{}, err
+	}
+	actionCfg.provider = firstNonEmpty(actionCfg.provider, cfg.provider, "gcs")
+	actionCfg.teamID = strings.TrimSpace(teamID)
+	return repoForBroker(actionCfg), nil
+}
+
+func runSetupTeamRepoAccessUpsert(cfg config, teamID, teamName, repo string, reader *bufio.Reader, rawInput io.Reader, stdout io.Writer) (string, error) {
+	return runSetupTeamRepoAccessUpsertMany(cfg, teamID, teamName, []string{repo}, reader, rawInput, stdout)
+}
+
+func runSetupTeamRepoAccessUpsertMany(cfg config, teamID, teamName string, repos []string, reader *bufio.Reader, rawInput io.Reader, stdout io.Writer) (string, error) {
+	var out bytes.Buffer
+	if len(repos) == 0 {
+		return "No changes made.", nil
+	}
+	role, ok, err := runSetupSelectWithRaw(reader, rawInput, stdout, setupBreadcrumb("Manage team", firstNonEmpty(teamName, teamID), "Repository role cap"), setupRepoRoleCapChoices(), "developer")
+	if err != nil || !ok {
+		return "No changes made.", err
+	}
+	for _, repo := range repos {
+		actionCfg, err := setupBrokerRepoConfig(cfg, repo)
+		if err != nil {
+			return "", err
+		}
+		if err := brokerAdminCommandWithInput(actionCfg, []string{"teams", "repo", "add", teamID, role}, strings.NewReader(""), &out); err != nil {
+			return "", err
+		}
+	}
+	return strings.TrimSpace(out.String()), nil
+}
+
+func setupBrokerUserRoleChoices() []setupChoice {
+	return []setupChoice{
+		{Label: "user", Value: "user", Help: "normal broker user"},
+		{Label: "admin", Value: "admin", Help: "broker administration"},
+	}
+}
+
+func setupRepoRoleChoices() []setupChoice {
+	return []setupChoice{
+		{Label: "read", Value: "read", Help: "read repository"},
+		{Label: "triage", Value: "triage", Help: "issues and PR triage"},
+		{Label: "developer", Value: "developer", Help: "push branches"},
+		{Label: "maintainer", Value: "maintainer", Help: "merge and maintain"},
+		{Label: "admin", Value: "admin", Help: "repo administration"},
+	}
+}
+
+func setupRepoRoleCapChoices() []setupChoice {
+	choices := setupRepoRoleChoices()
+	choices = append(choices, setupChoice{Label: "owner", Value: "owner", Help: "owner-only repository actions"})
+	return choices
+}
+
+func runSetupTeamSelect(cfg config, reader *bufio.Reader, rawInput io.Reader, stdout io.Writer, title string) (string, bool, error) {
+	teams, err := setupBrokerTeamChoices(cfg)
+	if err != nil {
+		return "", false, err
+	}
+	return runSetupSelectWithRaw(reader, rawInput, stdout, title, teams, "")
+}
+
+func runSetupUserSelect(cfg config, reader *bufio.Reader, rawInput io.Reader, stdout io.Writer, title string) (string, bool, error) {
+	users, err := setupBrokerUserChoices(cfg)
+	if err != nil {
+		return "", false, err
+	}
+	return runSetupSelectWithRaw(reader, rawInput, stdout, title, users, "")
+}
+
+func runSetupAvailableRepoInviteUserSelect(cfg config, repo, teamID string, reader *bufio.Reader, rawInput io.Reader, stdout io.Writer, title string) (string, bool, error) {
+	users, err := setupAvailableRepoInviteUserChoices(cfg, repo, teamID)
+	if err != nil {
+		return "", false, err
+	}
+	if len(users) == 0 {
+		if _, err := runSetupBrokerOutputWithRaw(reader, rawInput, stdout, title, "No users are available to invite."); err != nil {
+			return "", false, err
+		}
+		return "", false, nil
+	}
+	return runSetupSelectWithRaw(reader, rawInput, stdout, title, users, "")
+}
+
+func runSetupAvailableTeamUserSelect(cfg config, teamID string, reader *bufio.Reader, rawInput io.Reader, stdout io.Writer, title string) (string, bool, error) {
+	users, err := setupAvailableTeamUserChoices(cfg, teamID)
+	if err != nil {
+		return "", false, err
+	}
+	if len(users) == 0 {
+		if _, err := runSetupBrokerOutputWithRaw(reader, rawInput, stdout, title, "No users are available to add."); err != nil {
+			return "", false, err
+		}
+		return "", false, nil
+	}
+	return runSetupSelectWithRaw(reader, rawInput, stdout, title, users, "")
+}
+
+func runSetupRepoSelect(cfg config, reader *bufio.Reader, rawInput io.Reader, stdout io.Writer, title string) (string, bool, error) {
+	repos, err := setupBrokerRepoChoices(cfg)
+	if err != nil {
+		return "", false, err
+	}
+	return runSetupSelectWithRaw(reader, rawInput, stdout, title, repos, "")
+}
+
+func runSetupRepoMultiSelect(cfg config, reader *bufio.Reader, rawInput io.Reader, stdout io.Writer, title string) ([]string, bool, error) {
+	repos, err := setupBrokerRepoChoices(cfg)
+	if err != nil {
+		return nil, false, err
+	}
+	return runSetupMultiSelectWithRaw(reader, rawInput, stdout, title, repos)
+}
+
+func runSetupTeamMemberSelect(cfg config, teamID string, reader *bufio.Reader, rawInput io.Reader, stdout io.Writer, title string) (string, bool, error) {
+	team, err := setupBrokerTeamInfo(cfg, teamID)
+	if err != nil {
+		return "", false, err
+	}
+	var choices []setupChoice
+	for _, member := range team.Members {
+		user := firstNonEmpty(member.Username, member.UserID)
+		if user == "" {
+			continue
+		}
+		choices = append(choices, setupChoice{Label: user, Value: user, Help: "team role cap " + firstNonEmpty(member.Role, "read")})
+	}
+	return runSetupSelectWithRaw(reader, rawInput, stdout, title, choices, "")
+}
+
+func runSetupTeamRepoSelect(cfg config, teamID string, reader *bufio.Reader, rawInput io.Reader, stdout io.Writer, title string) (string, bool, error) {
+	choices, err := setupBrokerTeamRepoChoices(cfg, teamID)
+	if err != nil {
+		return "", false, err
+	}
+	return runSetupSelectWithRaw(reader, rawInput, stdout, title, choices, "")
+}
+
+func setupBrokerTeamChoices(cfg config) ([]setupChoice, error) {
+	brokerURL, err := brokerURLFromConfigOrDiscovery(cfg)
+	if err != nil {
+		return nil, err
+	}
+	var resp brokerTeamsResponse
+	if err := brokerPost(brokerURL, "/teams/list", brokerRepoAdminRequest{}, &resp); err != nil {
+		return nil, err
+	}
+	var choices []setupChoice
+	for _, team := range resp.Teams {
+		choices = append(choices, setupChoice{Label: team.Name, Value: team.ID, Help: fmt.Sprintf("%d member(s)", len(team.Members))})
+	}
+	sort.Slice(choices, func(i, j int) bool { return choices[i].Label < choices[j].Label })
+	return choices, nil
+}
+
+func setupBrokerTeamInfo(cfg config, teamID string) (brokerTeamInfo, error) {
+	brokerURL, err := brokerURLFromConfigOrDiscovery(cfg)
+	if err != nil {
+		return brokerTeamInfo{}, err
+	}
+	var resp brokerTeamsResponse
+	if err := brokerPost(brokerURL, "/teams/list", brokerRepoAdminRequest{}, &resp); err != nil {
+		return brokerTeamInfo{}, err
+	}
+	for _, team := range resp.Teams {
+		if team.ID == teamID || strings.EqualFold(team.Name, teamID) {
+			return team, nil
+		}
+	}
+	return brokerTeamInfo{}, fmt.Errorf("team %s not found", teamID)
+}
+
+func setupFormatTeamMembers(team brokerTeamInfo) string {
+	if len(team.Members) == 0 {
+		return "No members."
+	}
+	var lines []string
+	lines = append(lines, fmt.Sprintf("%-32s  %-14s", "User", "Team role cap"))
+	lines = append(lines, fmt.Sprintf("%-32s  %-14s", strings.Repeat("-", 4), strings.Repeat("-", 13)))
+	for _, member := range team.Members {
+		user := firstNonEmpty(member.Username, member.UserID)
+		if user == "" {
+			continue
+		}
+		lines = append(lines, fmt.Sprintf("%-32s  %-14s", user, firstNonEmpty(member.Role, "read")))
+	}
+	if len(lines) > 2 {
+		sort.Strings(lines[2:])
+	}
+	return strings.Join(lines, "\n")
+}
+
+func setupTeamDisplayName(fallback string, team brokerTeamInfo) string {
+	return firstNonEmpty(team.Name, team.ID, fallback)
+}
+
+func setupBrokerUserChoices(cfg config) ([]setupChoice, error) {
+	users, err := setupBrokerUsers(cfg)
+	if err != nil {
+		return nil, err
+	}
+	return setupBrokerUserChoicesFromUsers(users, nil), nil
+}
+
+func setupAvailableTeamUserChoices(cfg config, teamID string) ([]setupChoice, error) {
+	users, err := setupBrokerUsers(cfg)
+	if err != nil {
+		return nil, err
+	}
+	team, err := setupBrokerTeamInfo(cfg, teamID)
+	if err != nil {
+		return nil, err
+	}
+	members := map[string]struct{}{}
+	for _, member := range team.Members {
+		user := strings.ToLower(firstNonEmpty(member.Username, member.UserID))
+		if user != "" {
+			members[user] = struct{}{}
+		}
+	}
+	return setupBrokerUserChoicesFromUsers(users, members), nil
+}
+
+func setupAvailableRepoInviteUserChoices(cfg config, repo, teamID string) ([]setupChoice, error) {
+	users, err := setupBrokerUsers(cfg)
+	if err != nil {
+		return nil, err
+	}
+	exclude := map[string]struct{}{}
+	repoUsers, err := setupRepoUsers(cfg, repo, teamID)
+	if err != nil {
+		return nil, err
+	}
+	for _, user := range repoUsers {
+		if user.User != "" {
+			exclude[strings.ToLower(user.User)] = struct{}{}
+		}
+	}
+	brokerRepo, err := setupBrokerTeamRepoForAction(cfg, repo, teamID)
+	if err != nil {
+		return nil, err
+	}
+	pending, err := setupPendingRepoInviteChoices(cfg, brokerRepo)
+	if err != nil {
+		return nil, err
+	}
+	for _, invite := range pending {
+		if invite.Value != "" {
+			exclude[strings.ToLower(invite.Value)] = struct{}{}
+		}
+	}
+	return setupBrokerUserChoicesFromUsers(users, exclude), nil
+}
+
+func setupBrokerUsers(cfg config) ([]brokerUserInfo, error) {
+	brokerURL, err := brokerURLFromConfigOrDiscovery(cfg)
+	if err != nil {
+		return nil, err
+	}
+	var resp brokerUsersResponse
+	if err := brokerPost(brokerURL, "/broker/users/list", brokerRepoAdminRequest{}, &resp); err != nil {
+		return nil, err
+	}
+	return resp.Users, nil
+}
+
+func setupBrokerUserByName(cfg config, username string) (brokerUserInfo, bool, error) {
+	users, err := setupBrokerUsers(cfg)
+	if err != nil {
+		return brokerUserInfo{}, false, err
+	}
+	needle := strings.ToLower(strings.TrimSpace(username))
+	for _, user := range users {
+		if strings.ToLower(firstNonEmpty(user.Username, user.ID)) == needle {
+			return user, true, nil
+		}
+	}
+	return brokerUserInfo{}, false, nil
+}
+
+func setupBrokerUserStatus(user brokerUserInfo) string {
+	parts := []string{firstNonEmpty(user.BrokerRole, "user")}
+	if user.Suspended {
+		parts = append(parts, "suspended")
+	} else if user.Pending || len(user.Keys) == 0 {
+		parts = append(parts, "pending")
+	}
+	if len(user.Keys) == 1 {
+		parts = append(parts, "1 key")
+	} else if len(user.Keys) > 1 {
+		parts = append(parts, fmt.Sprintf("%d keys", len(user.Keys)))
+	}
+	return strings.Join(parts, " · ")
+}
+
+func setupBrokerUserChoicesFromUsers(users []brokerUserInfo, exclude map[string]struct{}) []setupChoice {
+	var choices []setupChoice
+	groupPending := exclude != nil
+	for _, user := range users {
+		username := firstNonEmpty(user.Username, user.ID)
+		if username == "" {
+			continue
+		}
+		if _, ok := exclude[strings.ToLower(username)]; ok {
+			continue
+		}
+		label := username
+		group := ""
+		if groupPending && (user.Pending || len(user.Keys) == 0) {
+			label += " *"
+			group = "pending users:"
+			label = "- " + label
+		} else if user.Pending || len(user.Keys) == 0 {
+			label += " *"
+		}
+		choices = append(choices, setupChoice{Label: label, Value: username, Help: user.BrokerRole, Group: group})
+	}
+	sort.Slice(choices, func(i, j int) bool {
+		if choices[i].Group != choices[j].Group {
+			return choices[i].Group < choices[j].Group
+		}
+		return choices[i].Label < choices[j].Label
+	})
+	return choices
+}
+
+func setupBrokerTeamRepoChoices(cfg config, teamID string) ([]setupChoice, error) {
+	repos, err := setupBrokerRepos(cfg)
+	if err != nil {
+		return nil, err
+	}
+	var choices []setupChoice
+	for _, repo := range repos {
+		logical := firstNonEmpty(repo.Logical, repo.Repo.Logical)
+		for _, grant := range repo.Teams {
+			if grant.ID == teamID || grant.TeamID == teamID {
+				choices = append(choices, setupChoice{Label: logicalRepoDisplayName(logical), Value: logical, Help: "role cap " + firstNonEmpty(grant.Role, "read")})
+			}
+		}
+	}
+	sort.Slice(choices, func(i, j int) bool { return choices[i].Label < choices[j].Label })
+	return choices, nil
+}
+
+func setupFormatTeamRepositories(cfg config, teamID string) string {
+	choices, err := setupBrokerTeamRepoChoices(cfg, teamID)
+	if err != nil {
+		return err.Error()
+	}
+	return setupFormatTeamRepositoriesForChoices(choices)
+}
+
+func setupFormatTeamRepositoriesForChoices(choices []setupChoice) string {
+	if len(choices) == 0 {
+		return "No repository access."
+	}
+	var lines []string
+	lines = append(lines, fmt.Sprintf("%-32s  %-14s", "Repository", "Role cap"))
+	lines = append(lines, fmt.Sprintf("%-32s  %-14s", strings.Repeat("-", 10), strings.Repeat("-", 8)))
+	for _, choice := range choices {
+		role := strings.TrimPrefix(choice.Help, "role cap ")
+		lines = append(lines, fmt.Sprintf("%-32s  %-14s", choice.Label, firstNonEmpty(role, "read")))
+	}
+	return strings.Join(lines, "\n")
+}
+
+func setupBrokerRepoChoices(cfg config) ([]setupChoice, error) {
+	repos, err := setupBrokerRepos(cfg)
+	if err != nil {
+		return nil, err
+	}
+	var choices []setupChoice
+	for _, repo := range repos {
+		logical := firstNonEmpty(repo.Logical, repo.Repo.Logical)
+		if logical == "" {
+			continue
+		}
+		choices = append(choices, setupChoice{Label: logicalRepoDisplayName(logical), Value: logical, Help: firstNonEmpty(repo.Repo.TeamID, coreTeamName)})
+	}
+	sort.Slice(choices, func(i, j int) bool { return choices[i].Label < choices[j].Label })
+	return choices, nil
+}
+
+func setupBrokerRepos(cfg config) ([]brokerRepoInfo, error) {
+	brokerURL, err := brokerURLFromConfigOrDiscovery(cfg)
+	if err != nil {
+		return nil, err
+	}
+	var resp brokerRepoListResponse
+	if err := brokerPost(brokerURL, "/repos/list", brokerRepoAdminRequest{}, &resp); err != nil {
+		return nil, err
+	}
+	return resp.Repos, nil
+}
+
+func runSetupSelectWithRaw(reader *bufio.Reader, rawInput io.Reader, stdout io.Writer, title string, choices []setupChoice, selected string) (string, bool, error) {
+	if len(choices) == 0 {
+		return "", false, fmt.Errorf("%s has no selectable entries", strings.ToLower(title))
+	}
+	rawMode, restore, err := setupDialogRawMode(rawInput)
+	if err != nil {
+		return "", false, err
+	}
+	defer restore()
+	state := setupSelectState{Title: title, Choices: choices, Button: -1}
+	for i, choice := range choices {
+		if choice.Value == selected || choice.Label == selected {
+			state.Cursor = i
+			break
+		}
+	}
+	for {
+		fmt.Fprint(stdout, renderSetupSelectFrame(state, rawMode))
+		b, err := reader.ReadByte()
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return "", false, nil
+			}
+			return "", false, err
+		}
+		switch b {
+		case 0x03:
+			return "", false, errors.New("setup canceled")
+		case 0x04:
+			value, ok := state.activate()
+			if ok {
+				return value, value != "", nil
+			}
+		case '\r', '\n', ' ':
+			value, ok := state.activate()
+			if ok {
+				return value, value != "", nil
+			}
+		case '\t':
+			state.tab()
+		case 0x1b:
+			last, ok, err := setupReadEscapeSequence(reader)
+			if err != nil {
+				return "", false, err
+			}
+			if !ok {
+				return "", false, nil
+			}
+			switch last {
+			case 'A':
+				state.up()
+			case 'B':
+				state.down()
+			case 'C':
+				value, ok := state.activate()
+				if ok {
+					return value, value != "", nil
+				}
+			case 'D':
+				return "", false, nil
+			}
+		}
+	}
+}
+
+func setupReadEscapeSequence(reader *bufio.Reader) (byte, bool, error) {
+	if reader.Buffered() == 0 {
+		return 0, false, nil
+	}
+	next, err := reader.ReadByte()
+	if err != nil {
+		if errors.Is(err, io.EOF) {
+			return 0, false, nil
+		}
+		return 0, false, err
+	}
+	if next != '[' {
+		return next, true, nil
+	}
+	if reader.Buffered() == 0 {
+		return 0, false, nil
+	}
+	last, err := reader.ReadByte()
+	if err != nil {
+		if errors.Is(err, io.EOF) {
+			return 0, false, nil
+		}
+		return 0, false, err
+	}
+	return last, true, nil
+}
+
+func (s *setupSelectState) rows() int { return len(s.Choices) }
+
+func (s *setupSelectState) visibleRange() (int, int) {
+	const maxRows = 10
+	rows := s.rows()
+	if s.Cursor < s.Scroll {
+		s.Scroll = s.Cursor
+	}
+	if s.Cursor >= s.Scroll+maxRows {
+		s.Scroll = s.Cursor - maxRows + 1
+	}
+	if s.Scroll < 0 {
+		s.Scroll = 0
+	}
+	if s.Scroll > rows-maxRows {
+		s.Scroll = maxSetupDialogInt(0, rows-maxRows)
+	}
+	return s.Scroll, minSetupDialogInt(s.Scroll+maxRows, rows)
+}
+
+func (s *setupSelectState) up() {
+	if s.rows() == 0 {
+		return
+	}
+	s.Button = -1
+	if s.Cursor == 0 {
+		s.Cursor = s.rows() - 1
+		return
+	}
+	s.Cursor--
+}
+
+func (s *setupSelectState) down() {
+	if s.rows() == 0 {
+		return
+	}
+	s.Button = -1
+	s.Cursor = (s.Cursor + 1) % s.rows()
+}
+
+func (s *setupSelectState) tab() {
+	if s.Button == 1 {
+		s.Button = -1
+		s.Cursor = 0
+		return
+	}
+	if s.Button < 0 {
+		s.Button = 0
+		return
+	}
+	s.Button = (s.Button + 1) % 2
+}
+
+func (s setupSelectState) activate() (string, bool) {
+	if s.Button == 1 {
+		return "", true
+	}
+	if s.Button == 0 || s.Button < 0 {
+		if s.Cursor >= 0 && s.Cursor < len(s.Choices) {
+			return s.Choices[s.Cursor].Value, true
+		}
+	}
+	return "", false
+}
+
+func renderSetupSelectFrame(state setupSelectState, rawMode bool) string {
+	rendered := renderSetupSelectWithStyle(state, rawMode)
+	if !rawMode {
+		return rendered
+	}
+	rendered = strings.ReplaceAll(rendered, "\n", "\r\n")
+	return "\x1b[?25l\x1b[H\x1b[2J" + rendered
+}
+
+func renderSetupSelectWithStyle(state setupSelectState, style bool) string {
+	start, end := state.visibleRange()
+	width := setupDialogDynamicWidth(58, state.Title, "Up/Down move  Right/Enter select  Tab buttons", "Left/Esc back  Ctrl-C cancel")
+	for i := start; i < end; i++ {
+		choice := state.Choices[i]
+		width = setupDialogDynamicWidth(width, fmt.Sprintf("> %-26s %s", choice.Label, choice.Help))
+		if choice.Group != "" {
+			width = setupDialogDynamicWidth(width, choice.Group)
+		}
+	}
+	var lines []string
+	lines = append(lines,
+		setupDialogBorder(width),
+		setupDialogTitleRow(width),
+		setupDialogBorder(width),
+		setupDialogRowWidth(state.Title, width),
+		setupDialogRowWidth("", width),
+	)
+	lastGroup := ""
+	for i := start; i < end; i++ {
+		choice := state.Choices[i]
+		if choice.Group != "" && choice.Group != lastGroup {
+			lines = append(lines, setupDialogRowWidth(choice.Group, width))
+			lastGroup = choice.Group
+		}
+		marker := " "
+		if state.Button < 0 && state.Cursor == i {
+			marker = ">"
+		}
+		lines = append(lines, setupDialogRowStyledWidth(fmt.Sprintf("%s %-26s %s", marker, choice.Label, choice.Help), width, setupDialogSectionStyle(style, state.Button < 0 && state.Cursor == i)))
+	}
+	if len(state.Choices) > 10 {
+		lines = append(lines, setupDialogRowWidth(setupBrokerScrollBar(start, end, len(state.Choices)), width))
+	}
+	okStyle := ""
+	cancelStyle := ""
+	if style && state.Button == 0 {
+		okStyle = "\x1b[44;97m"
+	}
+	if style && state.Button == 1 {
+		cancelStyle = "\x1b[44;97m"
+	}
+	lines = append(lines,
+		setupDialogRowWidth("", width),
+		setupDialogBorder(width),
+		setupDialogRowWidth(setupDialogButton("[ OK ]", okStyle)+"    "+setupDialogButton("[ Cancel ]", cancelStyle), width),
+		setupDialogRowWidth("Up/Down move  Right/Enter select  Tab buttons", width),
+		setupDialogRowWidth("Left/Esc back  Ctrl-C cancel", width),
+		setupDialogBorder(width),
+	)
+	rendered := strings.Join(lines, "\n") + "\n"
+	if setupSelectHasPendingUserNote(state) {
+		rendered += "* pending invite or no accepted key yet\n"
+	}
+	return rendered
+}
+
+func setupSelectHasPendingUserNote(state setupSelectState) bool {
+	if !strings.Contains(strings.ToLower(state.Title), "username") {
+		return false
+	}
+	start, end := state.visibleRange()
+	for i := start; i < end; i++ {
+		if strings.HasSuffix(strings.TrimSpace(state.Choices[i].Label), "*") {
+			return true
+		}
+	}
+	return false
+}
+
+func runSetupMultiSelectWithRaw(reader *bufio.Reader, rawInput io.Reader, stdout io.Writer, title string, choices []setupChoice) ([]string, bool, error) {
+	if len(choices) == 0 {
+		return nil, false, fmt.Errorf("%s has no selectable entries", strings.ToLower(title))
+	}
+	state := setupMultiSelectState{Title: title, Choices: choices, Selected: make([]bool, len(choices)), Button: -1}
+	for {
+		fmt.Fprint(stdout, renderSetupMultiSelectFrame(state, true))
+		b, err := reader.ReadByte()
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return nil, false, nil
+			}
+			return nil, false, err
+		}
+		switch b {
+		case 0x03:
+			return nil, false, errors.New("setup canceled")
+		case 0x04:
+			if selected, ok := state.deploy(); ok {
+				return selected, true, nil
+			}
+		case '\r', '\n', ' ':
+			if state.Button == 1 {
+				return nil, false, nil
+			}
+			if state.Button == 0 {
+				if selected, ok := state.deploy(); ok {
+					return selected, true, nil
+				}
+				continue
+			}
+			state.toggle()
+		case '\t':
+			state.tab()
+		case 0x1b:
+			last, ok, err := setupReadEscapeSequence(reader)
+			if err != nil {
+				return nil, false, err
+			}
+			if !ok {
+				return nil, false, nil
+			}
+			switch last {
+			case 'A':
+				state.up()
+			case 'B':
+				state.down()
+			case 'C':
+				if selected, ok := state.deploy(); ok {
+					return selected, true, nil
+				}
+			case 'D':
+				return nil, false, nil
+			}
+		}
+	}
+}
+
+func (s *setupMultiSelectState) rows() int { return len(s.Choices) }
+
+func (s *setupMultiSelectState) visibleRange() (int, int) {
+	const maxRows = 10
+	rows := s.rows()
+	if s.Cursor < s.Scroll {
+		s.Scroll = s.Cursor
+	}
+	if s.Cursor >= s.Scroll+maxRows {
+		s.Scroll = s.Cursor - maxRows + 1
+	}
+	if s.Scroll < 0 {
+		s.Scroll = 0
+	}
+	if s.Scroll > rows-maxRows {
+		s.Scroll = maxSetupDialogInt(0, rows-maxRows)
+	}
+	return s.Scroll, minSetupDialogInt(s.Scroll+maxRows, rows)
+}
+
+func (s *setupMultiSelectState) up() {
+	if s.rows() == 0 {
+		return
+	}
+	s.Button = -1
+	s.Message = ""
+	if s.Cursor == 0 {
+		s.Cursor = s.rows() - 1
+		return
+	}
+	s.Cursor--
+}
+
+func (s *setupMultiSelectState) down() {
+	if s.rows() == 0 {
+		return
+	}
+	s.Button = -1
+	s.Message = ""
+	s.Cursor = (s.Cursor + 1) % s.rows()
+}
+
+func (s *setupMultiSelectState) tab() {
+	s.Message = ""
+	if s.Button == 1 {
+		s.Button = -1
+		s.Cursor = 0
+		return
+	}
+	if s.Button < 0 {
+		s.Button = 0
+		return
+	}
+	s.Button = (s.Button + 1) % 2
+}
+
+func (s *setupMultiSelectState) toggle() {
+	s.Message = ""
+	if s.Cursor >= 0 && s.Cursor < len(s.Selected) {
+		s.Selected[s.Cursor] = !s.Selected[s.Cursor]
+	}
+}
+
+func (s *setupMultiSelectState) deploy() ([]string, bool) {
+	var selected []string
+	for i, ok := range s.Selected {
+		if ok {
+			selected = append(selected, s.Choices[i].Value)
+		}
+	}
+	if len(selected) == 0 {
+		s.Message = "Select at least one repository."
+		return nil, false
+	}
+	return selected, true
+}
+
+func renderSetupMultiSelectFrame(state setupMultiSelectState, rawMode bool) string {
+	rendered := renderSetupMultiSelectWithStyle(state, rawMode)
+	if !rawMode {
+		return rendered
+	}
+	rendered = strings.ReplaceAll(rendered, "\n", "\r\n")
+	return "\x1b[?25l\x1b[H\x1b[2J" + rendered
+}
+
+func renderSetupMultiSelectWithStyle(state setupMultiSelectState, style bool) string {
+	start, end := state.visibleRange()
+	width := setupDialogDynamicWidth(58, state.Title, "Space/Enter toggles  Right/Ctrl-D OK", "Left/Esc back  Arrows move  Tab buttons")
+	for i := start; i < end; i++ {
+		choice := state.Choices[i]
+		width = setupDialogDynamicWidth(width, fmt.Sprintf("> [x] %-22s %s", choice.Label, choice.Help))
+	}
+	var lines []string
+	lines = append(lines,
+		setupDialogBorder(width),
+		setupDialogTitleRow(width),
+		setupDialogBorder(width),
+		setupDialogRowWidth(state.Title, width),
+		setupDialogRowWidth("", width),
+	)
+	for i := start; i < end; i++ {
+		choice := state.Choices[i]
+		marker := " "
+		if state.Button < 0 && state.Cursor == i {
+			marker = ">"
+		}
+		checked := "[ ]"
+		if i < len(state.Selected) && state.Selected[i] {
+			checked = "[x]"
+		}
+		lines = append(lines, setupDialogRowStyledWidth(fmt.Sprintf("%s %s %-22s %s", marker, checked, choice.Label, choice.Help), width, setupDialogSectionStyle(style, state.Button < 0 && state.Cursor == i)))
+	}
+	if len(state.Choices) > 10 {
+		lines = append(lines, setupDialogRowWidth(setupBrokerScrollBar(start, end, len(state.Choices)), width))
+	}
+	if state.Message != "" {
+		lines = append(lines, setupDialogRowStyledWidth(state.Message, width, setupDialogANSI(style, "33")))
+	}
+	okStyle := ""
+	cancelStyle := ""
+	if style && state.Button == 0 {
+		okStyle = "\x1b[44;97m"
+	}
+	if style && state.Button == 1 {
+		cancelStyle = "\x1b[44;97m"
+	}
+	lines = append(lines,
+		setupDialogRowWidth("", width),
+		setupDialogBorder(width),
+		setupDialogRowWidth(setupDialogButton("[ OK ]", okStyle)+"    "+setupDialogButton("[ Cancel ]", cancelStyle), width),
+		setupDialogRowWidth("Space/Enter toggles  Right/Ctrl-D OK", width),
+		setupDialogRowWidth("Left/Esc back  Arrows move  Tab buttons", width),
+		setupDialogBorder(width),
+	)
+	return strings.Join(lines, "\n") + "\n"
+}
+
+func runSetupTextFormWithRaw(reader *bufio.Reader, rawInput io.Reader, stdout io.Writer, title string, fields []setupTextField) ([]string, bool, error) {
+	state := setupTextFormState{Title: title, Fields: fields, Button: -1}
+	for {
+		fmt.Fprint(stdout, renderSetupTextFormFrame(state, true))
+		b, err := reader.ReadByte()
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return nil, false, nil
+			}
+			return nil, false, err
+		}
+		switch b {
+		case 0x03:
+			return nil, false, errors.New("setup canceled")
+		case 0x04:
+			if values, ok := state.deploy(); ok {
+				return values, true, nil
+			}
+		case '\r', '\n':
+			if state.Editing {
+				state.Editing = false
+				state.EditOriginal = ""
+				continue
+			}
+			if state.Button == 1 {
+				return nil, false, nil
+			}
+			if values, ok := state.activate(); ok {
+				return values, true, nil
+			}
+		case ' ':
+			if state.Editing {
+				state.appendByte(b)
+				continue
+			}
+			if state.Button == 1 {
+				return nil, false, nil
+			}
+			if values, ok := state.activate(); ok {
+				return values, true, nil
+			}
+		case '\t':
+			state.tab()
+		case 0x7f, 0x08:
+			if state.Editing {
+				state.backspace()
+			}
+		case 0x1b:
+			if state.Editing {
+				state.Fields[state.Cursor].Value = state.EditOriginal
+				state.Editing = false
+				state.EditOriginal = ""
+				continue
+			}
+			last, ok, err := setupReadEscapeSequence(reader)
+			if err != nil {
+				return nil, false, err
+			}
+			if !ok {
+				return nil, false, nil
+			}
+			switch last {
+			case 'A':
+				state.up()
+			case 'B':
+				state.down()
+			case 'C':
+				if values, ok := state.activate(); ok {
+					return values, true, nil
+				}
+			case 'D':
+				return nil, false, nil
+			}
+		default:
+			if state.Editing {
+				state.appendByte(b)
+			}
+		}
+	}
+}
+
+func (s *setupTextFormState) rows() int { return len(s.Fields) }
+
+func (s *setupTextFormState) up() {
+	if s.Editing || s.rows() == 0 {
+		return
+	}
+	s.Button = -1
+	s.Message = ""
+	if s.Cursor == 0 {
+		s.Cursor = s.rows() - 1
+		return
+	}
+	s.Cursor--
+}
+
+func (s *setupTextFormState) down() {
+	if s.Editing || s.rows() == 0 {
+		return
+	}
+	s.Button = -1
+	s.Message = ""
+	s.Cursor = (s.Cursor + 1) % s.rows()
+}
+
+func (s *setupTextFormState) tab() {
+	if s.Editing {
+		s.Editing = false
+		s.EditOriginal = ""
+	}
+	s.Message = ""
+	if s.Button == 1 {
+		s.Button = -1
+		s.Cursor = 0
+		return
+	}
+	if s.Button < 0 {
+		s.Button = 0
+		return
+	}
+	s.Button = (s.Button + 1) % 2
+}
+
+func (s *setupTextFormState) activate() ([]string, bool) {
+	if s.Button == 0 {
+		return s.deploy()
+	}
+	if s.Button == 1 {
+		return nil, false
+	}
+	if s.Cursor >= 0 && s.Cursor < len(s.Fields) {
+		s.Editing = true
+		s.EditOriginal = s.Fields[s.Cursor].Value
+		s.Message = ""
+	}
+	return nil, false
+}
+
+func (s *setupTextFormState) deploy() ([]string, bool) {
+	var values []string
+	for _, field := range s.Fields {
+		value := strings.TrimSpace(field.Value)
+		if field.Required && value == "" {
+			s.Message = field.Label + " is required."
+			return nil, false
+		}
+		values = append(values, value)
+	}
+	return values, true
+}
+
+func (s *setupTextFormState) appendByte(b byte) {
+	if b == '\r' || b == '\n' {
+		s.Editing = false
+		s.EditOriginal = ""
+		return
+	}
+	if b < 32 || b > 126 {
+		return
+	}
+	if s.Cursor < 0 || s.Cursor >= len(s.Fields) || len(s.Fields[s.Cursor].Value) >= 160 {
+		return
+	}
+	s.Fields[s.Cursor].Value += string(b)
+}
+
+func (s *setupTextFormState) backspace() {
+	if s.Cursor < 0 || s.Cursor >= len(s.Fields) {
+		return
+	}
+	value := s.Fields[s.Cursor].Value
+	if len(value) == 0 {
+		return
+	}
+	s.Fields[s.Cursor].Value = value[:len(value)-1]
+}
+
+func renderSetupTextFormFrame(state setupTextFormState, rawMode bool) string {
+	rendered := renderSetupTextFormWithStyle(state, rawMode)
+	if !rawMode {
+		return rendered
+	}
+	rendered = strings.ReplaceAll(rendered, "\n", "\r\n")
+	return "\x1b[?25l\x1b[H\x1b[2J" + rendered
+}
+
+func renderSetupTextFormWithStyle(state setupTextFormState, style bool) string {
+	width := setupDialogDynamicWidth(58, state.Title, "Enter edits/saves field  Tab fields/buttons", "Ctrl-D OK  Esc cancel/revert  Ctrl-C cancel")
+	for _, field := range state.Fields {
+		width = setupDialogDynamicWidth(width, fmt.Sprintf("> %-18s [%s]", field.Label, initDialogInputValue(field.Value, 31, false, false)))
+	}
+	inputWidth := maxSetupDialogInt(31, width-24)
+	var lines []string
+	lines = append(lines,
+		setupDialogBorder(width),
+		setupDialogTitleRow(width),
+		setupDialogBorder(width),
+		setupDialogRowWidth(state.Title, width),
+		setupDialogRowWidth("", width),
+	)
+	for i, field := range state.Fields {
+		active := state.Button < 0 && state.Cursor == i
+		marker := " "
+		if active {
+			marker = ">"
+		}
+		inputStyle := setupDialogSectionStyle(style, active)
+		if style && state.Editing && active {
+			inputStyle += "\x1b[44;97m"
+		}
+		value := field.Value
+		if field.Secret {
+			value = strings.Repeat("*", len(value))
+		}
+		lines = append(lines, setupDialogRowStyledWidth(fmt.Sprintf("%s %-18s [%s]", marker, field.Label, initDialogInputValue(value, inputWidth, state.Editing && active, style)), width, inputStyle))
+	}
+	if state.Message != "" {
+		lines = append(lines, setupDialogRowStyledWidth(state.Message, width, setupDialogANSI(style, "33")))
+	}
+	okStyle := ""
+	cancelStyle := ""
+	if style && state.Button == 0 {
+		okStyle = "\x1b[44;97m"
+	}
+	if style && state.Button == 1 {
+		cancelStyle = "\x1b[44;97m"
+	}
+	lines = append(lines,
+		setupDialogRowWidth("", width),
+		setupDialogBorder(width),
+		setupDialogRowWidth(setupDialogButton("[ OK ]", okStyle)+"    "+setupDialogButton("[ Cancel ]", cancelStyle), width),
+		setupDialogRowWidth("Enter edits/saves field  Tab fields/buttons", width),
+		setupDialogRowWidth("Ctrl-D OK  Esc cancel/revert  Ctrl-C cancel", width),
+		setupDialogBorder(width),
+	)
+	return strings.Join(lines, "\n") + "\n"
+}
+
+func runSetupBrokerOutputWithRaw(reader *bufio.Reader, rawInput io.Reader, stdout io.Writer, title, body string) (string, error) {
+	for {
+		fmt.Fprint(stdout, renderSetupBrokerOutputFrame(title, body, true))
+		b, err := reader.ReadByte()
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return "Done.", nil
+			}
+			return "", err
+		}
+		switch b {
+		case 0x03:
+			return "", errors.New("setup canceled")
+		case '\r', '\n', ' ', 0x04, 0x1b, 'q', 'Q':
+			return "Done.", nil
+		}
+	}
+}
+
+func runSetupPlainCommandOutputWithRaw(reader *bufio.Reader, stdout io.Writer, title, command string) (string, error) {
+	command = strings.TrimSpace(command)
+	if command == "" {
+		command = "No command was returned."
+	}
+	rendered := strings.TrimSpace(title) + "\n\n" + command + "\n\nPress any key to continue\n"
+	rendered = strings.ReplaceAll(rendered, "\n", "\r\n")
+	fmt.Fprint(stdout, "\x1b[?25h\x1b[H\x1b[2J"+rendered)
+	b, err := reader.ReadByte()
+	if err != nil && !errors.Is(err, io.EOF) {
+		return "", err
+	}
+	if b == 0x03 {
+		return "", errors.New("setup canceled")
+	}
+	return "Done.", nil
+}
+
+func setupAcceptCommandFromOutput(output string) string {
+	lines := strings.Split(output, "\n")
+	for i, line := range lines {
+		if strings.Contains(strings.ToLower(line), "give this command") {
+			for _, candidate := range lines[i+1:] {
+				candidate = strings.TrimSpace(candidate)
+				if strings.HasPrefix(candidate, "bgit ") {
+					return candidate
+				}
+			}
+		}
+	}
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "bgit ") {
+			return line
+		}
+	}
+	return strings.TrimSpace(output)
+}
+
+func renderSetupBrokerOutputFrame(title, body string, rawMode bool) string {
+	rendered := renderSetupBrokerOutputWithStyle(title, body, rawMode)
+	if !rawMode {
+		return rendered
+	}
+	rendered = strings.ReplaceAll(rendered, "\n", "\r\n")
+	return "\x1b[?25l\x1b[H\x1b[2J" + rendered
+}
+
+func renderSetupBrokerOutputWithStyle(title, body string, style bool) string {
+	width := setupDialogDynamicWidth(72, title, "Enter/Esc returns to previous menu")
+	body = strings.TrimSpace(body)
+	if body == "" {
+		body = "No entries."
+	}
+	for _, line := range strings.Split(body, "\n") {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		width = setupDialogDynamicWidth(width, line)
+	}
+	var lines []string
+	lines = append(lines,
+		setupDialogBorder(width),
+		setupDialogTitleRow(width),
+		setupDialogBorder(width),
+		setupDialogRowWidth(title, width),
+		setupDialogRowWidth("", width),
+	)
+	bodyLines := setupWrapOutputLines(body, width)
+	if len(bodyLines) > 18 {
+		bodyLines = bodyLines[:12]
+		bodyLines = append(bodyLines, "...")
+	}
+	for _, line := range bodyLines {
+		lines = append(lines, setupDialogRowWidth(line, width))
+	}
+	lines = append(lines,
+		setupDialogRowWidth("", width),
+		setupDialogBorder(width),
+		setupDialogRowWidth("[ OK ]", width),
+		setupDialogRowWidth("Enter/Esc returns to previous menu", width),
+		setupDialogBorder(width),
+	)
+	return strings.Join(lines, "\n") + "\n"
+}
+
+func setupWrapOutputLines(body string, width int) []string {
+	var out []string
+	for _, line := range strings.Split(body, "\n") {
+		if len(stripSetupANSI(line)) <= width {
+			out = append(out, line)
+			continue
+		}
+		out = append(out, setupWrapHard(line, width)...)
+	}
+	return out
+}
+
+func setupWrapHard(line string, width int) []string {
+	if width <= 0 {
+		return []string{line}
+	}
+	var out []string
+	prefix := ""
+	if strings.HasPrefix(line, "  ") {
+		prefix = "  "
+	}
+	remaining := line
+	for len(stripSetupANSI(remaining)) > width {
+		cut := width
+		if prefix != "" && len(out) > 0 {
+			cut = width - len(prefix)
+		}
+		if cut < 8 {
+			cut = width
+		}
+		part := remaining[:minSetupDialogInt(cut, len(remaining))]
+		if len(out) > 0 && prefix != "" {
+			part = prefix + part
+		}
+		out = append(out, part)
+		remaining = remaining[minSetupDialogInt(cut, len(remaining)):]
+	}
+	if remaining != "" {
+		if len(out) > 0 && prefix != "" {
+			remaining = prefix + remaining
+		}
+		out = append(out, remaining)
+	}
+	return out
+}
+
+func runSetupBrokerDeleteConfirmWithRaw(reader *bufio.Reader, rawInput io.Reader, stdout io.Writer, broker setupConfiguredBroker) (bool, error) {
+	rawMode, restore, err := setupDialogRawMode(rawInput)
+	if err != nil {
+		return false, err
+	}
+	defer restore()
+	button := 1
+	for {
+		fmt.Fprint(stdout, renderSetupBrokerDeleteConfirmFrame(broker, button, rawMode))
+		b, err := reader.ReadByte()
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return false, nil
+			}
+			return false, err
+		}
+		switch b {
+		case 0x03:
+			return false, errors.New("setup canceled")
+		case '\t':
+			button = (button + 1) % 2
+		case '\r', '\n', ' ', 0x04:
+			return button == 0, nil
+		case 0x1b, 'q', 'Q':
+			return false, nil
+		}
+	}
+}
+
+func renderSetupBrokerDeleteConfirmFrame(broker setupConfiguredBroker, button int, rawMode bool) string {
+	rendered := renderSetupBrokerDeleteConfirmWithStyle(broker, button, rawMode)
+	if !rawMode {
+		return rendered
+	}
+	rendered = strings.ReplaceAll(rendered, "\n", "\r\n")
+	return "\x1b[?25l\x1b[H\x1b[2J" + rendered
+}
+
+func renderSetupBrokerDeleteConfirmWithStyle(broker setupConfiguredBroker, button int, style bool) string {
+	deleteStyle := ""
+	cancelStyle := ""
+	if style && button == 0 {
+		deleteStyle = "\x1b[41;97m"
+	}
+	if style && button == 1 {
+		cancelStyle = "\x1b[44;97m"
+	}
+	lines := []string{
+		"+------------------------------------------------------------+",
+		"|                    BUCKETGIT SETUP                         |",
+		"+------------------------------------------------------------+",
+		setupDialogRow("Delete broker " + setupBrokerQualifiedName(broker) + "?"),
+		setupDialogRow("This removes broker infrastructure for this region."),
+		setupDialogRow("Repository buckets are not deleted by broker delete."),
+		"|                                                            |",
+		"+------------------------------------------------------------+",
+		setupDialogRow(setupDialogButton("[ Delete ]", deleteStyle) + "    " + setupDialogButton("[ Cancel ]", cancelStyle)),
+		setupDialogRow("Tab buttons  Enter select  Esc cancel"),
+		"+------------------------------------------------------------+",
+	}
+	return strings.Join(lines, "\n") + "\n"
 }
 
 func setupAvailableCreateProviders() []string {
@@ -2685,6 +5892,13 @@ func minSetupDialogInt(a, b int) int {
 	return b
 }
 
+func maxSetupDialogInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
 func renderSetupDialog(state setupDialogState) string {
 	return renderSetupDialogWithStyle(state, false)
 }
@@ -2971,6 +6185,42 @@ func setupDialogProviderVisibleItems(state setupDialogState, provider string) []
 	return items
 }
 
+func setupBreadcrumb(parts ...string) string {
+	var cleaned []string
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part != "" {
+			cleaned = append(cleaned, part)
+		}
+	}
+	return strings.Join(cleaned, " > ")
+}
+
+func setupDialogDynamicWidth(base int, values ...string) int {
+	width := base
+	for _, value := range values {
+		if n := len(stripSetupANSI(value)); n > width {
+			width = n
+		}
+	}
+	if width < 58 {
+		width = 58
+	}
+	if width > 100 {
+		width = 100
+	}
+	return width
+}
+
+func setupDialogTitleRow(width int) string {
+	title := "BUCKETGIT SETUP"
+	if len(title) >= width {
+		return setupDialogRowWidth(title, width)
+	}
+	left := (width - len(title)) / 2
+	return setupDialogRowWidth(strings.Repeat(" ", left)+title, width)
+}
+
 func setupDialogRow(text string) string {
 	visible := stripSetupANSI(text)
 	if len(visible) > 58 {
@@ -2978,6 +6228,19 @@ func setupDialogRow(text string) string {
 		visible = text
 	}
 	return "| " + text + strings.Repeat(" ", 58-len(visible)) + " |"
+}
+
+func setupDialogBorder(width int) string {
+	return "+" + strings.Repeat("-", width+2) + "+"
+}
+
+func setupDialogRowWidth(text string, width int) string {
+	visible := stripSetupANSI(text)
+	if len(visible) > width {
+		text = visible[:width]
+		visible = text
+	}
+	return "| " + text + strings.Repeat(" ", width-len(visible)) + " |"
 }
 
 func setupDialogRowStyled(text, style string) string {
@@ -2990,6 +6253,60 @@ func setupDialogRowStyled(text, style string) string {
 		text = style + text + "\x1b[0m"
 	}
 	return "| " + text + strings.Repeat(" ", 58-len(visible)) + " |"
+}
+
+func setupDialogRowStyledWidth(text string, width int, style string) string {
+	visible := stripSetupANSI(text)
+	if len(visible) > width {
+		text = visible[:width]
+		visible = text
+	}
+	if style != "" {
+		text = style + text + "\x1b[0m"
+	}
+	return "| " + text + strings.Repeat(" ", width-len(visible)) + " |"
+}
+
+func setupDialogWrappedActionRows(marker, label, help string, labelWidth, width int, style string) []string {
+	prefixWidth := 2 + labelWidth + 1
+	helpWidth := width - prefixWidth
+	if helpWidth < 12 {
+		helpWidth = 12
+	}
+	parts := setupWrapWords(help, helpWidth)
+	if len(parts) == 0 {
+		parts = []string{""}
+	}
+	rows := []string{setupDialogRowStyledWidth(fmt.Sprintf("%s %-*s %s", marker, labelWidth, label, parts[0]), width, style)}
+	for _, part := range parts[1:] {
+		rows = append(rows, setupDialogRowStyledWidth(fmt.Sprintf("  %-*s %s", labelWidth, "", part), width, style))
+	}
+	return rows
+}
+
+func setupWrapWords(text string, width int) []string {
+	words := strings.Fields(text)
+	if len(words) == 0 {
+		return nil
+	}
+	var lines []string
+	line := ""
+	for _, word := range words {
+		if line == "" {
+			line = word
+			continue
+		}
+		if len(line)+1+len(word) > width {
+			lines = append(lines, line)
+			line = word
+			continue
+		}
+		line += " " + word
+	}
+	if line != "" {
+		lines = append(lines, line)
+	}
+	return lines
 }
 
 func setupProviderLabel(provider string) string {
@@ -3020,6 +6337,14 @@ func shortSetupKey(key string) string {
 
 func brokerUpsertOwners(brokerURL string, publicKeys []string) error {
 	return brokerPost(brokerURL, "/owners/upsert", brokerOwnerRequest{User: "owner", Role: "owner", PublicKeys: publicKeys}, nil)
+}
+
+func brokerEnsureCoreTeam(brokerURL string) error {
+	err := brokerPost(brokerURL, "/teams/create", brokerRepoAdminRequest{TeamID: coreTeamID, Name: coreTeamName}, nil)
+	if err != nil && !strings.Contains(err.Error(), "team already exists") {
+		return err
+	}
+	return nil
 }
 
 func upsertGlobalGCPProfile(cfg globalConfig, profile globalGCPProfile) globalConfig {

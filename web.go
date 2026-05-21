@@ -435,6 +435,8 @@ func (s *webServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.handleAPIIssues(ctx, w, r)
 	case route == "api/settings":
 		s.handleAPISettings(ctx, w, r)
+	case route == "api/settings-fragment":
+		s.handleAPISettingsFragment(ctx, w, r)
 	case route == "api/blob":
 		srv.handleAPIBlob(ctx, w, r)
 	case strings.HasPrefix(route, "api/commit/"):
@@ -453,6 +455,8 @@ func (s *webServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.handleIssue(ctx, w, r, strings.TrimPrefix(route, "issues/"))
 	case route == "settings":
 		s.handleSettings(ctx, w, r)
+	case route == "admin":
+		http.Redirect(w, r, "/settings", http.StatusFound)
 	case route == "archive.zip":
 		srv.handleArchiveZip(ctx, w, r)
 	case strings.HasPrefix(route, "commit/"):
@@ -735,6 +739,17 @@ type webSettingsInfo struct {
 	Errors        map[string]string         `json:"errors,omitempty"`
 }
 
+type webSettingsCache struct {
+	UpdatedAt int64           `json:"updated_at"`
+	Info      webSettingsInfo `json:"info"`
+}
+
+type brokerRepoTeamGrant struct {
+	ID     string `json:"id,omitempty"`
+	TeamID string `json:"team_id,omitempty"`
+	Role   string `json:"role,omitempty"`
+}
+
 type brokerRepoInfoRequest struct {
 	Repo          brokerRepo `json:"repo"`
 	Description   string     `json:"description,omitempty"`
@@ -743,6 +758,12 @@ type brokerRepoInfoRequest struct {
 	ReadOnly      bool       `json:"read_only,omitempty"`
 	IssuesEnabled bool       `json:"issues_enabled"`
 	Logical       string     `json:"logical,omitempty"`
+	TeamID        string     `json:"team_id,omitempty"`
+	Name          string     `json:"name,omitempty"`
+	User          string     `json:"user,omitempty"`
+	Role          string     `json:"role,omitempty"`
+	BrokerRole    string     `json:"broker_role,omitempty"`
+	PublicKeys    []string   `json:"public_keys,omitempty"`
 }
 
 type brokerRepoInfoResponse struct {
@@ -759,7 +780,30 @@ func (s *webServer) handleAPISettings(ctx context.Context, w http.ResponseWriter
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	s.renderJSON(w, s.settingsInfo(ctx))
+	refresh := r.URL.Query().Get("refresh") == "1"
+	info, _, err := s.cachedSettingsInfo(ctx, refresh)
+	if err != nil {
+		s.renderJSONError(w, http.StatusBadRequest, err)
+		return
+	}
+	s.renderJSON(w, info)
+}
+
+func (s *webServer) handleAPISettingsFragment(ctx context.Context, w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	view := strings.TrimSpace(r.URL.Query().Get("view"))
+	if view == "" {
+		view = "settings"
+	}
+	info, _, err := s.cachedSettingsInfo(ctx, r.URL.Query().Get("refresh") == "1")
+	if err != nil {
+		s.renderJSONError(w, http.StatusBadRequest, err)
+		return
+	}
+	s.renderJSON(w, map[string]any{"html": s.settingsSectionsHTML(info, view), "settings": info})
 }
 
 func (s *webServer) handleAPIIssues(ctx context.Context, w http.ResponseWriter, r *http.Request) {
@@ -843,6 +887,73 @@ func (s *webServer) settingsInfo(ctx context.Context) webSettingsInfo {
 		info.Errors = nil
 	}
 	return info
+}
+
+func (s *webServer) settingsSeedInfo() webSettingsInfo {
+	return webSettingsInfo{
+		Repo:          repoForBroker(s.cfg),
+		Title:         s.title,
+		BrokerURL:     s.cfg.brokerURL,
+		Provider:      s.cfg.provider,
+		Region:        firstNonEmpty(s.cfg.region, globalConfigRegionForBrokerURL(s.cfg.brokerURL)),
+		DefaultBranch: defaultBranch,
+		Visibility:    "private",
+		IssuesEnabled: true,
+	}
+}
+
+func (s *webServer) settingsCachePath() string {
+	if s.localGitDir == "" {
+		return ""
+	}
+	return filepath.Join(s.localGitDir, "bucketgit", "cache", "settings.json")
+}
+
+func (s *webServer) readSettingsCache() (webSettingsInfo, error) {
+	path := s.settingsCachePath()
+	if path == "" {
+		return webSettingsInfo{}, fs.ErrNotExist
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return webSettingsInfo{}, err
+	}
+	var cache webSettingsCache
+	if err := json.Unmarshal(data, &cache); err != nil {
+		return webSettingsInfo{}, err
+	}
+	return cache.Info, nil
+}
+
+func (s *webServer) writeSettingsCache(info webSettingsInfo) error {
+	path := s.settingsCachePath()
+	if path == "" {
+		return nil
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	data, err := json.MarshalIndent(webSettingsCache{UpdatedAt: time.Now().Unix(), Info: info}, "", "  ")
+	if err != nil {
+		return err
+	}
+	data = append(data, '\n')
+	if existing, err := os.ReadFile(path); err == nil && bytes.Equal(existing, data) {
+		return nil
+	}
+	return os.WriteFile(path, data, 0o644)
+}
+
+func (s *webServer) cachedSettingsInfo(ctx context.Context, refresh bool) (webSettingsInfo, bool, error) {
+	if !refresh {
+		if info, err := s.readSettingsCache(); err == nil {
+			return info, true, nil
+		}
+		return s.settingsSeedInfo(), false, nil
+	}
+	info := s.settingsInfo(ctx)
+	_ = s.writeSettingsCache(info)
+	return info, false, nil
 }
 
 func globalConfigRegionForBrokerURL(brokerURL string) string {
@@ -1360,7 +1471,6 @@ func (s *webServer) handleAPIActionSettings(ctx context.Context, w http.Response
 		Logical        string `json:"logical"`
 		User           string `json:"user"`
 		Role           string `json:"role"`
-		PublicKey      string `json:"public_key"`
 		Key            string `json:"key"`
 		Ref            string `json:"ref"`
 		RequirePR      bool   `json:"require_pr"`
@@ -2109,7 +2219,7 @@ func (s *webServer) handleIssue(ctx context.Context, w http.ResponseWriter, r *h
 }
 
 func (s *webServer) handleSettings(ctx context.Context, w http.ResponseWriter, r *http.Request) {
-	info := s.settingsInfo(ctx)
+	info, cached, _ := s.cachedSettingsInfo(ctx, false)
 	ref := branchRef(firstNonEmpty(s.cfg.branch, defaultBranch))
 	var body strings.Builder
 	body.WriteString(`<main class="layout" data-bgit-source="seed">`)
@@ -2122,20 +2232,35 @@ func (s *webServer) handleSettings(ctx context.Context, w http.ResponseWriter, r
 		s.renderPage(w, webPageTitle(s.title, "settings"), body.String())
 		return
 	}
-	body.WriteString(s.settingsAboutHTML(info))
-	body.WriteString(s.settingsAccessHTML(info))
-	body.WriteString(s.settingsBranchesHTML(info))
-	body.WriteString(s.settingsPullRequestsHTML(info))
-	body.WriteString(s.settingsDangerHTML(info))
-	if len(info.Errors) > 0 {
-		body.WriteString(`<section class="settings-section"><h2>Unavailable sections</h2>`)
-		for name, message := range info.Errors {
-			body.WriteString(`<div class="settings-error"><strong>` + html.EscapeString(name) + `</strong> ` + html.EscapeString(message) + `</div>`)
-		}
-		body.WriteString(`</section>`)
-	}
+	body.WriteString(`<div data-settings-sections data-settings-view="settings">`)
+	body.WriteString(s.settingsInitialSectionsHTML(info, "settings", cached))
+	body.WriteString(`</div>`)
 	body.WriteString(`</section></div></div></main>`)
 	s.renderPage(w, webPageTitle(s.title, "settings"), body.String())
+}
+
+func (s *webServer) settingsInitialSectionsHTML(info webSettingsInfo, view string, cached bool) string {
+	if cached {
+		return s.settingsSectionsHTML(info, view)
+	}
+	return `<section class="settings-section settings-loading"><h2>Loading broker data</h2><p>Repository administration data is loading in the background.</p></section>`
+}
+
+func (s *webServer) settingsSectionsHTML(info webSettingsInfo, view string) string {
+	var b strings.Builder
+	b.WriteString(s.settingsAboutHTML(info))
+	b.WriteString(s.settingsAccessHTML(info))
+	b.WriteString(s.settingsBranchesHTML(info))
+	b.WriteString(s.settingsPullRequestsHTML(info))
+	b.WriteString(s.settingsDangerHTML(info))
+	if len(info.Errors) > 0 {
+		b.WriteString(`<section class="settings-section"><h2>Unavailable sections</h2>`)
+		for name, message := range info.Errors {
+			b.WriteString(`<div class="settings-error"><strong>` + html.EscapeString(name) + `</strong> ` + html.EscapeString(message) + `</div>`)
+		}
+		b.WriteString(`</section>`)
+	}
+	return b.String()
 }
 
 func (s *webServer) settingsAboutHTML(info webSettingsInfo) string {
@@ -2208,7 +2333,7 @@ func (s *webServer) settingsAccessHTML(info webSettingsInfo) string {
 	b.WriteString(`</div>`)
 	b.WriteString(`<form class="settings-form settings-member-form" data-settings-form="add-member" data-capability="admin_keys">`)
 	b.WriteString(`<h3>Invite member</h3><div class="settings-form-grid"><label>Username<input name="user" autocomplete="off" required></label><label>Role<select name="role">`)
-	for _, role := range []string{"read", "triage", "developer", "maintainer", "admin"} {
+	for _, role := range []string{"read", "triage", "developer", "maintainer", "admin", "owner"} {
 		b.WriteString(`<option value="` + role + `">` + role + `</option>`)
 	}
 	b.WriteString(`</select></label></div>`)

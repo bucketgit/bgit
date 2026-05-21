@@ -25,6 +25,13 @@ document.addEventListener('click', function (event) {
     return;
   }
 
+  const disabledCapabilityLink = event.target.closest('a.is-capability-disabled');
+  if (disabledCapabilityLink) {
+    event.preventDefault();
+    setSyncStatus(disabledCapabilityLink.getAttribute('title') || 'Your current broker role does not allow this action.', 'is-stale');
+    return;
+  }
+
   const commitRow = event.target.closest('[data-commit-href]');
   if (commitRow && !event.target.closest('a, button, input, textarea, select, label, .commit-inline-detail')) {
     event.preventDefault();
@@ -259,6 +266,7 @@ document.addEventListener('DOMContentLoaded', function () {
   connectBgitEvents();
   refreshWhoamiState();
   hydrateRefs();
+  refreshSettingsSections();
   refreshRemoteState({refreshPullRequests: false});
   window.setInterval(function () { refreshRemoteState({refreshPullRequests: true}); }, 30000);
 });
@@ -506,6 +514,24 @@ async function refreshWhoamiState() {
   } catch (_) {}
 }
 
+async function refreshSettingsSections() {
+  const root = document.querySelector('[data-settings-sections]');
+  if (!root) return;
+  const view = root.getAttribute('data-settings-view') || 'settings';
+  root.classList.add('is-refreshing');
+  try {
+    const data = await fetchJSON('/api/settings-fragment?refresh=1&view=' + encodeURIComponent(view));
+    if (data && typeof data.html === 'string') {
+      root.innerHTML = data.html;
+      applyCapabilityUI();
+    }
+  } catch (err) {
+    root.innerHTML = '<section class="settings-section"><h2>Broker data unavailable</h2><div class="settings-error">' + escapeHTML(compactError(err)) + '</div></section>';
+  } finally {
+    root.classList.remove('is-refreshing');
+  }
+}
+
 function setWhoamiState(value) {
   currentWhoami = value || null;
   document.documentElement.dataset.bgitRole = currentWhoami && currentWhoami.role ? currentWhoami.role : '';
@@ -518,9 +544,27 @@ function hasCapability(name) {
   return currentWhoami.capabilities[name] === true;
 }
 
+function hasAnyCapability(names) {
+  const parts = String(names || '').split(/\s+/).filter(Boolean);
+  if (parts.length === 0) return true;
+  return parts.some(hasCapability);
+}
+
 function applyCapabilityUI() {
   for (const el of document.querySelectorAll('[data-capability]')) {
     const allowed = hasCapability(el.getAttribute('data-capability') || '');
+    const disabledMessage = 'Your current broker role does not allow this action.';
+    if (el.matches('button, input, select, textarea')) {
+      el.disabled = !allowed;
+      el.title = allowed ? '' : disabledMessage;
+    } else {
+      el.classList.toggle('is-capability-disabled', !allowed);
+      el.title = allowed ? '' : disabledMessage;
+      for (const control of el.querySelectorAll('button, input, select, textarea')) control.disabled = !allowed;
+    }
+  }
+  for (const el of document.querySelectorAll('[data-capability-any]')) {
+    const allowed = hasAnyCapability(el.getAttribute('data-capability-any') || '');
     const disabledMessage = 'Your current broker role does not allow this action.';
     if (el.matches('button, input, select, textarea')) {
       el.disabled = !allowed;

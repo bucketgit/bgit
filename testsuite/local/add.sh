@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 source "$(dirname "$0")/../lib/testlib.sh"
-dir="$(new_workdir local add)"
-"$BGIT" init --noninteractive --repo local-add "$dir" --profile "$GCP_PROFILE" >/dev/null
-init_local_git_identity "$dir"
+init_output="$(init_bgit_repo gcp local-add)"
+dir="$(printf "%s\n" "$init_output" | sed -n "1p")"
 printf 'hello\n' > "$dir/README.md"
 out="$(run_in "$dir" status)"
 assert_contains "$out" "Untracked files"

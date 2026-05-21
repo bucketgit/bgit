@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 source "$(dirname "$0")/../lib/testlib.sh"
-dir="$(new_workdir local inspect)"
-"$BGIT" init --noninteractive --repo local-inspect "$dir" --profile "$GCP_PROFILE" >/dev/null
-init_local_git_identity "$dir"
+init_output="$(init_bgit_repo gcp local-inspect)"
+dir="$(printf "%s\n" "$init_output" | sed -n "1p")"
 commit_file "$dir" README.md one "one"
 printf 'two\n' >> "$dir/README.md"
 out="$(run_in "$dir" diff)"

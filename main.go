@@ -21,7 +21,7 @@ import (
 
 const defaultBranch = "main"
 const defaultAuthMode = "gcloud"
-const brokerVersion = "1.0.1-dev"
+const brokerVersion = "1.1.0"
 
 var version = "dev"
 
@@ -33,6 +33,7 @@ type config struct {
 	origin                      string
 	brokerURL                   string
 	logicalRepo                 string
+	teamID                      string
 	region                      string
 	auth                        string
 	gcloudConfiguration         string
@@ -519,6 +520,9 @@ func mergeConfig(primary, fallback config) config {
 	if primary.logicalRepo == "" {
 		primary.logicalRepo = fallback.logicalRepo
 	}
+	if primary.teamID == "" {
+		primary.teamID = fallback.teamID
+	}
 	if primary.region == "" {
 		primary.region = fallback.region
 	}
@@ -598,6 +602,10 @@ func readLocalConfig(dir string) (config, error) {
 			return config{}, err
 		}
 	}
+	teamID := ""
+	if teamOut, teamErr := runGit(dir, "config", "--get", "bucketgit.team"); teamErr == nil {
+		teamID = strings.TrimSpace(string(teamOut))
+	}
 	localRegion := ""
 	if regionOut, regionErr := runGit(dir, "config", "--get", "bucketgit.region"); regionErr == nil {
 		localRegion = strings.TrimSpace(string(regionOut))
@@ -616,6 +624,7 @@ func readLocalConfig(dir string) (config, error) {
 			origin:              fmt.Sprintf("git@%s:%s", defaultSSHHost, logicalRepo),
 			brokerURL:           brokerURL,
 			logicalRepo:         logicalRepo,
+			teamID:              teamID,
 			region:              localRegion,
 			identity:            identity,
 			auth:                localAuth.auth,
@@ -963,30 +972,35 @@ func helpPages() map[string]string {
 		"clone": `usage:
   bgit clone <broker-repo> [directory]
   bgit clone https://broker.example.com/app.git [directory]
+  bgit clone https://broker.example.com/team/app.git [directory]
+  bgit clone https://broker.example.com/team/app/app.git [directory]
   bgit clone --broker https://broker.example.com app.git [directory]
 
-Clone a BucketGit repository by logical repo name. Passing a broker URL makes
-the checkout self-contained and does not require a local profile. Direct
-object-storage clone moved to bgit direct clone.
+Clone a BucketGit repository by logical repo name. Flat broker URLs use the
+default core team. Team URLs can use /team/repo.git or /team/repo/repo.git.
+Passing a broker URL makes the checkout self-contained and does not require a
+local profile. Direct object-storage clone moved to bgit direct clone.
 
 examples:
   bgit clone app.git
   bgit clone https://bgit-broker.example.com/app.git
+  bgit clone https://git.example.com/platform/app.git
+  bgit clone https://git.example.com/platform/app/app.git
   bgit direct clone gs://my-bucket/repositories/app.git
   bgit direct clone s3://my-bucket/repositories/app.git --profile aws-profile
 `,
 		"init": `usage:
   bgit init
-  bgit init --noninteractive --repo NAME --profile PROFILE[.REGION] [--region REGION] [directory]
+  bgit init --noninteractive --repo NAME --profile PROFILE[.REGION] --team TEAM [--region REGION] [directory]
 
-Create a local Git repository and attach it to a BucketGit repository from
+Create a local Git repository and attach it to an existing BucketGit repository from
 ~/.bgit/config.yaml. Without --noninteractive, init prompts for missing repo,
-profile, and region choices.
+profile, region, and team choices.
 
 examples:
   bgit init
-  bgit init --noninteractive --repo app --profile gcp:work.europe-west1
-  bgit init --noninteractive --repo app --profile work --region europe-west1
+  bgit init --noninteractive --repo app --profile gcp:work.europe-west1 --team core
+  bgit init --noninteractive --repo app --profile work --region europe-west1 --team core
 `,
 		"setup": `usage:
   bgit setup
@@ -1036,9 +1050,15 @@ Configure a direct bucketgit origin using Git remote syntax.
 `,
 		"admin": `usage:
   bgit admin keys list|add|remove|suspend|import-github [args]
-  bgit admin invite-user --broker URL --user USER [--role ROLE] REPO
+  bgit admin broker-users list|upsert USER [--role admin|user] [--key PATH_OR_PUBLIC_KEY]|delete USER
+  bgit admin teams list|create NAME|delete TEAM|member add TEAM USER [--role ROLE]|member remove TEAM USER
+  bgit admin teams repo list|repo add TEAM ROLE|repo remove TEAM
+  bgit admin repo list
+  bgit admin repo info
+  bgit admin repo create --team TEAM [--role ROLE] REPO
+  bgit admin invite-user --broker URL [--team TEAM] --user USER [--role ROLE] REPO
   bgit admin accept-invite CODE
-  bgit admin cancel-invite --broker URL --user USER REPO
+  bgit admin cancel-invite --broker URL [--team TEAM] --user USER REPO
   bgit admin confirm-ownership-transfer --broker URL REPO
   bgit admin accept-ownership-transfer CODE
   bgit admin cancel-ownership-transfer [--broker URL REPO]
@@ -1056,6 +1076,15 @@ examples:
   bgit admin keys list
   bgit admin keys add --user ada --role developer --key ~/.ssh/ada.pub
   bgit admin keys import-github octocat --role read
+  bgit admin broker-users upsert ada --role user --key ~/.ssh/ada.pub
+  bgit admin teams create platform
+  bgit admin teams delete TEAM_ID
+  bgit admin teams member add TEAM_ID ada --role developer
+  bgit admin teams repo list
+  bgit admin teams repo add TEAM_ID developer
+  bgit admin repo list
+  bgit admin repo info
+  bgit admin repo create --team platform app
   bgit admin invite-user --broker https://broker.example.com --user ada --role developer app
   bgit admin protect add main
   bgit admin repo visibility public

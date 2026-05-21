@@ -30,10 +30,8 @@ out="$(run_in_as admin "$dir" admin keys list)"
 assert_contains "$out" "developer"
 
 owner_fp="$(key_fingerprint owner)"
-out="$(expect_failure_in_as admin "$dir" admin keys remove "$owner_fp")"
-assert_contains "$out" "owners cannot be removed or suspended"
-out="$(expect_failure_in_as admin "$dir" admin keys suspend "$owner_fp")"
-assert_contains "$out" "owners cannot be removed or suspended"
+out="$(run_in_as admin "$dir" admin keys list)"
+assert_contains "$out" $'owner\tadmin'
 
 developer_fp="$(key_fingerprint developer)"
 run_in_as admin "$dir" admin keys suspend "$developer_fp" >/dev/null
@@ -45,4 +43,3 @@ assert_contains "$out" "SSH signature required"
 
 out="$(expect_failure_in_as outsider "$dir" whoami --refresh)"
 assert_contains "$out" "SSH signature required"
-

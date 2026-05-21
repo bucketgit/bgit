@@ -3293,6 +3293,26 @@ func TestWebRepoHeaderUsesShortTitleAndBrokerLocationBadge(t *testing.T) {
 	if !strings.Contains(header, `data-theme-toggle`) {
 		t.Fatalf("header missing theme toggle: %s", header)
 	}
+	if strings.Contains(header, `href="/admin"`) {
+		t.Fatalf("header should not include separate repo admin tab: %s", header)
+	}
+	if strings.Contains(header, `href="/broker-admin"`) || strings.Contains(header, "Broker Admin") {
+		t.Fatalf("header should not include broker admin tab: %s", header)
+	}
+}
+
+func TestWebBrokerAdminRouteIsGone(t *testing.T) {
+	bare := filepath.Join(t.TempDir(), "repo.git")
+	if _, err := runGit("", "init", "--bare", bare); err != nil {
+		t.Fatal(err)
+	}
+	handler := newWebHandlerWithAPI(newNativeGitRepoForStore(config{branch: "main"}, &localGitStore{root: bare}), nil, config{branch: "main"})
+	req := httptest.NewRequest(http.MethodGet, "/broker-admin", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
 }
 
 func TestWebHandlerCanRenderSeedThenRemote(t *testing.T) {

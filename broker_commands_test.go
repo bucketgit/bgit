@@ -15,6 +15,24 @@ import (
 
 func TestBrokerInitWritesBrokerGitConfig(t *testing.T) {
 	root := t.TempDir()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/repos/get" {
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+		var req brokerRepoRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatal(err)
+		}
+		if req.Repo.Logical != "app.git" {
+			t.Fatalf("logical repo = %q", req.Repo.Logical)
+		}
+		if req.Repo.TeamID != coreTeamID {
+			t.Fatalf("team = %q", req.Repo.TeamID)
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer server.Close()
 	configPath := filepath.Join(root, ".bgit", "config")
 	if err := writeGlobalConfig(configPath, globalConfig{
 		Version: globalConfigVersion,
@@ -23,7 +41,7 @@ func TestBrokerInitWritesBrokerGitConfig(t *testing.T) {
 			ProjectID: "project-id",
 			Regions: []globalProfileRegion{{
 				Name:      "europe-west1",
-				BrokerURL: "https://broker.example.test",
+				BrokerURL: server.URL,
 			}},
 		}},
 	}); err != nil {
@@ -31,14 +49,15 @@ func TestBrokerInitWritesBrokerGitConfig(t *testing.T) {
 	}
 	target := filepath.Join(root, "app")
 	var stdout bytes.Buffer
-	err := brokerInitCommand([]string{"--noninteractive", "--repo", "app", target, "--profile", "gcp:work/europe-west1", "--config", configPath}, strings.NewReader(""), &stdout)
+	err := brokerInitCommand([]string{"--noninteractive", "--repo", "app", target, "--profile", "gcp:work/europe-west1", "--team", "core", "--config", configPath}, strings.NewReader(""), &stdout)
 	if err != nil {
 		t.Fatal(err)
 	}
 	for key, want := range map[string]string{
-		"bucketgit.broker":      "https://broker.example.test",
+		"bucketgit.broker":      server.URL,
 		"bucketgit.profile":     "gcp:work/europe-west1",
 		"bucketgit.region":      "europe-west1",
+		"bucketgit.team":        coreTeamID,
 		"bucketgit.logicalRepo": "app.git",
 		"branch.main.remote":    "origin",
 		"branch.main.merge":     "refs/heads/main",
@@ -89,10 +108,19 @@ func TestShellQuoteForGitSSHCommand(t *testing.T) {
 
 func TestInitBrokerWorktreeOmitsIdentityWhenUnset(t *testing.T) {
 	target := filepath.Join(t.TempDir(), "app")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/repos/get" {
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer server.Close()
 	err := initBrokerWorktree(target, "app", brokerProfile{
 		Provider:      "gcs",
 		QualifiedName: "broker:https://broker.example.test",
-		BrokerURL:     "",
+		BrokerURL:     server.URL,
+		TeamID:        coreTeamID,
 	}, "", "", io.Discard)
 	if err != nil {
 		t.Fatal(err)
@@ -112,6 +140,10 @@ func TestBrokerInitNoninteractiveRequiresProfileAndRepo(t *testing.T) {
 	}
 	err = brokerInitCommand([]string{"--noninteractive", "--profile", "work"}, strings.NewReader(""), ioDiscard{})
 	if err == nil || !strings.Contains(err.Error(), "requires --repo") {
+		t.Fatalf("err = %v", err)
+	}
+	err = brokerInitCommand([]string{"--noninteractive", "--profile", "work", "--repo", "app"}, strings.NewReader(""), ioDiscard{})
+	if err == nil || !strings.Contains(err.Error(), "requires --team") {
 		t.Fatalf("err = %v", err)
 	}
 }
@@ -150,8 +182,64 @@ func TestAdminKeysListUsesLogicalBrokerRepo(t *testing.T) {
 	}
 }
 
+func TestInviteUserPreservesTeamScopedRepo(t *testing.T) {
+	var got brokerOwnerTransferRequest
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/keys/invite/create" {
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+		if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+			t.Fatal(err)
+		}
+		_, _ = w.Write([]byte(`{"accept_command":"bgit admin accept-invite bgitinv_test"}`))
+	}))
+	defer server.Close()
+
+	var stdout bytes.Buffer
+	if err := brokerInviteUserCommand(config{provider: "s3"}, []string{"--broker", server.URL, "--team", "t_marketing", "--user", "owner", "--role", "read", "mkt"}, &stdout); err != nil {
+		t.Fatal(err)
+	}
+	if got.Repo.Logical != "mkt.git" || got.Repo.TeamID != "t_marketing" || got.Repo.Provider != "s3" {
+		t.Fatalf("repo = %#v", got.Repo)
+	}
+	if got.User != "owner" || got.Role != "read" {
+		t.Fatalf("request = %#v", got)
+	}
+}
+
+func TestPrintBrokerUsersUsesReadableColumns(t *testing.T) {
+	var stdout bytes.Buffer
+	printBrokerUsers(&stdout, []brokerUserInfo{{
+		ID:         "u_owner",
+		Username:   "owner",
+		BrokerRole: "owner",
+		Keys:       []brokerKey{{PublicKey: "ssh-ed25519 AAAA owner"}},
+	}, {
+		ID:         "u_pending",
+		Username:   "pending",
+		BrokerRole: "user",
+		Pending:    true,
+	}})
+	out := stdout.String()
+	for _, want := range []string{"ID", "Username", "Role", "Status", "u_owner", "owner", "active", "u_pending", "pending"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("missing %q in %q", want, out)
+		}
+	}
+	if strings.Contains(out, "\t") {
+		t.Fatalf("output should not contain tabs: %q", out)
+	}
+}
+
 func TestTopLevelBrokerInitForwardsGlobalProfile(t *testing.T) {
 	root := t.TempDir()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/repos/get" {
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer server.Close()
 	configPath := filepath.Join(root, ".bgit", "config")
 	if err := writeGlobalConfig(configPath, globalConfig{
 		Version: globalConfigVersion,
@@ -160,7 +248,7 @@ func TestTopLevelBrokerInitForwardsGlobalProfile(t *testing.T) {
 			ProjectID: "project-id",
 			Regions: []globalProfileRegion{{
 				Name:      "europe-west1",
-				BrokerURL: "https://broker.example.test",
+				BrokerURL: server.URL,
 			}},
 		}},
 		AWSProfiles: []globalAWSProfile{{
@@ -176,7 +264,7 @@ func TestTopLevelBrokerInitForwardsGlobalProfile(t *testing.T) {
 	}
 	target := filepath.Join(root, "app")
 	var stdout bytes.Buffer
-	err := run([]string{"init", "--noninteractive", "--repo", "app", target, "--config", configPath, "--profile", "gcp:work/europe-west1"}, strings.NewReader(""), &stdout, ioDiscard{})
+	err := run([]string{"init", "--noninteractive", "--repo", "app", target, "--config", configPath, "--profile", "gcp:work/europe-west1", "--team", "core"}, strings.NewReader(""), &stdout, ioDiscard{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -319,12 +407,19 @@ func TestBrokerProfileDotRegionSelectsProfile(t *testing.T) {
 }
 
 func TestParseBrokerCloneURL(t *testing.T) {
-	brokerURL, repo, ok, err := parseBrokerCloneURL("https://broker.example.test/app.git")
+	brokerURL, repo, teamName, ok, err := parseBrokerCloneURL("https://broker.example.test/app.git")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !ok || brokerURL != "https://broker.example.test" || repo != "app.git" {
-		t.Fatalf("brokerURL=%q repo=%q ok=%v", brokerURL, repo, ok)
+	if !ok || brokerURL != "https://broker.example.test" || repo != "app.git" || teamName != "" {
+		t.Fatalf("brokerURL=%q repo=%q team=%q ok=%v", brokerURL, repo, teamName, ok)
+	}
+	brokerURL, repo, teamName, ok, err = parseBrokerCloneURL("https://broker.example.test/core/app/app.git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || brokerURL != "https://broker.example.test" || repo != "app.git" || teamName != "core" {
+		t.Fatalf("brokerURL=%q repo=%q team=%q ok=%v", brokerURL, repo, teamName, ok)
 	}
 }
 
@@ -334,8 +429,52 @@ func TestLogicalRepoNamesMustBeFlat(t *testing.T) {
 			t.Fatalf("normalizeLogicalRepoName(%q) succeeded", name)
 		}
 	}
-	if _, _, _, err := parseBrokerCloneURL("https://broker.example.test/team/app.git"); err == nil {
-		t.Fatal("parseBrokerCloneURL accepted path-shaped logical repo")
+	if _, _, _, _, err := parseBrokerCloneURL("https://broker.example.test/team/other/app.git"); err == nil {
+		t.Fatal("parseBrokerCloneURL accepted mismatched team repo path")
+	}
+}
+
+func TestDiscoverBrokerCloneURLUsesTXTTeamName(t *testing.T) {
+	oldLookup := lookupTXT
+	lookupTXT = func(name string) ([]string, error) {
+		if name != "_bgit.git.example.com" {
+			t.Fatalf("lookup name = %q", name)
+		}
+		return []string{`v=bgit1 broker=https://broker.example.test team=t_abc123 name=teamfoobar`}, nil
+	}
+	defer func() { lookupTXT = oldLookup }()
+
+	brokerURL, repo, teamID, ok, err := discoverBrokerCloneURL("https://git.example.com/teamfoobar/repo/repo.git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || brokerURL != "https://broker.example.test" || repo != "repo.git" || teamID != "t_abc123" {
+		t.Fatalf("brokerURL=%q repo=%q teamID=%q ok=%v", brokerURL, repo, teamID, ok)
+	}
+
+	_, _, _, ok, err = discoverBrokerCloneURL("https://git.example.com/teamfoobar/other/repo.git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok {
+		t.Fatal("discovered broker for mismatched GitHub-style repo path")
+	}
+}
+
+func TestDiscoverBrokerCloneURLSkipsDirectBrokerHosts(t *testing.T) {
+	oldLookup := lookupTXT
+	lookupTXT = func(name string) ([]string, error) {
+		t.Fatalf("unexpected TXT lookup %q", name)
+		return nil, nil
+	}
+	defer func() { lookupTXT = oldLookup }()
+
+	_, _, _, ok, err := discoverBrokerCloneURL("https://service.run.app/teamfoobar/repo.git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok {
+		t.Fatal("discovered broker for direct Cloud Run host")
 	}
 }
 
@@ -353,6 +492,13 @@ func TestBrokerProfileForCloneURL(t *testing.T) {
 
 func TestBrokerInitInteractivePromptsForRepoAndProfile(t *testing.T) {
 	root := t.TempDir()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/repos/get" {
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer server.Close()
 	configPath := filepath.Join(root, ".bgit", "config")
 	if err := writeGlobalConfig(configPath, globalConfig{
 		Version: globalConfigVersion,
@@ -361,7 +507,7 @@ func TestBrokerInitInteractivePromptsForRepoAndProfile(t *testing.T) {
 			AccountID: "123456789012",
 			Regions: []globalProfileRegion{{
 				Name:      "eu-west-1",
-				BrokerURL: "https://broker.example.test",
+				BrokerURL: server.URL,
 			}},
 		}},
 	}); err != nil {
@@ -369,7 +515,7 @@ func TestBrokerInitInteractivePromptsForRepoAndProfile(t *testing.T) {
 	}
 	target := filepath.Join(root, "repo")
 	var stdout bytes.Buffer
-	err := brokerInitCommand([]string{"--config", configPath, "--profile", "aws:prod/eu-west-1", "ignored", target}, strings.NewReader("\x04"), &stdout)
+	err := brokerInitCommand([]string{"--config", configPath, "--profile", "aws:prod/eu-west-1", "--team", "core", "ignored", target}, strings.NewReader("\x04"), &stdout)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -622,6 +768,83 @@ func TestAdminCloudIAMMovedToDirect(t *testing.T) {
 	err := brokerAdminCommand(config{}, []string{"grant-read", "user@example.com"}, ioDiscard{})
 	if err == nil || !strings.Contains(err.Error(), "bgit direct admin") {
 		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestAdminRepoCreateUsesCreateEndpointAndTeam(t *testing.T) {
+	var got brokerRepoAdminRequest
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("content-type", "application/json")
+		switch r.URL.Path {
+		case "/teams/resolve":
+			_, _ = w.Write([]byte(`{"team":{"id":"t_marketing","name":"marketing"}}`))
+		case "/repos/create":
+			if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+				t.Fatal(err)
+			}
+			_, _ = w.Write([]byte(`{"ok":true}`))
+		default:
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+	var stdout bytes.Buffer
+	err := brokerAdminCommand(config{provider: "gcs", brokerURL: server.URL}, []string{"repo", "create", "--team", "marketing", "--role", "developer", "demo"}, &stdout)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Repo.Logical != "demo.git" || got.Repo.TeamID != "t_marketing" || got.Role != "developer" {
+		t.Fatalf("request = %#v", got)
+	}
+	if !strings.Contains(stdout.String(), "created repository demo in team marketing") {
+		t.Fatalf("stdout = %q", stdout.String())
+	}
+}
+
+func TestAdminRepoCreateAllowsOwnerTeamGrant(t *testing.T) {
+	var got brokerRepoAdminRequest
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("content-type", "application/json")
+		switch r.URL.Path {
+		case "/teams/resolve":
+			_, _ = w.Write([]byte(`{"team":{"id":"t_core","name":"core"}}`))
+		case "/repos/create":
+			if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+				t.Fatal(err)
+			}
+			_, _ = w.Write([]byte(`{"ok":true}`))
+		default:
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+	if err := brokerAdminCommand(config{provider: "gcs", brokerURL: server.URL}, []string{"repo", "create", "--team", "core", "--role", "owner", "demo"}, ioDiscard{}); err != nil {
+		t.Fatal(err)
+	}
+	if got.Role != "owner" || got.Repo.TeamID != "t_core" {
+		t.Fatalf("request = %#v", got)
+	}
+}
+
+func TestAdminTeamsRepoAddAllowsOwnerRole(t *testing.T) {
+	var got brokerRepoAdminRequest
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("content-type", "application/json")
+		if r.URL.Path != "/repo/teams/upsert" {
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+		if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+			t.Fatal(err)
+		}
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer server.Close()
+	cfg := config{brokerURL: server.URL, logicalRepo: "demo.git", provider: "gcs"}
+	if err := brokerTeamsCommand(cfg, []string{"repo", "add", "t_core", "owner"}, ioDiscard{}); err != nil {
+		t.Fatal(err)
+	}
+	if got.TeamID != "t_core" || got.Role != "owner" || got.Repo.Logical != "demo.git" {
+		t.Fatalf("request = %#v", got)
 	}
 }
 

@@ -62,9 +62,10 @@ Set up BucketGit for one or more cloud profiles:
 bgit setup
 ```
 
-`bgit setup` discovers GCP and AWS profiles, lets you choose regions, imports
-owner SSH keys, deploys or updates the broker, and writes global configuration to
-`~/.bgit/config.yaml`.
+`bgit setup` is the interactive broker setup and management tool. It discovers
+GCP and AWS profiles, lets you choose regions, creates or updates brokers,
+imports owner SSH keys, manages users and teams, and writes global configuration
+to `~/.bgit/config.yaml`.
 
 Create a broker repository, then attach a local checkout:
 
@@ -170,7 +171,7 @@ bgit admin repo list
 bgit admin repo info
 ```
 
-## Setup And Profiles
+## Setup And Broker Management
 
 Global configuration is stored in `~/.bgit/config.yaml`. Profiles are
 provider- and region-aware, so the same cloud account can have brokers in
@@ -206,9 +207,11 @@ bgit setup profile create --provider aws work
 GCP setup uses `gcloud` configurations. AWS setup reads AWS config/credentials
 files and can use the AWS CLI when profile creation is requested.
 
-`bgit setup` seeds a default `core` team. Repositories are created explicitly
-with `bgit admin repo create` or through the setup broker-management UI; `bgit
-init` attaches a local checkout to an existing broker repository.
+`bgit setup` also manages configured brokers. From the setup UI you can create,
+update, manage, or delete brokers, manage users and teams, and seed the default
+`core` team. Repositories are created explicitly with `bgit admin repo create`
+or through the setup broker-management UI; `bgit init` attaches a local checkout
+to an existing broker repository.
 
 ## Identity
 

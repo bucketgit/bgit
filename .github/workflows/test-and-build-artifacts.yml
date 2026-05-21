@@ -1,6 +1,20 @@
 name: Test And Build Artifacts
 
 on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - "*.go"
+      - "**/*.go"
+      - "go.mod"
+      - "go.sum"
+      - "CHANGELOG.md"
+      - "broker/**"
+      - "www/**"
+      - "testsuite/**"
+      - ".github/workflows/test-and-build-artifacts.yml"
+      - ".github/workflows/test.yml"
   push:
     branches:
       - main
@@ -15,6 +29,7 @@ on:
       - "www/**"
       - "testsuite/**"
       - ".github/workflows/test-and-build-artifacts.yml"
+      - ".github/workflows/test.yml"
   workflow_dispatch:
 
 permissions:
@@ -27,6 +42,7 @@ concurrency:
 jobs:
   unit:
     name: Unit Tests (${{ matrix.os }})
+    if: github.ref == 'refs/heads/develop' || github.event_name == 'workflow_dispatch'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15
     permissions:
@@ -57,6 +73,7 @@ jobs:
     name: Build Multiarchitecture Artifacts
     needs:
       - unit
+    if: always() && (github.ref == 'refs/heads/main' || (github.event_name == 'pull_request' && github.base_ref == 'main' && github.head_ref == 'develop' && github.event.pull_request.head.repo.full_name == github.repository) || needs.unit.result == 'success')
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     permissions:
@@ -74,7 +91,7 @@ jobs:
           cache-dependency-path: go.sum
 
       - name: Resolve Version From Changelog
-        if: github.ref == 'refs/heads/main'
+        if: github.ref == 'refs/heads/main' || (github.event_name == 'pull_request' && github.base_ref == 'main' && github.head_ref == 'develop' && github.event.pull_request.head.repo.full_name == github.repository)
         shell: pwsh
         run: |
           if (!(Test-Path "CHANGELOG.md")) {
@@ -194,6 +211,7 @@ jobs:
     name: Integration Tests (${{ matrix.os }})
     needs:
       - build
+    if: github.ref == 'refs/heads/develop' || github.event_name == 'workflow_dispatch'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     permissions:
@@ -277,9 +295,10 @@ jobs:
   publish:
     name: Publish Release
     needs:
+      - build
       - integration
     runs-on: ubuntu-24.04
-    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop')
+    if: always() && github.event_name == 'push' && ((github.ref == 'refs/heads/main' && needs.build.result == 'success') || (github.ref == 'refs/heads/develop' && needs.integration.result == 'success'))
     timeout-minutes: 15
     permissions:
       contents: write

@@ -3259,13 +3259,14 @@ func TestWebClonePanelShowsBrokerCloneCommand(t *testing.T) {
 	server := &webServer{cfg: config{
 		brokerURL:   "https://broker.example.test/",
 		logicalRepo: "app.git",
+		teamID:      "t_marketing",
 		origin:      "git@git.bucketgit.com:app.git",
 	}}
 	html := server.clonePanelHTML()
 	if !strings.Contains(html, "app.git") {
 		t.Fatalf("clone panel missing repo: %s", html)
 	}
-	if !strings.Contains(html, "bgit clone https://broker.example.test/app.git") {
+	if !strings.Contains(html, "bgit clone https://broker.example.test/t_marketing/app.git") {
 		t.Fatalf("clone panel missing broker clone command: %s", html)
 	}
 	if !strings.Contains(html, "git@git.bucketgit.com:app.git") {
@@ -3277,13 +3278,14 @@ func TestWebRepoHeaderUsesShortTitleAndBrokerLocationBadge(t *testing.T) {
 	cfg := config{
 		brokerURL:   "https://broker.example.test/",
 		logicalRepo: "app.git",
+		teamID:      coreTeamID,
 	}
 	title := webRepoTitle(cfg)
 	if title != "app.git" {
 		t.Fatalf("title = %q", title)
 	}
 	server := &webServer{cfg: cfg, title: title}
-	if badge := server.repoLocationBadge(); badge != "broker.example.test/app.git" {
+	if badge := server.repoLocationBadge(); badge != "broker.example.test/core/app.git" {
 		t.Fatalf("badge = %q", badge)
 	}
 	header := server.headerHTML("refs/heads/main", "")

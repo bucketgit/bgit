@@ -4,6 +4,13 @@ All notable changes to `bgit` are documented in this file.
 
 This project follows semantic versioning.
 
+## 1.1.2
+
+Fixed
+
+- `bgit web` now shows team-aware broker clone URLs, so non-core team
+  repositories can be cloned from the displayed command.
+
 ## 1.1.1
 
 Fixed

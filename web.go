@@ -3055,9 +3055,9 @@ func (s *webServer) repoLocationBadge() string {
 		return ""
 	}
 	if parsed, err := url.Parse(brokerURL); err == nil && parsed.Host != "" {
-		return parsed.Host + "/" + logicalRepo
+		return parsed.Host + brokerClonePath(s.cfg.teamID, logicalRepo)
 	}
-	return strings.TrimPrefix(strings.TrimPrefix(strings.TrimRight(brokerURL, "/"), "https://"), "http://") + "/" + logicalRepo
+	return strings.TrimPrefix(strings.TrimPrefix(strings.TrimRight(brokerURL, "/"), "https://"), "http://") + brokerClonePath(s.cfg.teamID, logicalRepo)
 }
 
 func (s *webServer) refSelectorHTML(ref string) string {
@@ -3172,7 +3172,7 @@ func (s *webServer) cloneWidgetHTML(ref string) string {
 	}
 	options := []cloneOption{}
 	if s.cfg.brokerURL != "" && logicalRepo != "" {
-		options = append(options, cloneOption{Label: "BGIT", Value: "bgit clone " + brokerCloneCommandURL(s.cfg.brokerURL, logicalRepo)})
+		options = append(options, cloneOption{Label: "BGIT", Value: "bgit clone " + brokerCloneCommandURL(s.cfg.brokerURL, s.cfg.teamID, logicalRepo)})
 	} else if origin != "" {
 		options = append(options, cloneOption{Label: "BGIT", Value: "bgit clone " + origin})
 	}
@@ -3228,8 +3228,20 @@ func cloneWidgetHTML(options []cloneOption, ref string) string {
 	return b.String()
 }
 
-func brokerCloneCommandURL(brokerURL, logicalRepo string) string {
-	return strings.TrimRight(strings.TrimSpace(brokerURL), "/") + "/" + strings.Trim(strings.TrimSpace(logicalRepo), "/")
+func brokerCloneCommandURL(brokerURL, teamID, logicalRepo string) string {
+	return strings.TrimRight(strings.TrimSpace(brokerURL), "/") + brokerClonePath(teamID, logicalRepo)
+}
+
+func brokerClonePath(teamID, logicalRepo string) string {
+	logical := strings.Trim(strings.TrimSpace(logicalRepo), "/")
+	team := strings.Trim(strings.TrimSpace(teamID), "/")
+	if team == "" {
+		return "/" + logical
+	}
+	if team == coreTeamID {
+		team = coreTeamName
+	}
+	return "/" + team + "/" + logical
 }
 
 func (s *webServer) renderPage(w http.ResponseWriter, title, body string) {

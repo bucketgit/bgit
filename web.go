@@ -25,6 +25,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"golang.org/x/crypto/ssh"
@@ -163,9 +164,12 @@ type webPullRequestCache struct {
 
 type brokerIssue struct {
 	ID        int                `json:"id,omitempty"`
+	Type      string             `json:"type,omitempty"`
 	Title     string             `json:"title,omitempty"`
 	Body      string             `json:"body,omitempty"`
 	Status    string             `json:"status,omitempty"`
+	Lane      string             `json:"lane,omitempty"`
+	Assignee  string             `json:"assignee,omitempty"`
 	Author    string             `json:"author,omitempty"`
 	CreatedAt string             `json:"created_at,omitempty"`
 	UpdatedAt string             `json:"updated_at,omitempty"`
@@ -179,11 +183,19 @@ type brokerIssueReply struct {
 }
 
 type brokerIssueRequest struct {
-	Repo    brokerRepo `json:"repo"`
-	ID      int        `json:"id,omitempty"`
-	Title   string     `json:"title,omitempty"`
-	Body    string     `json:"body,omitempty"`
-	Comment string     `json:"comment,omitempty"`
+	Repo     brokerRepo `json:"repo"`
+	ID       int        `json:"id,omitempty"`
+	Type     string     `json:"type,omitempty"`
+	Title    string     `json:"title,omitempty"`
+	Body     string     `json:"body,omitempty"`
+	Lane     string     `json:"lane,omitempty"`
+	Assignee string     `json:"assignee,omitempty"`
+	Comment  string     `json:"comment,omitempty"`
+}
+
+type boardRenderContext struct {
+	Assignees []string
+	Monogram  string
 }
 
 func webCommand(ctx context.Context, cfg config, args []string, stdout io.Writer) error {
@@ -389,7 +401,7 @@ func (s *webServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	route := strings.TrimPrefix(r.URL.Path, "/")
 	srv := s.serverForRequest(r, strings.HasPrefix(route, "api/"))
 	switch {
-	case r.Method != http.MethodGet && r.Method != http.MethodHead && !strings.HasPrefix(route, "api/actions/"):
+	case r.Method != http.MethodGet && r.Method != http.MethodHead && !strings.HasPrefix(route, "api/actions/") && route != "api/user/profile":
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	case route == "assets/bgit-mark.png":
 		s.handleWebAsset(w, webLogoPath)
@@ -419,8 +431,12 @@ func (s *webServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.handleAPIActionPullRequest(ctx, w, r)
 	case route == "api/actions/issues":
 		s.handleAPIActionIssue(ctx, w, r)
+	case route == "api/actions/board":
+		s.handleAPIActionBoard(ctx, w, r)
 	case route == "api/actions/settings":
 		s.handleAPIActionSettings(ctx, w, r)
+	case route == "api/user/profile":
+		s.handleAPIUserProfile(ctx, w, r)
 	case route == "api/diff":
 		s.handleAPIDiff(ctx, w, r)
 	case route == "api/refs":
@@ -447,14 +463,22 @@ func (s *webServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		srv.handleCommits(ctx, w, r)
 	case route == "prs":
 		s.handlePullRequests(ctx, w, r)
+	case route == "prs/new":
+		s.handleNewPullRequest(ctx, w, r)
 	case strings.HasPrefix(route, "prs/"):
 		s.handlePullRequest(ctx, w, r, strings.TrimPrefix(route, "prs/"))
 	case route == "issues":
 		s.handleIssues(ctx, w, r)
 	case strings.HasPrefix(route, "issues/"):
 		s.handleIssue(ctx, w, r, strings.TrimPrefix(route, "issues/"))
+	case route == "board":
+		s.handleBoard(ctx, w, r)
+	case strings.HasPrefix(route, "board/"):
+		s.handleStory(ctx, w, r, strings.TrimPrefix(route, "board/"))
 	case route == "settings":
 		s.handleSettings(ctx, w, r)
+	case route == "user/settings" || route == "user/settings/":
+		s.handleUserSettings(ctx, w, r)
 	case route == "admin":
 		http.Redirect(w, r, "/settings", http.StatusFound)
 	case route == "archive.zip":
@@ -773,6 +797,29 @@ type brokerRepoInfoResponse struct {
 	Visibility    string     `json:"visibility"`
 	ReadOnly      bool       `json:"read_only"`
 	IssuesEnabled bool       `json:"issues_enabled"`
+}
+
+type brokerUserProfileRequest struct {
+	Repo   brokerRepo `json:"repo"`
+	Bio    string     `json:"bio,omitempty"`
+	Avatar string     `json:"avatar,omitempty"`
+}
+
+type brokerUserProfileResponse struct {
+	User    string                 `json:"user"`
+	Profile brokerUserProfileData  `json:"profile"`
+	Keys    []brokerUserProfileKey `json:"keys"`
+}
+
+type brokerUserProfileData struct {
+	Bio    string `json:"bio,omitempty"`
+	Avatar string `json:"avatar,omitempty"`
+}
+
+type brokerUserProfileKey struct {
+	PublicKey   string `json:"public_key"`
+	Fingerprint string `json:"fingerprint,omitempty"`
+	Source      string `json:"source,omitempty"`
 }
 
 func (s *webServer) handleAPISettings(ctx context.Context, w http.ResponseWriter, r *http.Request) {
@@ -1115,6 +1162,20 @@ func (s *webServer) handleAPIDiff(ctx context.Context, w http.ResponseWriter, r 
 		s.renderJSON(w, resp)
 		return
 	}
+	if source := strings.TrimSpace(r.URL.Query().Get("source")); source != "" {
+		target := strings.TrimSpace(r.URL.Query().Get("target"))
+		if target == "" {
+			s.renderJSONError(w, http.StatusBadRequest, errors.New("target branch is required"))
+			return
+		}
+		html, mergeable, conflict, err := s.pullRequestPreviewDiffHTML(ctx, normalizeDestinationRef(target), normalizeDestinationRef(source))
+		if err != nil {
+			s.renderJSONError(w, http.StatusBadRequest, err)
+			return
+		}
+		s.renderJSON(w, map[string]any{"html": html, "mergeable": mergeable, "conflict": conflict})
+		return
+	}
 	repoPath := cleanWebPath(r.URL.Query().Get("path"))
 	if repoPath == "" || repoPath == "." {
 		s.renderJSONError(w, http.StatusBadRequest, errors.New("diff requires a path"))
@@ -1384,6 +1445,10 @@ func (s *webServer) handleAPIActionPullRequest(ctx context.Context, w http.Respo
 	var req struct {
 		ID              int                        `json:"id"`
 		Action          string                     `json:"action"`
+		Title           string                     `json:"title"`
+		Body            string                     `json:"body"`
+		Source          string                     `json:"source"`
+		Target          string                     `json:"target"`
 		Comment         string                     `json:"comment"`
 		DeleteBranch    bool                       `json:"delete_branch"`
 		Comments        []brokerPullRequestComment `json:"comments"`
@@ -1394,7 +1459,7 @@ func (s *webServer) handleAPIActionPullRequest(ctx context.Context, w http.Respo
 		s.renderJSONError(w, http.StatusBadRequest, err)
 		return
 	}
-	if req.ID <= 0 {
+	if strings.TrimSpace(req.Action) != "create" && req.ID <= 0 {
 		s.renderJSONError(w, http.StatusBadRequest, errors.New("pull request id is required"))
 		return
 	}
@@ -1412,6 +1477,23 @@ func (s *webServer) handleAPIActionPullRequest(ctx context.Context, w http.Respo
 	}
 	endpoint := ""
 	switch strings.TrimSpace(req.Action) {
+	case "create":
+		source := normalizeDestinationRef(req.Source)
+		target := normalizeDestinationRef(req.Target)
+		if source == "" || target == "" {
+			s.renderJSONError(w, http.StatusBadRequest, errors.New("source and target branches are required"))
+			return
+		}
+		if source == target {
+			s.renderJSONError(w, http.StatusBadRequest, errors.New("source and target branches must be different"))
+			return
+		}
+		title := strings.TrimSpace(req.Title)
+		if title == "" {
+			title = shortRefName(source) + " into " + shortRefName(target)
+		}
+		endpoint = "/prs/create"
+		brokerReq.PR = brokerPullRequest{Title: title, Body: strings.TrimSpace(req.Body), Source: source, Target: target}
 	case "comment":
 		if brokerReq.Comment == "" {
 			s.renderJSONError(w, http.StatusBadRequest, errors.New("comment is required"))
@@ -1623,6 +1705,75 @@ func (s *webServer) handleAPIActionIssue(ctx context.Context, w http.ResponseWri
 		endpoint = "/issues/reopen"
 	default:
 		s.renderJSONError(w, http.StatusBadRequest, fmt.Errorf("unsupported issue action %q", req.Action))
+		return
+	}
+	var resp map[string]any
+	if err := brokerPostContext(ctx, s.cfg.brokerURL, endpoint, payload, &resp); err != nil {
+		s.renderJSONError(w, http.StatusBadRequest, err)
+		return
+	}
+	s.renderJSON(w, map[string]any{"ok": true})
+}
+
+func (s *webServer) handleAPIActionBoard(ctx context.Context, w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if strings.TrimSpace(s.cfg.brokerURL) == "" || strings.TrimSpace(s.cfg.logicalRepo) == "" {
+		s.renderJSONError(w, http.StatusBadRequest, errors.New("board requires a broker-backed repository"))
+		return
+	}
+	var req struct {
+		Action   string `json:"action"`
+		ID       int    `json:"id"`
+		Title    string `json:"title"`
+		Body     string `json:"body"`
+		Lane     string `json:"lane"`
+		Assignee string `json:"assignee"`
+		Comment  string `json:"comment"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		s.renderJSONError(w, http.StatusBadRequest, err)
+		return
+	}
+	payload := brokerIssueRequest{Repo: repoForBroker(s.cfg), ID: req.ID, Type: "story", Title: strings.TrimSpace(req.Title), Body: strings.TrimSpace(req.Body), Lane: strings.TrimSpace(req.Lane), Assignee: strings.TrimSpace(req.Assignee), Comment: strings.TrimSpace(req.Comment)}
+	endpoint := ""
+	switch strings.TrimSpace(req.Action) {
+	case "create":
+		endpoint = "/issues/create"
+		payload.Lane = firstNonEmpty(payload.Lane, "backlog")
+		if payload.Body == "" {
+			s.renderJSONError(w, http.StatusBadRequest, errors.New("story is required"))
+			return
+		}
+		payload.Title = firstNonEmpty(payload.Title, storySummary(payload.Body))
+	case "move":
+		endpoint = "/issues/move"
+		if payload.ID <= 0 || payload.Lane == "" {
+			s.renderJSONError(w, http.StatusBadRequest, errors.New("story move requires an id and lane"))
+			return
+		}
+	case "take":
+		endpoint = "/issues/take"
+		if payload.ID <= 0 {
+			s.renderJSONError(w, http.StatusBadRequest, errors.New("story id is required"))
+			return
+		}
+	case "assign":
+		endpoint = "/issues/assign"
+		if payload.ID <= 0 {
+			s.renderJSONError(w, http.StatusBadRequest, errors.New("story assignment requires an id"))
+			return
+		}
+	case "comment":
+		endpoint = "/issues/comment"
+		if payload.ID <= 0 || payload.Comment == "" {
+			s.renderJSONError(w, http.StatusBadRequest, errors.New("story comment requires an id and comment"))
+			return
+		}
+	default:
+		s.renderJSONError(w, http.StatusBadRequest, fmt.Errorf("unsupported board action %q", req.Action))
 		return
 	}
 	var resp map[string]any
@@ -2162,10 +2313,81 @@ func (s *webServer) handlePullRequests(ctx context.Context, w http.ResponseWrite
 	var body strings.Builder
 	body.WriteString(`<main class="layout" data-bgit-source="seed">`)
 	body.WriteString(s.headerHTML(ref, "prs"))
-	body.WriteString(`<div class="repo-content repo-content-single"><div class="repo-primary"><section class="panel"><div class="panel-title">Pull requests</div><div data-pr-list data-pr-source="` + html.EscapeString(source) + `"` + boolDataAttr("stale", stale) + `>`)
+	body.WriteString(`<div class="repo-content repo-content-single"><div class="repo-primary"><section class="panel"><div class="panel-title pr-list-title"><span>Pull requests</span><a class="button-link" href="/prs/new" data-capability="push">New pull request</a></div><div data-pr-list data-pr-source="` + html.EscapeString(source) + `"` + boolDataAttr("stale", stale) + `>`)
 	body.WriteString(pullRequestListHTML(prs))
 	body.WriteString(`</div></section></div></div></main>`)
 	s.renderPage(w, webPageTitle(s.title, "pull requests"), body.String())
+}
+
+func (s *webServer) handleNewPullRequest(ctx context.Context, w http.ResponseWriter, r *http.Request) {
+	ref := branchRef(firstNonEmpty(s.cfg.branch, defaultBranch))
+	var body strings.Builder
+	body.WriteString(`<main class="layout" data-bgit-source="seed">`)
+	body.WriteString(s.headerHTML(ref, "prs"))
+	body.WriteString(`<div class="repo-content repo-content-single"><div class="repo-primary"><section class="panel pr-create-panel"><div class="panel-title">Open a pull request</div>`)
+	if strings.TrimSpace(s.cfg.brokerURL) == "" {
+		body.WriteString(`<div class="empty">Pull requests are available for broker-backed repositories.</div></section></div></div></main>`)
+		s.renderPage(w, webPageTitle(s.title, "new pull request"), body.String())
+		return
+	}
+	body.WriteString(s.pullRequestCreateHTML(ctx, ref))
+	body.WriteString(`</section></div></div></main>`)
+	s.renderPage(w, webPageTitle(s.title, "new pull request"), body.String())
+}
+
+func (s *webServer) pullRequestCreateHTML(ctx context.Context, currentRef string) string {
+	options, err := s.refOptions(ctx)
+	if err != nil {
+		return `<div class="settings-error">` + html.EscapeString(err.Error()) + `</div>`
+	}
+	var branches []webRefOption
+	for _, option := range options {
+		if option.kind == "Branches" {
+			branches = append(branches, option)
+		}
+	}
+	if len(branches) == 0 {
+		return `<div class="empty">No branches found.</div>`
+	}
+	target := branchRef(firstNonEmpty(s.cfg.branch, defaultBranch))
+	source := normalizeWebRef(currentRef)
+	if source == "" || source == target {
+		for _, branch := range branches {
+			if branch.fullName != target {
+				source = branch.fullName
+				break
+			}
+		}
+	}
+	if source == "" {
+		source = branches[0].fullName
+	}
+	var b strings.Builder
+	b.WriteString(`<form class="pr-create-form" data-pr-create-form data-capability="push">`)
+	b.WriteString(`<div class="pr-compare-box"><label>base<select name="target" data-pr-create-target>`)
+	for _, branch := range branches {
+		selected := ""
+		if branch.fullName == target {
+			selected = ` selected`
+		}
+		b.WriteString(`<option value="` + html.EscapeString(branch.fullName) + `"` + selected + `>` + html.EscapeString(branch.name) + `</option>`)
+	}
+	b.WriteString(`</select></label><span aria-hidden="true">←</span><label>compare<select name="source" data-pr-create-source>`)
+	for _, branch := range branches {
+		selected := ""
+		if branch.fullName == source {
+			selected = ` selected`
+		}
+		b.WriteString(`<option value="` + html.EscapeString(branch.fullName) + `"` + selected + `>` + html.EscapeString(branch.name) + `</option>`)
+	}
+	b.WriteString(`</select></label></div>`)
+	b.WriteString(`<div class="pr-create-summary" data-pr-create-summary></div>`)
+	b.WriteString(`<div class="pr-create-diff" data-pr-create-diff><div class="empty">Select branches to preview the diff.</div></div>`)
+	b.WriteString(`<label>Title<input name="title" autocomplete="off" placeholder="Briefly describe these changes"></label>`)
+	b.WriteString(`<label>Description<textarea name="body" rows="8" placeholder="Describe what changed and why"></textarea></label>`)
+	b.WriteString(`<div class="settings-actions"><a class="button-link" href="/prs">Cancel</a><button class="button-link primary" type="submit">Create pull request</button></div>`)
+	b.WriteString(`</form>`)
+	return b.String()
 }
 
 func (s *webServer) handleIssues(ctx context.Context, w http.ResponseWriter, r *http.Request) {
@@ -2187,6 +2409,25 @@ func (s *webServer) handleIssues(ctx context.Context, w http.ResponseWriter, r *
 	s.renderPage(w, webPageTitle(s.title, "issues"), body.String())
 }
 
+func (s *webServer) handleBoard(ctx context.Context, w http.ResponseWriter, r *http.Request) {
+	issues, err := s.listIssues(ctx)
+	if err != nil {
+		issues = nil
+	}
+	boardCtx := s.boardRenderContext(ctx)
+	ref := branchRef(firstNonEmpty(s.cfg.branch, defaultBranch))
+	var body strings.Builder
+	body.WriteString(`<main class="layout" data-bgit-source="seed">`)
+	body.WriteString(s.headerHTML(ref, "board"))
+	body.WriteString(`<div class="repo-content repo-content-single"><div class="repo-primary"><section class="panel board-panel" data-board-panel><div class="panel-title board-title"><span>Task board</span><button class="button-link story-chip" type="button" data-board-only-me aria-pressed="false">Only me</button></div>`)
+	body.WriteString(boardHTML(issues, boardCtx))
+	if err != nil {
+		body.WriteString(`<div class="settings-error">` + html.EscapeString(err.Error()) + `</div>`)
+	}
+	body.WriteString(`</section></div></div></main>`)
+	s.renderPage(w, webPageTitle(s.title, "board"), body.String())
+}
+
 func (s *webServer) handleIssue(ctx context.Context, w http.ResponseWriter, r *http.Request, idPart string) {
 	id, err := strconv.Atoi(strings.Trim(idPart, "/"))
 	if err != nil || id <= 0 {
@@ -2196,6 +2437,11 @@ func (s *webServer) handleIssue(ctx context.Context, w http.ResponseWriter, r *h
 	issue, err := s.getIssue(ctx, id)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+	if issue.Type == "story" {
+		monogram := repoMonogram(firstNonEmpty(s.cfg.logicalRepo, s.title))
+		http.Redirect(w, r, "/board/"+url.PathEscape(storyDisplayID(monogram, issue.ID)), http.StatusFound)
 		return
 	}
 	ref := branchRef(firstNonEmpty(s.cfg.branch, defaultBranch))
@@ -2208,7 +2454,11 @@ func (s *webServer) handleIssue(ctx context.Context, w http.ResponseWriter, r *h
 	for _, comment := range issue.Comments {
 		body.WriteString(`<div class="issue-comment"><strong>` + html.EscapeString(firstNonEmpty(comment.User, "anonymous")) + ` commented ` + html.EscapeString(relativeTime(parseTime(comment.At))) + `</strong><p>` + html.EscapeString(comment.Body) + `</p></div>`)
 	}
-	body.WriteString(`<form class="issue-form" data-issue-form="comment"><label>Comment<textarea name="comment" rows="4" required></textarea></label><div class="settings-actions"><button class="button-link primary" type="submit">Comment</button>`)
+	formAttrs := `class="issue-form" data-issue-form="comment"`
+	if issue.Type == "story" {
+		formAttrs += ` data-capability="push"`
+	}
+	body.WriteString(`<form ` + formAttrs + `><label>Comment<textarea name="comment" rows="4" required></textarea></label><div class="settings-actions"><button class="button-link primary" type="submit">Comment</button>`)
 	if issue.Status == "closed" {
 		body.WriteString(`<button class="button-link" type="button" data-issue-action="reopen">Reopen</button>`)
 	} else {
@@ -2216,6 +2466,73 @@ func (s *webServer) handleIssue(ctx context.Context, w http.ResponseWriter, r *h
 	}
 	body.WriteString(`</div></form></section></div></div></main>`)
 	s.renderPage(w, webPageTitle(s.title, "issue"), body.String())
+}
+
+func (s *webServer) handleStory(ctx context.Context, w http.ResponseWriter, r *http.Request, idPart string) {
+	boardCtx := s.boardRenderContext(ctx)
+	id, err := parseStoryDisplayID(strings.Trim(idPart, "/"), boardCtx.Monogram)
+	if err != nil || id <= 0 {
+		http.NotFound(w, r)
+		return
+	}
+	story, err := s.getIssue(ctx, id)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+	if story.Type != "story" {
+		http.NotFound(w, r)
+		return
+	}
+	ref := branchRef(firstNonEmpty(s.cfg.branch, defaultBranch))
+	lane := normalizeKanbanLane(story.Lane)
+	var body strings.Builder
+	body.WriteString(`<main class="layout" data-bgit-source="seed">`)
+	body.WriteString(s.headerHTML(ref, "board"))
+	body.WriteString(`<div class="repo-content repo-content-single"><div class="repo-primary"><section class="panel story-detail" data-story-id="` + strconv.Itoa(story.ID) + `">`)
+	body.WriteString(`<div class="issue-heading story-heading"><span class="issue-state">` + html.EscapeString(kanbanLaneLabel(lane)) + `</span><h1>Story ` + html.EscapeString(storyDisplayID(boardCtx.Monogram, story.ID)) + `</h1></div>`)
+	body.WriteString(`<div class="story-body">` + html.EscapeString(storyText(story)) + `</div>`)
+	body.WriteString(`<div class="story-detail-actions" data-capability="push">`)
+	body.WriteString(storyAssignmentControlsHTML(story, boardCtx))
+	body.WriteString(`<select data-board-lane aria-label="Move story">`)
+	for _, option := range kanbanLanes() {
+		selected := ""
+		if option == lane {
+			selected = ` selected`
+		}
+		body.WriteString(`<option value="` + option + `"` + selected + `>` + html.EscapeString(kanbanLaneLabel(option)) + `</option>`)
+	}
+	body.WriteString(`</select>`)
+	if story.Assignee != "" {
+		body.WriteString(`<span class="muted">Assigned to ` + html.EscapeString(story.Assignee) + `</span>`)
+	}
+	body.WriteString(`</div>`)
+	for _, comment := range story.Comments {
+		body.WriteString(`<div class="issue-comment"><strong>` + html.EscapeString(firstNonEmpty(comment.User, "anonymous")) + ` commented ` + html.EscapeString(relativeTime(parseTime(comment.At))) + `</strong><p>` + html.EscapeString(comment.Body) + `</p></div>`)
+	}
+	body.WriteString(`<form class="issue-form" data-board-form="comment" data-capability="push"><label>Comment<textarea name="comment" rows="4" required></textarea></label><div class="settings-actions"><button class="button-link primary" type="submit">Comment</button></div></form>`)
+	body.WriteString(`</section></div></div></main>`)
+	s.renderPage(w, webPageTitle(s.title, "story"), body.String())
+}
+
+func (s *webServer) boardRenderContext(ctx context.Context) boardRenderContext {
+	var out boardRenderContext
+	out.Monogram = repoMonogram(firstNonEmpty(s.cfg.logicalRepo, s.title))
+	out.Assignees, _ = s.listBoardAssignees(ctx)
+	return out
+}
+
+func (s *webServer) listBoardAssignees(ctx context.Context) ([]string, error) {
+	if strings.TrimSpace(s.cfg.brokerURL) == "" || strings.TrimSpace(s.cfg.logicalRepo) == "" {
+		return nil, errors.New("board requires a broker-backed repository")
+	}
+	var resp struct {
+		Users []string `json:"users"`
+	}
+	if err := brokerPostContext(ctx, s.cfg.brokerURL, "/issues/assignees", brokerIssueRequest{Repo: repoForBroker(s.cfg)}, &resp); err != nil {
+		return nil, err
+	}
+	return resp.Users, nil
 }
 
 func (s *webServer) handleSettings(ctx context.Context, w http.ResponseWriter, r *http.Request) {
@@ -2237,6 +2554,59 @@ func (s *webServer) handleSettings(ctx context.Context, w http.ResponseWriter, r
 	body.WriteString(`</div>`)
 	body.WriteString(`</section></div></div></main>`)
 	s.renderPage(w, webPageTitle(s.title, "settings"), body.String())
+}
+
+func (s *webServer) handleUserSettings(ctx context.Context, w http.ResponseWriter, r *http.Request) {
+	ref := branchRef(firstNonEmpty(s.cfg.branch, defaultBranch))
+	var body strings.Builder
+	body.WriteString(`<main class="layout" data-bgit-source="seed">`)
+	body.WriteString(s.headerHTML(ref, "user-settings"))
+	body.WriteString(`<div class="repo-content repo-content-single"><div class="repo-primary"><section class="panel user-settings-panel" data-user-settings>`)
+	body.WriteString(`<div class="panel-title">User profile</div>`)
+	if strings.TrimSpace(s.cfg.brokerURL) == "" {
+		body.WriteString(`<div class="empty">User profiles are available for broker-backed repositories.</div></section></div></div></main>`)
+		s.renderPage(w, webPageTitle(s.title, "user settings"), body.String())
+		return
+	}
+	body.WriteString(`<div class="user-profile-grid"><div class="user-profile-avatar-block"><div class="user-avatar-preview" data-user-avatar-preview>` + userIconHTML() + `</div><label class="button-link user-avatar-upload">Upload avatar<input type="file" accept="image/*" data-user-avatar-file hidden></label></div>`)
+	body.WriteString(`<form class="user-profile-form" data-user-profile-form><label>Bio<textarea name="bio" rows="6" maxlength="2000" placeholder="Short bio"></textarea></label><div class="settings-actions"><button class="button-link primary" type="submit">Save profile</button></div></form></div>`)
+	body.WriteString(`<div class="avatar-cropper" data-avatar-cropper hidden><div class="avatar-crop-frame" data-avatar-crop-frame><img alt="" draggable="false" data-avatar-crop-image></div><div class="avatar-zoom-controls"><button class="button-link story-chip" type="button" data-avatar-zoom-out aria-label="Zoom out" title="Zoom out">-</button><button class="button-link story-chip" type="button" data-avatar-zoom-in aria-label="Zoom in" title="Zoom in">+</button></div><div class="settings-actions"><button class="button-link primary" type="button" data-avatar-apply>Use image</button><button class="button-link" type="button" data-avatar-cancel>Cancel</button></div></div>`)
+	body.WriteString(`<section class="settings-section"><h2>SSH keys</h2><div data-user-keys><div class="empty">Loading keys...</div></div></section>`)
+	body.WriteString(`</section></div></div></main>`)
+	s.renderPage(w, webPageTitle(s.title, "user settings"), body.String())
+}
+
+func (s *webServer) handleAPIUserProfile(ctx context.Context, w http.ResponseWriter, r *http.Request) {
+	if strings.TrimSpace(s.cfg.brokerURL) == "" || strings.TrimSpace(s.cfg.logicalRepo) == "" {
+		s.renderJSONError(w, http.StatusBadRequest, errors.New("user profile requires a broker-backed repository"))
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		var resp brokerUserProfileResponse
+		if err := brokerPostContext(ctx, s.cfg.brokerURL, "/profile/get", brokerUserProfileRequest{Repo: repoForBroker(s.cfg)}, &resp); err != nil {
+			s.renderJSONError(w, http.StatusBadRequest, err)
+			return
+		}
+		s.renderJSON(w, resp)
+	case http.MethodPost:
+		var req struct {
+			Bio    string `json:"bio"`
+			Avatar string `json:"avatar"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			s.renderJSONError(w, http.StatusBadRequest, err)
+			return
+		}
+		var resp brokerUserProfileResponse
+		if err := brokerPostContext(ctx, s.cfg.brokerURL, "/profile/update", brokerUserProfileRequest{Repo: repoForBroker(s.cfg), Bio: strings.TrimSpace(req.Bio), Avatar: strings.TrimSpace(req.Avatar)}, &resp); err != nil {
+			s.renderJSONError(w, http.StatusBadRequest, err)
+			return
+		}
+		s.renderJSON(w, resp)
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
 }
 
 func (s *webServer) settingsInitialSectionsHTML(info webSettingsInfo, view string, cached bool) string {
@@ -2487,17 +2857,21 @@ func prReviewComments(pr brokerPullRequest) []brokerPullRequestComment {
 }
 
 func (s *webServer) pullRequestChangedFiles(ctx context.Context, pr brokerPullRequest) ([]webChangedFile, int, int, error) {
-	repo := s
 	targetRef := firstNonEmpty(pr.Target, branchRef(defaultBranch))
 	sourceRef := firstNonEmpty(pr.Source, pr.Head)
+	return s.pullRequestChangedFilesForRefs(ctx, targetRef, sourceRef, pr.Head)
+}
+
+func (s *webServer) pullRequestChangedFilesForRefs(ctx context.Context, targetRef, sourceRef, sourceFallback string) ([]webChangedFile, int, int, error) {
+	repo := s
 	targetHash, targetErr := repo.resolvePullRequestRevision(ctx, targetRef, "")
-	sourceHash, sourceErr := repo.resolvePullRequestRevision(ctx, sourceRef, pr.Head)
+	sourceHash, sourceErr := repo.resolvePullRequestRevision(ctx, sourceRef, sourceFallback)
 	if (targetErr != nil || sourceErr != nil) && s.apiRepo != nil && s.apiRepo != s.repo {
 		remote := *s
 		remote.repo = s.apiRepo
 		repo = &remote
 		targetHash, targetErr = repo.resolvePullRequestRevision(ctx, targetRef, "")
-		sourceHash, sourceErr = repo.resolvePullRequestRevision(ctx, sourceRef, pr.Head)
+		sourceHash, sourceErr = repo.resolvePullRequestRevision(ctx, sourceRef, sourceFallback)
 	}
 	if targetErr != nil || sourceErr != nil {
 		return nil, 0, 0, errors.New("pull request refs are not available locally yet. Fetch the source and target branches, then refresh this page")
@@ -2511,6 +2885,43 @@ func (s *webServer) pullRequestChangedFiles(ctx context.Context, pr brokerPullRe
 		return nil, 0, 0, err
 	}
 	return repo.changedFilesBetweenTrees(ctx, targetCommit.tree, sourceCommit.tree)
+}
+
+func (s *webServer) pullRequestPreviewDiffHTML(ctx context.Context, targetRef, sourceRef string) (string, bool, string, error) {
+	files, additions, deletions, err := s.pullRequestChangedFilesForRefs(ctx, targetRef, sourceRef, "")
+	if err != nil {
+		return "", false, "", err
+	}
+	mergeable, conflict := s.pullRequestMergeability(ctx, targetRef, sourceRef)
+	return diffFilesPanelHTML(files, additions, deletions), mergeable, conflict, nil
+}
+
+func (s *webServer) pullRequestMergeability(ctx context.Context, targetRef, sourceRef string) (bool, string) {
+	repo := s
+	targetHash, targetErr := repo.resolvePullRequestRevision(ctx, targetRef, "")
+	sourceHash, sourceErr := repo.resolvePullRequestRevision(ctx, sourceRef, "")
+	if (targetErr != nil || sourceErr != nil) && s.apiRepo != nil && s.apiRepo != s.repo {
+		remote := *s
+		remote.repo = s.apiRepo
+		repo = &remote
+		targetHash, targetErr = repo.resolvePullRequestRevision(ctx, targetRef, "")
+		sourceHash, sourceErr = repo.resolvePullRequestRevision(ctx, sourceRef, "")
+	}
+	if targetErr != nil || sourceErr != nil {
+		return false, "refs are not available"
+	}
+	baseHash, err := repo.mergeBase(ctx, targetHash, sourceHash)
+	if err != nil {
+		return false, err.Error()
+	}
+	conflict, err := repo.hasMergeConflict(ctx, baseHash, targetHash, sourceHash)
+	if err != nil {
+		return false, err.Error()
+	}
+	if conflict != "" {
+		return false, conflict
+	}
+	return true, ""
 }
 
 func (s *webServer) pullRequestUnifiedDiff(ctx context.Context, id int) (string, error) {
@@ -2639,6 +3050,91 @@ func (s *webServer) resolvePullRequestRevision(ctx context.Context, ref, fallbac
 		}
 	}
 	return "", fs.ErrNotExist
+}
+
+func (s *webServer) mergeBase(ctx context.Context, a, b string) (string, error) {
+	ancestors := map[string]struct{}{}
+	stack := []string{a}
+	for len(stack) > 0 {
+		hash := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		if _, ok := ancestors[hash]; ok {
+			continue
+		}
+		ancestors[hash] = struct{}{}
+		commit, err := s.repo.commit(ctx, hash)
+		if err != nil {
+			return "", err
+		}
+		stack = append(stack, commit.parents...)
+	}
+	stack = []string{b}
+	seen := map[string]struct{}{}
+	for len(stack) > 0 {
+		hash := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		if _, ok := ancestors[hash]; ok {
+			return hash, nil
+		}
+		if _, ok := seen[hash]; ok {
+			continue
+		}
+		seen[hash] = struct{}{}
+		commit, err := s.repo.commit(ctx, hash)
+		if err != nil {
+			return "", err
+		}
+		stack = append(stack, commit.parents...)
+	}
+	return "", errors.New("no merge base found")
+}
+
+func (s *webServer) hasMergeConflict(ctx context.Context, baseHash, targetHash, sourceHash string) (string, error) {
+	baseCommit, err := s.repo.commit(ctx, baseHash)
+	if err != nil {
+		return "", err
+	}
+	targetCommit, err := s.repo.commit(ctx, targetHash)
+	if err != nil {
+		return "", err
+	}
+	sourceCommit, err := s.repo.commit(ctx, sourceHash)
+	if err != nil {
+		return "", err
+	}
+	base := map[string]webTreeFile{}
+	target := map[string]webTreeFile{}
+	source := map[string]webTreeFile{}
+	if err := s.collectTreeFiles(ctx, baseCommit.tree, "", base); err != nil {
+		return "", err
+	}
+	if err := s.collectTreeFiles(ctx, targetCommit.tree, "", target); err != nil {
+		return "", err
+	}
+	if err := s.collectTreeFiles(ctx, sourceCommit.tree, "", source); err != nil {
+		return "", err
+	}
+	paths := map[string]struct{}{}
+	for path := range base {
+		paths[path] = struct{}{}
+	}
+	for path := range target {
+		paths[path] = struct{}{}
+	}
+	for path := range source {
+		paths[path] = struct{}{}
+	}
+	for path := range paths {
+		b := base[path]
+		t := target[path]
+		src := source[path]
+		targetChanged := t.hash != b.hash
+		sourceChanged := src.hash != b.hash
+		if targetChanged && sourceChanged && t.hash != src.hash {
+			return "merge conflict in " + path, nil
+		}
+	}
+	return "", nil
 }
 
 func (s *webServer) commitRange(ctx context.Context, base, head string, limit int) ([]commitObject, error) {
@@ -2850,11 +3346,12 @@ func (s *webServer) readmeHTML(ctx context.Context, treeHash string) string {
 
 func (s *webServer) headerHTML(ref, repoPath string) string {
 	var b strings.Builder
-	b.WriteString(themeToggleHTML())
+	b.WriteString(topUserControlsHTML())
 	b.WriteString(`<header class="repo-header">`)
 	codeActive := ` class="active"`
 	commitsActive := ""
 	prsActive := ""
+	boardActive := ""
 	issuesActive := ""
 	settingsActive := ""
 	if repoPath == "commits" {
@@ -2866,6 +3363,9 @@ func (s *webServer) headerHTML(ref, repoPath string) string {
 	} else if repoPath == "settings" {
 		codeActive = ""
 		settingsActive = ` class="active"`
+	} else if repoPath == "board" {
+		codeActive = ""
+		boardActive = ` class="active"`
 	} else if repoPath == "issues" {
 		codeActive = ""
 		issuesActive = ` class="active"`
@@ -2881,6 +3381,7 @@ func (s *webServer) headerHTML(ref, repoPath string) string {
 		}
 		b.WriteString(`<a` + prsActive + ` href="/prs" data-pr-tab` + hidden + `>Pull requests (<span data-pr-tab-count>` + strconv.Itoa(count) + `</span>)</a>`)
 	}
+	b.WriteString(`<a` + boardActive + ` href="/board">Board</a>`)
 	b.WriteString(`<a` + issuesActive + ` href="/issues">Issues</a>`)
 	b.WriteString(`<a` + settingsActive + ` href="/settings" data-capability="read">Settings</a>`)
 	b.WriteString(`</nav>`)
@@ -3035,6 +3536,18 @@ func (s *webServer) fileIndexHTML(ctx context.Context, treeHash, ref string) str
 
 func themeToggleHTML() string {
 	return `<button class="theme-toggle" type="button" data-theme-toggle aria-label="Toggle dark or light theme" title="Toggle theme. Long press for auto."><svg class="theme-symbol" aria-hidden="true" viewBox="0 0 80 80" focusable="false"><circle cx="40" cy="40" r="17"/><path d="M40 0l5.8 19.7H34.2L40 0zM40 80l-5.8-19.7h11.6L40 80zM0 40l19.7-5.8v11.6L0 40zM80 40l-19.7 5.8V34.2L80 40zM11.7 11.7l18 9.8-8.2 8.2-9.8-18zM68.3 68.3l-18-9.8 8.2-8.2 9.8 18zM68.3 11.7l-9.8 18-8.2-8.2 18-9.8zM11.7 68.3l9.8-18 8.2 8.2-18 9.8z"/></svg><span class="theme-auto" aria-hidden="true">A</span></button>`
+}
+
+func topUserControlsHTML() string {
+	return `<div class="top-user-controls">` + userMenuHTML() + themeToggleHTML() + `</div>`
+}
+
+func userMenuHTML() string {
+	return `<div class="user-menu"><button class="user-menu-button" type="button" data-user-menu-toggle aria-label="User menu" title="User menu" aria-expanded="false">` + userIconHTML() + `</button><div class="user-menu-popover" data-user-menu hidden><a href="/user/settings/">Settings</a></div></div>`
+}
+
+func userIconHTML() string {
+	return `<svg viewBox="0 0 24 24" fill="none" aria-hidden="true" focusable="false"><path d="M12 12a4 4 0 1 0 0-8 4 4 0 0 0 0 8Z" stroke="currentColor" stroke-width="2"/><path d="M4 21a8 8 0 0 1 16 0" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>`
 }
 
 func remoteSyncHTML() string {
@@ -3506,17 +4019,429 @@ func pullRequestListHTML(prs []brokerPullRequest) string {
 }
 
 func issueListHTML(issues []brokerIssue) string {
-	if len(issues) == 0 {
-		return `<div class="empty">No issues found.</div>`
-	}
 	var b strings.Builder
 	b.WriteString(`<div class="issue-list">`)
+	count := 0
 	for _, issue := range issues {
+		if issue.Type == "story" {
+			continue
+		}
+		count++
 		status := firstNonEmpty(issue.Status, "open")
 		b.WriteString(`<a class="issue-row" href="/issues/` + strconv.Itoa(issue.ID) + `"><span class="issue-state ` + html.EscapeString(status) + `">` + html.EscapeString(strings.ToUpper(status)) + `</span><span><strong>` + html.EscapeString(firstNonEmpty(issue.Title, "Untitled issue")) + `</strong><small>#` + strconv.Itoa(issue.ID) + ` opened by ` + html.EscapeString(firstNonEmpty(issue.Author, "anonymous")) + `</small></span></a>`)
 	}
+	if count == 0 {
+		return `<div class="empty">No issues found.</div>`
+	}
 	b.WriteString(`</div>`)
 	return b.String()
+}
+
+func boardHTML(issues []brokerIssue, ctx boardRenderContext) string {
+	var stories []brokerIssue
+	for _, issue := range issues {
+		if issue.Type == "story" {
+			stories = append(stories, issue)
+		}
+	}
+	assigneeNames := append([]string{}, ctx.Assignees...)
+	for _, story := range stories {
+		if strings.TrimSpace(story.Assignee) != "" {
+			assigneeNames = append(assigneeNames, story.Assignee)
+		}
+	}
+	assigneeMonograms := uniqueUserMonograms(assigneeNames)
+	var b strings.Builder
+	b.WriteString(`<div class="kanban-board">`)
+	for _, lane := range kanbanLanes() {
+		b.WriteString(`<section class="kanban-lane" data-board-drop-lane="` + html.EscapeString(lane) + `"><h3>` + html.EscapeString(kanbanLaneLabel(lane)) + `</h3>`)
+		if lane == "backlog" {
+			b.WriteString(`<button class="story-card story-card-add" type="button" data-board-action="new" data-capability="push" aria-label="Add story"><span aria-hidden="true">+</span></button>`)
+		}
+		for _, story := range stories {
+			if normalizeKanbanLane(story.Lane) != lane {
+				continue
+			}
+			storyKey := storyDisplayID(ctx.Monogram, story.ID)
+			b.WriteString(`<article class="story-card" data-story-id="` + strconv.Itoa(story.ID) + `" data-story-lane="` + html.EscapeString(lane) + `" data-story-assignee="` + html.EscapeString(story.Assignee) + `" draggable="true"><div class="story-card-title"><a href="/board/` + url.PathEscape(storyKey) + `">` + html.EscapeString(storyKey) + `</a><div class="story-actions" data-capability="push">`)
+			if story.Assignee != "" {
+				b.WriteString(`<span class="story-assignee-mark" title="Assigned to ` + html.EscapeString(story.Assignee) + `" aria-label="Assigned to ` + html.EscapeString(story.Assignee) + `">` + html.EscapeString(assigneeMonogram(story.Assignee, assigneeMonograms)) + `</span>`)
+			}
+			b.WriteString(storyAssignmentControlsHTML(story, ctx))
+			b.WriteString(`<button class="button-link story-chip story-icon-chip" type="button" data-board-move-toggle aria-label="Move story" title="Move story">` + moveStoryIconHTML() + `</button>`)
+			b.WriteString(`<select data-board-lane aria-label="Move story" hidden>`)
+			for _, option := range kanbanLanes() {
+				selected := ""
+				if option == lane {
+					selected = ` selected`
+				}
+				b.WriteString(`<option value="` + option + `"` + selected + `>` + html.EscapeString(kanbanLaneLabel(option)) + `</option>`)
+			}
+			b.WriteString(`</select></div></div><p>` + html.EscapeString(storyText(story)) + `</p></article>`)
+		}
+		b.WriteString(`</section>`)
+	}
+	b.WriteString(`</div>`)
+	return b.String()
+}
+
+func storyAssignmentControlsHTML(story brokerIssue, ctx boardRenderContext) string {
+	assignee := strings.TrimSpace(story.Assignee)
+	if assignee != "" {
+		var b strings.Builder
+		b.WriteString(`<button class="button-link story-chip story-icon-chip" type="button" data-board-reassign-toggle aria-label="Reassign story" title="Reassign story">` + reassignStoryIconHTML() + `</button>`)
+		b.WriteString(`<select data-board-reassign aria-label="Reassign story" hidden>`)
+		b.WriteString(`<option value="__unassigned__">Unassigned</option>`)
+		for _, user := range sortedBoardAssignees(ctx.Assignees) {
+			user = strings.TrimSpace(user)
+			if user == "" {
+				continue
+			}
+			selected := ""
+			if strings.EqualFold(user, assignee) {
+				selected = ` selected`
+			}
+			b.WriteString(`<option value="` + html.EscapeString(user) + `"` + selected + `>` + html.EscapeString(user) + `</option>`)
+		}
+		b.WriteString(`</select>`)
+		return b.String()
+	}
+	return `<button class="button-link story-chip" type="button" data-board-action="take">Take</button>`
+}
+
+func moveStoryIconHTML() string {
+	return `<svg viewBox="0 0 24 24" fill="none" aria-hidden="true" focusable="false"><path d="M5 12h14" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="m14 7 5 5-5 5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>`
+}
+
+func reassignStoryIconHTML() string {
+	return `<svg viewBox="0 0 24 24" fill="none" aria-hidden="true" focusable="false"><path d="M8 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8Z" stroke="currentColor" stroke-width="2"/><path d="M3 21a5 5 0 0 1 10 0" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M16 8h5" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="m19 5 3 3-3 3" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><path d="M21 16h-5" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="m18 13-3 3 3 3" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>`
+}
+
+func sortedBoardAssignees(users []string) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, user := range users {
+		user = strings.TrimSpace(user)
+		key := strings.ToLower(user)
+		if user == "" || seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, user)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return strings.ToLower(out[i]) < strings.ToLower(out[j])
+	})
+	return out
+}
+
+func uniqueUserMonograms(users []string) map[string]string {
+	sorted := sortedBoardAssignees(users)
+	baseGroups := map[string][]string{}
+	for _, user := range sorted {
+		base := userMonogram(user)
+		if base == "" {
+			continue
+		}
+		baseGroups[base] = append(baseGroups[base], user)
+	}
+	out := map[string]string{}
+	for base, group := range baseGroups {
+		if len(group) == 1 {
+			out[strings.ToLower(group[0])] = base
+			continue
+		}
+		used := map[string]bool{}
+		assigned := map[string]bool{}
+		pending := make([]string, 0, len(group))
+		for _, user := range group {
+			label := uniqueNumericSuffixMonogram(user, group)
+			if label != "" && !used[label] {
+				used[label] = true
+				out[strings.ToLower(user)] = label
+				assigned[strings.ToLower(user)] = true
+				continue
+			}
+			if label != "" {
+				pending = append(pending, user)
+			}
+		}
+		var remaining []string
+		for _, user := range group {
+			if !assigned[strings.ToLower(user)] {
+				remaining = append(remaining, user)
+			}
+		}
+		for _, user := range remaining {
+			if containsStringFold(pending, user) {
+				continue
+			}
+			label := uniqueUserPrefix(user, remaining)
+			if label == "" || used[label] {
+				pending = append(pending, user)
+				continue
+			}
+			used[label] = true
+			out[strings.ToLower(user)] = label
+			assigned[strings.ToLower(user)] = true
+		}
+		counter := 1
+		for _, user := range pending {
+			if assigned[strings.ToLower(user)] {
+				continue
+			}
+			label := numberedUserMonogram(user, counter)
+			for used[label] {
+				counter++
+				label = numberedUserMonogram(user, counter)
+			}
+			counter++
+			used[label] = true
+			out[strings.ToLower(user)] = label
+		}
+	}
+	return out
+}
+
+func containsStringFold(values []string, value string) bool {
+	for _, candidate := range values {
+		if strings.EqualFold(candidate, value) {
+			return true
+		}
+	}
+	return false
+}
+
+func uniqueNumericSuffixMonogram(user string, group []string) string {
+	suffix, ok := trailingDigits(user)
+	if !ok {
+		return ""
+	}
+	for _, other := range group {
+		if strings.EqualFold(user, other) {
+			continue
+		}
+		otherSuffix, otherOK := trailingDigits(other)
+		if otherOK && otherSuffix == suffix {
+			return ""
+		}
+	}
+	return numberedUserMonogramSuffix(user, suffix)
+}
+
+func assigneeMonogram(user string, labels map[string]string) string {
+	key := strings.ToLower(strings.TrimSpace(user))
+	if label := labels[key]; label != "" {
+		return label
+	}
+	return userMonogram(user)
+}
+
+func uniqueUserPrefix(user string, group []string) string {
+	runes := userIdentifierRunes(user)
+	for size := 1; size <= 3 && size <= len(runes); size++ {
+		prefix := string(runes[:size])
+		unique := true
+		for _, other := range group {
+			if strings.EqualFold(user, other) {
+				continue
+			}
+			otherRunes := userIdentifierRunes(other)
+			if len(otherRunes) >= size && string(otherRunes[:size]) == prefix {
+				unique = false
+				break
+			}
+		}
+		if unique {
+			return prefix
+		}
+	}
+	return ""
+}
+
+func numberedUserMonogram(user string, n int) string {
+	return numberedUserMonogramSuffix(user, strconv.Itoa(n))
+}
+
+func numberedUserMonogramSuffix(user, suffix string) string {
+	runes := userIdentifierRunes(user)
+	limit := 3 - utf8.RuneCountInString(suffix)
+	if limit < 1 {
+		limit = 1
+	}
+	if len(runes) > limit {
+		runes = runes[:limit]
+	}
+	if len(runes) == 0 {
+		return suffix
+	}
+	return string(runes) + suffix
+}
+
+func trailingDigits(user string) (string, bool) {
+	var digits []rune
+	for _, r := range strings.TrimSpace(user) {
+		if unicode.IsDigit(r) {
+			digits = append(digits, r)
+			continue
+		}
+		digits = nil
+	}
+	if len(digits) == 0 {
+		return "", false
+	}
+	return string(digits), true
+}
+
+func userIdentifierRunes(user string) []rune {
+	var out []rune
+	for _, r := range strings.TrimSpace(user) {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) {
+			out = append(out, unicode.ToUpper(r))
+		}
+	}
+	return out
+}
+
+func storyDisplayID(monogram string, id int) string {
+	monogram = strings.TrimSpace(monogram)
+	if monogram == "" {
+		return strconv.Itoa(id)
+	}
+	return monogram + "-" + strconv.Itoa(id)
+}
+
+func parseStoryDisplayID(value, monogram string) (int, error) {
+	monogram = strings.TrimSpace(monogram)
+	if monogram == "" {
+		return 0, errors.New("story id prefix is required")
+	}
+	wantPrefix := strings.ToUpper(monogram) + "-"
+	value = strings.ToUpper(strings.TrimSpace(value))
+	if !strings.HasPrefix(value, wantPrefix) {
+		return 0, fmt.Errorf("story id must use the repository prefix, for example %s", storyDisplayID(monogram, 1))
+	}
+	id, err := strconv.Atoi(strings.TrimPrefix(value, wantPrefix))
+	if err != nil || id <= 0 {
+		return 0, errors.New("story id is required")
+	}
+	return id, nil
+}
+
+func repoMonogram(name string) string {
+	name = strings.TrimSpace(strings.Trim(name, "/"))
+	if name == "" {
+		return ""
+	}
+	if i := strings.LastIndex(name, "/"); i >= 0 {
+		name = name[i+1:]
+	}
+	name = strings.TrimSuffix(name, ".git")
+	var parts []string
+	var current []rune
+	flush := func() {
+		if len(current) == 0 {
+			return
+		}
+		parts = append(parts, string(current))
+		current = nil
+	}
+	for _, r := range name {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) {
+			current = append(current, r)
+			continue
+		}
+		flush()
+	}
+	flush()
+	if len(parts) == 0 {
+		return ""
+	}
+	var out []rune
+	if len(parts) == 1 {
+		for _, r := range parts[0] {
+			out = append(out, unicode.ToUpper(r))
+			if len(out) == 2 {
+				break
+			}
+		}
+		return string(out)
+	}
+	for _, part := range parts {
+		for _, r := range part {
+			out = append(out, unicode.ToUpper(r))
+			break
+		}
+		if len(out) == 3 {
+			break
+		}
+	}
+	return string(out)
+}
+
+func userMonogram(name string) string {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return ""
+	}
+	parts := strings.FieldsFunc(name, func(r rune) bool {
+		return !(unicode.IsLetter(r) || unicode.IsDigit(r))
+	})
+	var out []rune
+	if len(parts) == 1 {
+		for _, r := range parts[0] {
+			out = append(out, unicode.ToUpper(r))
+			if len(out) == 2 {
+				break
+			}
+		}
+		return string(out)
+	}
+	for _, part := range parts {
+		if part == "" {
+			continue
+		}
+		for _, r := range part {
+			out = append(out, unicode.ToUpper(r))
+			break
+		}
+		if len(out) == 2 {
+			break
+		}
+	}
+	return string(out)
+}
+
+func kanbanLaneLabel(lane string) string {
+	switch lane {
+	case "ready":
+		return "Ready"
+	case "doing":
+		return "Doing"
+	case "review":
+		return "Review"
+	case "done":
+		return "Done"
+	default:
+		return "Backlog"
+	}
+}
+
+func storyText(story brokerIssue) string {
+	return firstNonEmpty(strings.TrimSpace(story.Body), strings.TrimSpace(story.Title), "Untitled story")
+}
+
+func storySummary(value string) string {
+	value = strings.Join(strings.Fields(value), " ")
+	if value == "" {
+		return ""
+	}
+	const max = 80
+	runes := []rune(value)
+	if len(runes) <= max {
+		return value
+	}
+	return strings.TrimSpace(string(runes[:max-1])) + "..."
 }
 
 func prHeaderHTML(pr brokerPullRequest, active string) string {

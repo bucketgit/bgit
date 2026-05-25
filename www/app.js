@@ -173,6 +173,66 @@ document.addEventListener('click', function (event) {
     return;
   }
 
+  const boardAction = event.target.closest('[data-board-action]');
+  if (boardAction) {
+    event.preventDefault();
+    handleBoardAction(boardAction);
+    return;
+  }
+
+  const boardOnlyMe = event.target.closest('[data-board-only-me]');
+  if (boardOnlyMe) {
+    event.preventDefault();
+    toggleBoardOnlyMe(boardOnlyMe);
+    return;
+  }
+
+  const userMenuToggle = event.target.closest('[data-user-menu-toggle]');
+  if (userMenuToggle) {
+    event.preventDefault();
+    toggleUserMenu(userMenuToggle);
+    return;
+  }
+  if (!event.target.closest('.user-menu')) {
+    closeUserMenus();
+  }
+
+  const reassignToggle = event.target.closest('[data-board-reassign-toggle]');
+  if (reassignToggle) {
+    event.preventDefault();
+    const actions = reassignToggle.closest('.story-actions, .story-detail-actions');
+    const select = actions ? actions.querySelector('[data-board-reassign]') : null;
+    const lane = actions ? actions.querySelector('[data-board-lane]') : null;
+    if (select) {
+      const opening = select.hidden;
+      select.hidden = !opening;
+      if (opening && lane) lane.hidden = true;
+      actions?.classList.toggle('is-reassigning', opening);
+      actions?.classList.remove('is-moving');
+      actions?.closest('[data-story-id]')?.classList.toggle('is-menu-open', opening);
+      if (opening) select.focus();
+    }
+    return;
+  }
+
+  const moveToggle = event.target.closest('[data-board-move-toggle]');
+  if (moveToggle) {
+    event.preventDefault();
+    const actions = moveToggle.closest('.story-actions, .story-detail-actions');
+    const lane = actions ? actions.querySelector('[data-board-lane]') : null;
+    const reassign = actions ? actions.querySelector('[data-board-reassign]') : null;
+    if (lane) {
+      const opening = lane.hidden;
+      lane.hidden = !opening;
+      if (opening && reassign) reassign.hidden = true;
+      actions?.classList.toggle('is-moving', opening);
+      actions?.classList.remove('is-reassigning');
+      actions?.closest('[data-story-id]')?.classList.toggle('is-menu-open', opening);
+      if (opening) lane.focus();
+    }
+    return;
+  }
+
   const cloneTab = event.target.closest('[data-clone-tab]');
   if (cloneTab) {
     const panel = cloneTab.closest('.clone-panel');
@@ -215,11 +275,80 @@ document.addEventListener('click', function (event) {
 });
 
 document.addEventListener('change', function (event) {
+  const lane = event.target.closest('[data-board-lane]');
+  if (lane) {
+    handleBoardLaneChange(lane);
+    return;
+  }
+  const reassign = event.target.closest('[data-board-reassign]');
+  if (reassign) {
+    handleBoardReassignChange(reassign);
+    return;
+  }
   const select = event.target.closest('[data-ref-selector]');
   if (!select) return;
   const url = new URL(window.location.href);
   url.searchParams.set('ref', select.value);
   window.location.href = url.toString();
+});
+
+document.addEventListener('keydown', function (event) {
+  if (event.key !== 'Escape') return;
+  const reassign = event.target.closest('[data-board-reassign]');
+  if (reassign && !reassign.hidden) {
+    event.preventDefault();
+    cancelBoardReassign(reassign);
+    return;
+  }
+  const lane = event.target.closest('[data-board-lane]');
+  if (lane && !lane.hidden) {
+    event.preventDefault();
+    cancelBoardMove(lane);
+  }
+});
+
+document.addEventListener('dragstart', function (event) {
+  const card = event.target.closest('[data-story-id]');
+  if (!card || card.classList.contains('is-committing') || !hasCapability('push')) {
+    event.preventDefault();
+    return;
+  }
+  event.dataTransfer.effectAllowed = 'move';
+  event.dataTransfer.setData('text/plain', card.getAttribute('data-story-id') || '');
+  event.dataTransfer.setData('application/x-bgit-story-lane', card.getAttribute('data-story-lane') || '');
+  card.classList.add('is-dragging');
+});
+
+document.addEventListener('dragend', function (event) {
+  const card = event.target.closest('[data-story-id]');
+  if (card) card.classList.remove('is-dragging');
+  clearBoardDropTargets();
+});
+
+document.addEventListener('dragover', function (event) {
+  const lane = event.target.closest('[data-board-drop-lane]');
+  if (!lane || !hasCapability('push')) return;
+  event.preventDefault();
+  event.dataTransfer.dropEffect = 'move';
+  lane.classList.add('is-drop-target');
+});
+
+document.addEventListener('dragleave', function (event) {
+  const lane = event.target.closest('[data-board-drop-lane]');
+  if (!lane || lane.contains(event.relatedTarget)) return;
+  lane.classList.remove('is-drop-target');
+});
+
+document.addEventListener('drop', function (event) {
+  const lane = event.target.closest('[data-board-drop-lane]');
+  if (!lane || !hasCapability('push')) return;
+  event.preventDefault();
+  clearBoardDropTargets();
+  const id = Number(event.dataTransfer.getData('text/plain') || 0);
+  const fromLane = event.dataTransfer.getData('application/x-bgit-story-lane') || '';
+  const toLane = lane.getAttribute('data-board-drop-lane') || '';
+  if (!id || !toLane || fromLane === toLane) return;
+  moveBoardStory(id, toLane);
 });
 
 document.addEventListener('submit', function (event) {
@@ -233,6 +362,18 @@ document.addEventListener('submit', function (event) {
   if (issueForm) {
     event.preventDefault();
     handleIssueForm(issueForm);
+    return;
+  }
+  const boardForm = event.target.closest('[data-board-form]');
+  if (boardForm) {
+    event.preventDefault();
+    handleBoardForm(boardForm);
+    return;
+  }
+  const prCreateForm = event.target.closest('[data-pr-create-form]');
+  if (prCreateForm) {
+    event.preventDefault();
+    handlePullRequestCreate(prCreateForm);
   }
 });
 
@@ -259,6 +400,8 @@ document.addEventListener('keydown', function (event) {
 
 document.addEventListener('DOMContentLoaded', function () {
   setupThemeToggle();
+  setupUserSettingsPage();
+  setupPullRequestCreatePage();
   setupReviewDiff();
   restorePullRequestScrollTarget();
   setWhoamiState(currentWhoami);
@@ -473,6 +616,25 @@ function setupThemeToggle() {
   apply();
 }
 
+function toggleUserMenu(button) {
+  const menu = button.closest('.user-menu');
+  const popover = menu ? menu.querySelector('[data-user-menu]') : null;
+  if (!popover) return;
+  const open = popover.hidden;
+  closeUserMenus();
+  popover.hidden = !open;
+  button.setAttribute('aria-expanded', open ? 'true' : 'false');
+}
+
+function closeUserMenus() {
+  for (const menu of document.querySelectorAll('.user-menu')) {
+    const popover = menu.querySelector('[data-user-menu]');
+    const button = menu.querySelector('[data-user-menu-toggle]');
+    if (popover) popover.hidden = true;
+    if (button) button.setAttribute('aria-expanded', 'false');
+  }
+}
+
 function connectBgitEvents() {
   if (!window.EventSource) return;
   let source = null;
@@ -536,6 +698,7 @@ function setWhoamiState(value) {
   currentWhoami = value || null;
   document.documentElement.dataset.bgitRole = currentWhoami && currentWhoami.role ? currentWhoami.role : '';
   applyCapabilityUI();
+  applyBoardOnlyMeFilter();
 }
 
 function hasCapability(name) {
@@ -575,6 +738,210 @@ function applyCapabilityUI() {
       for (const control of el.querySelectorAll('button, input, select, textarea')) control.disabled = !allowed;
     }
   }
+}
+
+function currentBoardUsers() {
+  if (!currentWhoami) return [];
+  const users = [
+    currentWhoami.user,
+    currentWhoami.identity && currentWhoami.identity.user,
+  ].map(function (value) {
+    return String(value || '').trim().toLowerCase();
+  }).filter(Boolean);
+  return Array.from(new Set(users));
+}
+
+function toggleBoardOnlyMe(button) {
+  if (button.disabled) return;
+  const panel = button.closest('[data-board-panel]');
+  if (!panel) return;
+  panel.classList.toggle('is-only-me');
+  applyBoardOnlyMeFilter();
+}
+
+function applyBoardOnlyMeFilter() {
+  const panel = document.querySelector('[data-board-panel]');
+  if (!panel) return;
+  const button = panel.querySelector('[data-board-only-me]');
+  const users = currentBoardUsers();
+  const active = panel.classList.contains('is-only-me');
+  if (button) {
+    button.disabled = users.length === 0;
+    button.classList.toggle('active', active);
+    button.setAttribute('aria-pressed', active ? 'true' : 'false');
+    button.title = users.length ? 'Show only stories assigned to you.' : 'Current broker user is not known yet.';
+  }
+  for (const card of panel.querySelectorAll('[data-story-id]')) {
+    const assignee = String(card.getAttribute('data-story-assignee') || '').trim().toLowerCase();
+    card.classList.toggle('is-filtered-out', active && (users.length === 0 || !users.includes(assignee)));
+  }
+  for (const addCard of panel.querySelectorAll('.story-card-add')) {
+    addCard.classList.toggle('is-filtered-out', active);
+  }
+}
+
+let pendingAvatarData = '';
+let avatarCropState = null;
+
+function setupUserSettingsPage() {
+  const root = document.querySelector('[data-user-settings]');
+  if (!root) return;
+  loadUserProfile();
+  const form = root.querySelector('[data-user-profile-form]');
+  if (form) {
+    form.addEventListener('submit', async function (event) {
+      event.preventDefault();
+      await saveUserProfile(form);
+    });
+  }
+  root.querySelector('[data-user-avatar-file]')?.addEventListener('change', handleAvatarFile);
+  root.querySelector('[data-avatar-crop-frame]')?.addEventListener('pointerdown', startAvatarPan);
+  root.querySelector('[data-avatar-zoom-in]')?.addEventListener('click', function () { changeAvatarZoom(0.1); });
+  root.querySelector('[data-avatar-zoom-out]')?.addEventListener('click', function () { changeAvatarZoom(-0.1); });
+  root.querySelector('[data-avatar-apply]')?.addEventListener('click', applyAvatarCrop);
+  root.querySelector('[data-avatar-cancel]')?.addEventListener('click', closeAvatarCropper);
+}
+
+async function loadUserProfile() {
+  try {
+    renderUserProfile(await fetchJSON('/api/user/profile'));
+  } catch (err) {
+    setSyncStatus(compactError(err), 'is-stale');
+  }
+}
+
+function renderUserProfile(data) {
+  const root = document.querySelector('[data-user-settings]');
+  if (!root) return;
+  const form = root.querySelector('[data-user-profile-form]');
+  if (form && form.elements.bio) form.elements.bio.value = data?.profile?.bio || '';
+  pendingAvatarData = data?.profile?.avatar || '';
+  renderAvatarPreview(pendingAvatarData);
+  renderUserKeys(Array.isArray(data?.keys) ? data.keys : []);
+}
+
+function renderAvatarPreview(value) {
+  const preview = document.querySelector('[data-user-avatar-preview]');
+  if (!preview) return;
+  if (value) {
+    preview.innerHTML = '<img alt="Profile image" src="' + escapeHTML(value) + '">';
+  }
+}
+
+function renderUserKeys(keys) {
+  const root = document.querySelector('[data-user-keys]');
+  if (!root) return;
+  if (!keys.length) {
+    root.innerHTML = '<div class="empty">No SSH keys found for this user.</div>';
+    return;
+  }
+  root.innerHTML = '<div class="user-key-list">' + keys.map(function (key) {
+    const publicKey = String(key.public_key || '');
+    const label = String(key.fingerprint || publicKey.slice(0, 48));
+    const source = key.source ? '<span>' + escapeHTML(key.source) + '</span>' : '';
+    return '<div class="user-key-row"><strong>' + escapeHTML(label) + '</strong>' + source + '<code>' + escapeHTML(publicKey) + '</code></div>';
+  }).join('') + '</div>';
+}
+
+async function saveUserProfile(form) {
+  try {
+    const data = await postJSON('/api/user/profile', {bio: formValue(form, 'bio'), avatar: pendingAvatarData});
+    renderUserProfile(data);
+    setSyncStatus('Profile saved.', 'is-current');
+  } catch (err) {
+    setSyncStatus(compactError(err), 'is-stale');
+  }
+}
+
+function handleAvatarFile(event) {
+  const file = event.target.files && event.target.files[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = function () {
+    openAvatarCropper(String(reader.result || ''));
+    event.target.value = '';
+  };
+  reader.readAsDataURL(file);
+}
+
+function openAvatarCropper(src) {
+  const cropper = document.querySelector('[data-avatar-cropper]');
+  const image = cropper ? cropper.querySelector('[data-avatar-crop-image]') : null;
+  if (!cropper || !image) return;
+  avatarCropState = {src, zoom: 1, x: 0, y: 0, dragging: false};
+  image.onload = updateAvatarCropPreview;
+  image.src = src;
+  cropper.hidden = false;
+  updateAvatarCropPreview();
+}
+
+function closeAvatarCropper() {
+  const cropper = document.querySelector('[data-avatar-cropper]');
+  if (cropper) cropper.hidden = true;
+  avatarCropState = null;
+}
+
+function updateAvatarCropPreview() {
+  const cropper = document.querySelector('[data-avatar-cropper]');
+  const image = cropper ? cropper.querySelector('[data-avatar-crop-image]') : null;
+  if (!cropper || !image || cropper.hidden || !avatarCropState || !image.complete) return;
+  image.style.transform = 'translate(calc(-50% + ' + avatarCropState.x + 'px), calc(-50% + ' + avatarCropState.y + 'px)) scale(' + avatarCropState.zoom + ')';
+}
+
+function startAvatarPan(event) {
+  if (!avatarCropState) return;
+  event.preventDefault();
+  const frame = event.currentTarget;
+  avatarCropState.dragging = true;
+  avatarCropState.dragStartX = event.clientX;
+  avatarCropState.dragStartY = event.clientY;
+  avatarCropState.startX = avatarCropState.x;
+  avatarCropState.startY = avatarCropState.y;
+  frame.setPointerCapture(event.pointerId);
+  frame.addEventListener('pointermove', moveAvatarPan);
+  frame.addEventListener('pointerup', endAvatarPan, {once: true});
+  frame.addEventListener('pointercancel', endAvatarPan, {once: true});
+}
+
+function moveAvatarPan(event) {
+  if (!avatarCropState || !avatarCropState.dragging) return;
+  avatarCropState.x = avatarCropState.startX + event.clientX - avatarCropState.dragStartX;
+  avatarCropState.y = avatarCropState.startY + event.clientY - avatarCropState.dragStartY;
+  updateAvatarCropPreview();
+}
+
+function endAvatarPan(event) {
+  const frame = event.currentTarget;
+  if (avatarCropState) avatarCropState.dragging = false;
+  frame.releasePointerCapture?.(event.pointerId);
+  frame.removeEventListener('pointermove', moveAvatarPan);
+}
+
+function changeAvatarZoom(delta) {
+  if (!avatarCropState) return;
+  avatarCropState.zoom = Math.max(1, Math.min(3, Math.round((avatarCropState.zoom + delta) * 100) / 100));
+  updateAvatarCropPreview();
+}
+
+function applyAvatarCrop() {
+  const cropper = document.querySelector('[data-avatar-cropper]');
+  const image = cropper ? cropper.querySelector('[data-avatar-crop-image]') : null;
+  if (!cropper || !image || !image.complete) return;
+  const canvas = document.createElement('canvas');
+  const size = 320;
+  canvas.width = size;
+  canvas.height = size;
+  const ctx = canvas.getContext('2d');
+  const zoom = avatarCropState?.zoom || 1;
+  const x = avatarCropState?.x || 0;
+  const y = avatarCropState?.y || 0;
+  const scale = Math.max(size / image.naturalWidth, size / image.naturalHeight) * zoom;
+  const width = image.naturalWidth * scale;
+  const height = image.naturalHeight * scale;
+  ctx.drawImage(image, (size - width) / 2 + x, (size - height) / 2 + y, width, height);
+  pendingAvatarData = canvas.toDataURL('image/png');
+  renderAvatarPreview(pendingAvatarData);
+  closeAvatarCropper();
 }
 
 async function fetchJSON(path) {
@@ -762,6 +1129,211 @@ async function handleIssueAction(button) {
   } catch (err) {
     setSyncStatus(compactError(err), 'is-stale');
   }
+}
+
+async function handleBoardForm(form) {
+  const action = form.getAttribute('data-board-form') || '';
+  const card = form.closest('[data-story-id]');
+  const payload = {action};
+  if (card) payload.id = Number(card.getAttribute('data-story-id') || 0);
+  if (action === 'comment') {
+    payload.comment = formValue(form, 'comment');
+    if (!payload.id || !payload.comment) {
+      setSyncStatus('Story comment is required.', 'is-stale');
+      return;
+    }
+  } else {
+    payload.body = formValue(form, 'body');
+    payload.lane = 'backlog';
+    if (!payload.body) {
+      setSyncStatus('Story is required.', 'is-stale');
+      return;
+    }
+  }
+  try {
+    await postJSON('/api/actions/board', payload);
+    window.location.reload();
+  } catch (err) {
+    setSyncStatus(compactError(err), 'is-stale');
+  }
+}
+
+async function handleBoardAction(button) {
+  const action = button.getAttribute('data-board-action') || '';
+  if (action === 'new') {
+    await createBoardStory();
+    return;
+  }
+  const card = button.closest('[data-story-id]');
+  const id = Number(card?.getAttribute('data-story-id') || 0);
+  if (!id || !action) return;
+  try {
+    await postJSON('/api/actions/board', {action, id});
+    window.location.reload();
+  } catch (err) {
+    setSyncStatus(compactError(err), 'is-stale');
+  }
+}
+
+async function createBoardStory() {
+  if (!hasCapability('push')) {
+    setSyncStatus('Your current broker role does not allow this action.', 'is-stale');
+    return;
+  }
+  const body = await promptModal({
+    cardClass: 'story-modal-card',
+    confirm: 'Add story',
+    inputLabel: 'Story',
+    multiline: true,
+    placeholder: 'As a contributor, I want to describe the work in one clear sentence, so that the team understands the value.',
+    rows: 6,
+  });
+  if (body === false) return;
+  const story = String(body || '').trim();
+  if (!story) {
+    setSyncStatus('Story is required.', 'is-stale');
+    return;
+  }
+  try {
+    await postJSON('/api/actions/board', {action: 'create', body: story, lane: 'backlog'});
+    window.location.reload();
+  } catch (err) {
+    setSyncStatus(compactError(err), 'is-stale');
+  }
+}
+
+async function handleBoardLaneChange(select) {
+  const card = select.closest('[data-story-id]');
+  const id = Number(card?.getAttribute('data-story-id') || 0);
+  const lane = select.value;
+  if (card?.classList.contains('is-committing')) {
+    hideBoardLaneSelect(select);
+    return;
+  }
+  if (!id || !lane) return;
+  const moved = await moveBoardStory(id, lane);
+  if (moved) hideBoardLaneSelect(select);
+}
+
+async function moveBoardStory(id, lane) {
+  const card = findBoardStoryCard(id);
+  const targetLane = findBoardLane(lane);
+  if (card && targetLane) {
+    return await moveBoardStoryOptimistically(card, targetLane, lane);
+  }
+  try {
+    await postJSON('/api/actions/board', {action: 'move', id, lane});
+    window.location.reload();
+    return true;
+  } catch (err) {
+    setSyncStatus(compactError(err), 'is-stale');
+    return false;
+  }
+}
+
+async function moveBoardStoryOptimistically(card, targetLane, lane) {
+  const id = Number(card.getAttribute('data-story-id') || 0);
+  const fromLane = card.getAttribute('data-story-lane') || '';
+  if (!id || !lane || fromLane === lane || card.classList.contains('is-committing')) return true;
+  const originalParent = card.parentElement;
+  const originalNextSibling = card.nextElementSibling;
+  const laneSelect = card.querySelector('[data-board-lane]');
+
+  targetLane.appendChild(card);
+  card.setAttribute('data-story-lane', lane);
+  if (laneSelect) laneSelect.value = lane;
+  setBoardStoryCommitting(card, true);
+  try {
+    await postJSON('/api/actions/board', {action: 'move', id, lane});
+    setBoardStoryCommitting(card, false);
+    return true;
+  } catch (err) {
+    if (originalParent) {
+      originalParent.insertBefore(card, originalNextSibling && originalNextSibling.parentElement === originalParent ? originalNextSibling : null);
+    }
+    card.setAttribute('data-story-lane', fromLane);
+    if (laneSelect) laneSelect.value = fromLane;
+    setBoardStoryCommitting(card, false);
+    setSyncStatus(compactError(err), 'is-stale');
+    return false;
+  }
+}
+
+function hideBoardLaneSelect(select) {
+  const actions = select.closest('.story-actions, .story-detail-actions');
+  select.hidden = true;
+  actions?.classList.remove('is-moving');
+  actions?.closest('[data-story-id]')?.classList.remove('is-menu-open');
+}
+
+function cancelBoardMove(select) {
+  const card = select.closest('[data-story-id]');
+  const currentLane = card?.getAttribute('data-story-lane') || '';
+  if (currentLane) select.value = currentLane;
+  hideBoardLaneSelect(select);
+}
+
+function setBoardStoryCommitting(card, committing) {
+  card.classList.toggle('is-committing', !!committing);
+  card.setAttribute('aria-busy', committing ? 'true' : 'false');
+  let spinner = card.querySelector('[data-story-commit-spinner]');
+  if (committing && !spinner) {
+    spinner = document.createElement('span');
+    spinner.className = 'story-commit-spinner';
+    spinner.setAttribute('data-story-commit-spinner', '');
+    spinner.setAttribute('aria-label', 'Committing');
+    const title = card.querySelector('.story-card-title');
+    title?.insertBefore(spinner, title.querySelector('.story-actions'));
+  } else if (!committing && spinner) {
+    spinner.remove();
+  }
+  for (const control of card.querySelectorAll('button, select, textarea, input')) {
+    control.disabled = !!committing;
+  }
+  if (!committing) applyCapabilityUI();
+}
+
+function findBoardStoryCard(id) {
+  for (const card of document.querySelectorAll('[data-story-id]')) {
+    if (Number(card.getAttribute('data-story-id') || 0) === Number(id || 0)) return card;
+  }
+  return null;
+}
+
+function findBoardLane(lane) {
+  for (const el of document.querySelectorAll('[data-board-drop-lane]')) {
+    if ((el.getAttribute('data-board-drop-lane') || '') === lane) return el;
+  }
+  return null;
+}
+
+function clearBoardDropTargets() {
+  for (const lane of document.querySelectorAll('[data-board-drop-lane].is-drop-target')) {
+    lane.classList.remove('is-drop-target');
+  }
+}
+
+async function handleBoardReassignChange(select) {
+  const card = select.closest('[data-story-id]');
+  const id = Number(card?.getAttribute('data-story-id') || 0);
+  if (!id) return;
+  const value = select.value;
+  const assignee = value === '__unassigned__' ? '' : value;
+  try {
+    await postJSON('/api/actions/board', {action: 'assign', id, assignee});
+    window.location.reload();
+  } catch (err) {
+    setSyncStatus(compactError(err), 'is-stale');
+  }
+}
+
+function cancelBoardReassign(select) {
+  const actions = select.closest('.story-actions, .story-detail-actions');
+  const toggle = actions ? actions.querySelector('[data-board-reassign-toggle]') : null;
+  select.hidden = true;
+  actions?.classList.remove('is-reassigning');
+  actions?.closest('[data-story-id]')?.classList.remove('is-menu-open');
+  if (toggle) toggle.focus();
 }
 
 function setSettingsBusy(busy) {
@@ -1213,6 +1785,86 @@ async function handlePullRequestAction(trigger) {
   }
 }
 
+function setupPullRequestCreatePage() {
+  const form = document.querySelector('[data-pr-create-form]');
+  if (!form) return;
+  form.querySelector('[data-pr-create-source]')?.addEventListener('change', updatePullRequestCreateSummary);
+  form.querySelector('[data-pr-create-target]')?.addEventListener('change', updatePullRequestCreateSummary);
+  updatePullRequestCreateSummary();
+}
+
+let prCreatePreviewTimer = 0;
+
+function updatePullRequestCreateSummary() {
+  const form = document.querySelector('[data-pr-create-form]');
+  if (!form) return;
+  const source = form.elements.source?.selectedOptions?.[0]?.textContent || shortRefName(form.elements.source?.value || '');
+  const target = form.elements.target?.selectedOptions?.[0]?.textContent || shortRefName(form.elements.target?.value || '');
+  const summary = form.querySelector('[data-pr-create-summary]');
+  if (!summary) return;
+  if (form.elements.source?.value === form.elements.target?.value) {
+    summary.classList.add('is-error');
+    summary.textContent = 'There is nothing to compare when base and compare are the same branch.';
+    renderPullRequestCreateDiff('<div class="empty">Choose different branches to preview the diff.</div>');
+    return;
+  }
+  summary.classList.remove('is-error');
+  summary.textContent = 'Compare ' + source + ' into ' + target + '.';
+  window.clearTimeout(prCreatePreviewTimer);
+  prCreatePreviewTimer = window.setTimeout(loadPullRequestCreateDiff, 180);
+}
+
+async function loadPullRequestCreateDiff() {
+  const form = document.querySelector('[data-pr-create-form]');
+  if (!form) return;
+  const source = form.elements.source?.value || '';
+  const target = form.elements.target?.value || '';
+  if (!source || !target || source === target) return;
+  renderPullRequestCreateDiff('<div class="empty">Loading diff...</div>');
+  try {
+    const data = await fetchJSON('/api/diff?source=' + encodeURIComponent(source) + '&target=' + encodeURIComponent(target));
+    const state = data.mergeable ? '<div class="pr-mergeability is-clean">Mergeable without conflicts</div>' : '<div class="pr-mergeability is-conflict">' + escapeHTML(data.conflict || 'Potential merge conflicts') + '</div>';
+    renderPullRequestCreateDiff(state + (data.html || '<div class="empty">No diff available.</div>'));
+  } catch (err) {
+    renderPullRequestCreateDiff('<div class="settings-error">' + escapeHTML(compactError(err)) + '</div>');
+  }
+}
+
+function renderPullRequestCreateDiff(html) {
+  const target = document.querySelector('[data-pr-create-diff]');
+  if (target) target.innerHTML = html;
+}
+
+async function handlePullRequestCreate(form) {
+  const source = form.elements.source?.value || '';
+  const target = form.elements.target?.value || '';
+  if (!source || !target || source === target) {
+    updatePullRequestCreateSummary();
+    return;
+  }
+  const button = form.querySelector('button[type="submit"]');
+  if (button) button.disabled = true;
+  try {
+    const data = await postJSON('/api/actions/pr', {
+      action: 'create',
+      source,
+      target,
+      title: formValue(form, 'title'),
+      body: formValue(form, 'body')
+    });
+    const id = Number(data?.pr?.id || 0);
+    window.location.href = id ? '/prs/' + id : '/prs';
+  } catch (err) {
+    setSyncStatus(compactError(err), 'is-stale');
+  } finally {
+    if (button) button.disabled = false;
+  }
+}
+
+function shortRefName(ref) {
+  return String(ref || '').replace(/^refs\/heads\//, '').replace(/^refs\/tags\//, '');
+}
+
 function showPullRequestReplyEditor(trigger) {
   const panel = trigger.closest('[data-pr-id]');
   if (!panel) return;
@@ -1578,9 +2230,13 @@ function modalDialog(options) {
     overlay.className = 'modal-overlay';
     const files = Array.isArray(options.files) ? options.files : [];
     const fileListHTML = files.length ? '<div class="modal-file-list"><div>Files to commit</div><ul>' + files.map(function (file) { return '<li>' + escapeHTML(file) + '</li>'; }).join('') + '</ul></div>' : '';
-    const fieldHTML = options.multiline ? '<textarea data-modal-input rows="' + escapeHTML(String(options.rows || 5)) + '" autocomplete="off"></textarea>' : '<input type="text" data-modal-input autocomplete="off">';
+    const placeholder = options.placeholder ? ' placeholder="' + escapeHTML(options.placeholder) + '"' : '';
+    const fieldHTML = options.multiline ? '<textarea data-modal-input rows="' + escapeHTML(String(options.rows || 5)) + '" autocomplete="off"' + placeholder + '></textarea>' : '<input type="text" data-modal-input autocomplete="off"' + placeholder + '>';
     const inputHTML = options.prompt ? '<label class="modal-field"><span>' + escapeHTML(options.inputLabel || 'Value') + '</span>' + fieldHTML + '</label><div class="modal-error" data-modal-error hidden></div>' : '';
-    overlay.innerHTML = '<div class="modal-card" role="dialog" aria-modal="true"><h2>' + escapeHTML(options.title || '') + '</h2><p>' + escapeHTML(options.body || '') + '</p>' + fileListHTML + inputHTML + '<div class="modal-actions"><button type="button" class="button-link" data-modal-cancel>Cancel</button><button type="button" class="button-link primary" data-modal-confirm>' + escapeHTML(options.confirm || 'OK') + '</button></div></div>';
+    const titleHTML = options.title ? '<h2>' + escapeHTML(options.title || '') + '</h2>' : '';
+    const bodyHTML = options.body ? '<p>' + escapeHTML(options.body || '') + '</p>' : '';
+    const cardClass = 'modal-card' + (options.cardClass ? ' ' + escapeHTML(options.cardClass) : '');
+    overlay.innerHTML = '<div class="' + cardClass + '" role="dialog" aria-modal="true">' + titleHTML + bodyHTML + fileListHTML + inputHTML + '<div class="modal-actions"><button type="button" class="button-link" data-modal-cancel>Cancel</button><button type="button" class="button-link primary" data-modal-confirm>' + escapeHTML(options.confirm || 'OK') + '</button></div></div>';
     document.body.appendChild(overlay);
     const input = overlay.querySelector('[data-modal-input]');
     const error = overlay.querySelector('[data-modal-error]');

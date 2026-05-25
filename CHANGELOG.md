@@ -4,6 +4,31 @@ All notable changes to `bgit` are documented in this file.
 
 This project follows semantic versioning.
 
+## 1.1.3
+
+Added
+
+- Added a broker-backed Task board for low-friction story tracking, with
+  backlog/ready/doing/review/done lanes, story comments, taking and reassigning
+  stories, drag-and-drop lane moves, optimistic committing state, an "Only me"
+  filter, and repo-prefixed story IDs.
+- Added `bgit board` commands for listing, creating, moving, taking, and
+  commenting on task-board stories.
+- Added a `bgit web` pull-request creation flow with base/compare branch
+  selection, diff preview, and mergeability/conflict status before creating the
+  PR.
+- Added user profile settings in `bgit web`, including bio, SSH-key display,
+  avatar upload, drag-to-pan cropping, and zoom controls.
+- Added QoL feature `bgit admin broker upgrade`, which upgrades the broker associated with
+  the current repository profile without going through the setup UI.
+
+Fixed
+
+- `bgit pull` defaults to the currently checked-out branch when no branch is
+  provided, instead of using `bucketgit.branch` from repository configuration.
+- Updated `golang.org/x/crypto`, `google.golang.org/grpc`, and the AWS S3 SDK
+  to address dependency security advisories.
+
 ## 1.1.2
 
 Fixed

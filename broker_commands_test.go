@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -130,6 +131,219 @@ func TestInitBrokerWorktreeOmitsIdentityWhenUnset(t *testing.T) {
 	}
 	if out, err := runGit(target, "config", "--local", "--get", "user.email"); err == nil {
 		t.Fatalf("user.email should not be set, got %q", strings.TrimSpace(string(out)))
+	}
+}
+
+func TestBoardCommandCreatesAndMovesStories(t *testing.T) {
+	var createReq brokerIssueRequest
+	var moveReq brokerIssueRequest
+	target, server, requests := setupBrokerCommandTestRepo(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/issues/create":
+			if err := json.NewDecoder(r.Body).Decode(&createReq); err != nil {
+				t.Fatal(err)
+			}
+			_, _ = w.Write([]byte(`{"issue":{"id":7,"type":"story","title":"Ship board","lane":"backlog"}}`))
+		case "/issues/move":
+			if err := json.NewDecoder(r.Body).Decode(&moveReq); err != nil {
+				t.Fatal(err)
+			}
+			_, _ = w.Write([]byte(`{"ok":true}`))
+		default:
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+	})
+	defer server.Close()
+	oldDir, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(oldDir)
+	if err := os.Chdir(target); err != nil {
+		t.Fatal(err)
+	}
+	var stdout bytes.Buffer
+	if err := boardCommand([]string{"create", "As", "a", "maintainer,", "I", "want", "to", "track", "stories,", "so", "that", "work", "is", "visible."}, strings.NewReader(""), &stdout); err != nil {
+		t.Fatal(err)
+	}
+	wantStory := "As a maintainer, I want to track stories, so that work is visible."
+	if createReq.Type != "story" || createReq.Title != wantStory || createReq.Body != wantStory || createReq.Lane != "backlog" {
+		t.Fatalf("create req = %#v", createReq)
+	}
+	if !strings.Contains(stdout.String(), "created story AP-7") {
+		t.Fatalf("stdout = %q", stdout.String())
+	}
+	stdout.Reset()
+	if err := boardCommand([]string{"move", "AP-7", "review"}, strings.NewReader(""), &stdout); err != nil {
+		t.Fatal(err)
+	}
+	if moveReq.ID != 7 || moveReq.Lane != "review" {
+		t.Fatalf("move req = %#v", moveReq)
+	}
+	if got := strings.Join(*requests, ","); got != "/issues/create,/issues/move" {
+		t.Fatalf("requests = %s", got)
+	}
+}
+
+func TestBoardCommandListsStoriesByLane(t *testing.T) {
+	target, server, _ := setupBrokerCommandTestRepo(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/issues/list" {
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+		_, _ = w.Write([]byte(`{"issues":[{"id":1,"type":"story","title":"Backlog item","lane":"backlog"},{"id":2,"type":"story","title":"Needs review","lane":"review","assignee":"ada"},{"id":3,"type":"issue","title":"Bug","lane":"doing"}]}`))
+	})
+	defer server.Close()
+	oldDir, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(oldDir)
+	if err := os.Chdir(target); err != nil {
+		t.Fatal(err)
+	}
+	var stdout bytes.Buffer
+	if err := boardCommand([]string{"list"}, strings.NewReader(""), &stdout); err != nil {
+		t.Fatal(err)
+	}
+	out := stdout.String()
+	for _, want := range []string{"backlog\n", "AP-1\tBacklog item", "review\n", "AP-2\tNeeds review\t@ada"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("missing %q in:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "Bug") {
+		t.Fatalf("issue leaked into board list:\n%s", out)
+	}
+}
+
+func TestSortedBoardAssigneesDeduplicatesCaseInsensitive(t *testing.T) {
+	got := sortedBoardAssignees([]string{"zoe", "Ada", "ada", "", "mike"})
+	want := []string{"Ada", "mike", "zoe"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("assignees = %#v, want %#v", got, want)
+	}
+}
+
+func TestRepoMonogramAndStoryDisplayID(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		want string
+	}{
+		{name: "app.git", want: "AP"},
+		{name: "bucket-git", want: "BG"},
+		{name: "team/bucketgit.git", want: "BU"},
+		{name: "bucket_git_web", want: "BGW"},
+	} {
+		if got := repoMonogram(tc.name); got != tc.want {
+			t.Fatalf("repoMonogram(%q) = %q, want %q", tc.name, got, tc.want)
+		}
+	}
+	if got := storyDisplayID("BG", 42); got != "BG-42" {
+		t.Fatalf("storyDisplayID = %q", got)
+	}
+}
+
+func TestUniqueUserMonogramsDisambiguateCollisions(t *testing.T) {
+	got := uniqueUserMonograms([]string{"dennis", "denise", "deborah", "derek", "derek1", "derek2"})
+	want := map[string]string{
+		"deborah": "DEB",
+		"denise":  "DE3",
+		"dennis":  "DE4",
+		"derek":   "DER",
+		"derek1":  "DE1",
+		"derek2":  "DE2",
+	}
+	for user, wantLabel := range want {
+		if got[user] != wantLabel {
+			t.Fatalf("monogram for %s = %q, want %q (all: %#v)", user, got[user], wantLabel, got)
+		}
+	}
+}
+
+func TestUniqueUserMonogramsPreferNumericUsernameSuffix(t *testing.T) {
+	users := make([]string, 0, 15)
+	for i := 1; i <= 15; i++ {
+		users = append(users, fmt.Sprintf("prosus-user-%d", i))
+	}
+	got := uniqueUserMonograms(users)
+	for i := 1; i <= 9; i++ {
+		user := fmt.Sprintf("prosus-user-%d", i)
+		want := fmt.Sprintf("PR%d", i)
+		if got[user] != want {
+			t.Fatalf("monogram for %s = %q, want %q (all: %#v)", user, got[user], want, got)
+		}
+	}
+	for i := 10; i <= 15; i++ {
+		user := fmt.Sprintf("prosus-user-%d", i)
+		want := fmt.Sprintf("P%d", i)
+		if got[user] != want {
+			t.Fatalf("monogram for %s = %q, want %q (all: %#v)", user, got[user], want, got)
+		}
+	}
+}
+
+func TestUniqueUserMonogramsCounterFallbackStartsAtOne(t *testing.T) {
+	got := uniqueUserMonograms([]string{"aaab", "aaac", "aaad"})
+	want := map[string]string{
+		"aaab": "AA1",
+		"aaac": "AA2",
+		"aaad": "AA3",
+	}
+	for user, wantLabel := range want {
+		if got[user] != wantLabel {
+			t.Fatalf("monogram for %s = %q, want %q (all: %#v)", user, got[user], wantLabel, got)
+		}
+	}
+}
+
+func TestParseBoardStoryIDArgRequiresRepoPrefix(t *testing.T) {
+	got, err := parseBoardStoryIDArg([]string{"move", "AP-7"}, "AP")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != 7 {
+		t.Fatalf("id = %d, want 7", got)
+	}
+	if _, err := parseBoardStoryIDArg([]string{"move", "7"}, "AP"); err == nil {
+		t.Fatal("expected bare board story id to be rejected")
+	}
+}
+
+func TestBrokerUpgradeTargetUsesCurrentRepoProfile(t *testing.T) {
+	global := globalConfig{GCPProfiles: []globalGCPProfile{{
+		Name: "work",
+		Regions: []globalProfileRegion{{
+			Name:      "europe-west1",
+			BrokerURL: "https://broker.example.test",
+		}},
+	}}}
+	got, err := brokerUpgradeTargetForCurrentRepo(config{
+		brokerURL:           "https://broker.example.test",
+		gcloudConfiguration: "gcp:work/europe-west1",
+		region:              "europe-west1",
+	}, global)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Provider != "gcs" || got.Name != "work" || got.Region != "europe-west1" || got.BrokerURL != "https://broker.example.test" {
+		t.Fatalf("target = %#v", got)
+	}
+}
+
+func TestBrokerUpgradeTargetFallsBackToBrokerURL(t *testing.T) {
+	global := globalConfig{AWSProfiles: []globalAWSProfile{{
+		Name: "prod",
+		Regions: []globalProfileRegion{{
+			Name:      "us-east-1",
+			BrokerURL: "https://abc.lambda-url.us-east-1.on.aws/",
+		}},
+	}}}
+	got, err := brokerUpgradeTargetForCurrentRepo(config{brokerURL: "https://abc.lambda-url.us-east-1.on.aws"}, global)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Provider != "s3" || got.Name != "prod" || got.Region != "us-east-1" {
+		t.Fatalf("target = %#v", got)
 	}
 }
 

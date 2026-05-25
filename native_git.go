@@ -389,10 +389,6 @@ func (r *nativeGitRepo) pull(ctx context.Context, args []string, stdout io.Write
 	if len(rest) > 1 {
 		return errors.New("pull accepts at most one branch")
 	}
-	branch := r.cfg.branch
-	if len(rest) == 1 {
-		branch = rest[0]
-	}
 	worktree, err := requireWorktree(".")
 	if err != nil {
 		return err
@@ -406,6 +402,12 @@ func (r *nativeGitRepo) pull(ctx context.Context, args []string, stdout io.Write
 	localRepo, err := openLocalRepository(worktree)
 	if err != nil {
 		return err
+	}
+	branch := ""
+	if len(rest) == 1 {
+		branch = rest[0]
+	} else {
+		branch = firstNonEmpty(localRepo.currentBranch(), r.cfg.branch, defaultBranch)
 	}
 	remoteHash, err := localRepo.resolveRevision("refs/remotes/bucketgit/" + shortBranchName(branch))
 	if err != nil {

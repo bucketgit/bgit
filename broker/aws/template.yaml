@@ -385,6 +385,47 @@ Resources:
           async function saveBrokerUsers(entry) {
             await db.send(new PutItemCommand({TableName: table, Item: {id: {S: entry.id}, data: {S: JSON.stringify(entry.data)}}}));
           }
+          function publicProfileForUser(user) {
+            const profile = user && user.profile || {};
+            return {bio: String(profile.bio || ""), avatar: String(profile.avatar || "")};
+          }
+          function normalizeProfileAvatar(value) {
+            value = String(value || "").trim();
+            if (!value) return "";
+            if (value.length > 700000) throw Object.assign(new Error("avatar is too large"), {statusCode: 400});
+            if (!/^data:image\/(png|jpeg|webp);base64,[A-Za-z0-9+/=]+$/.test(value)) throw Object.assign(new Error("avatar must be a cropped image data URL"), {statusCode: 400});
+            return value;
+          }
+          function profileKeysForUser(entry, users, actor) {
+            const keys = [];
+            const seen = new Set();
+            const addKey = (item) => {
+              const publicKey = normalizeKey(item && (item.public_key || item));
+              if (!publicKey || seen.has(publicKey)) return;
+              seen.add(publicKey);
+              keys.push({public_key: publicKey, fingerprint: keyFingerprint(publicKey), source: item.source || ""});
+            };
+            const username = String(actor.user || "").trim().toLowerCase();
+            const brokerUser = (users.data.users || []).find((item) => String(item.username || item.id || "").trim().toLowerCase() === username);
+            for (const key of brokerUser && brokerUser.keys || []) addKey(key);
+            for (const key of entry.data.keys || []) {
+              if (String(key.user || "").trim().toLowerCase() === username) addKey(key);
+            }
+            if (actor.public_key) addKey({public_key: actor.public_key, source: actor.source || ""});
+            return keys;
+          }
+          function ensureProfileUser(users, actor) {
+            const username = String(actor.user || "").trim();
+            if (!username) throw Object.assign(new Error("user is required"), {statusCode: 403});
+            let user = (users.data.users || []).find((item) => String(item.username || "").trim().toLowerCase() === username.toLowerCase());
+            if (!user) {
+              user = {id: actor.user_id || "u_" + cleanName(username), username, broker_role: "user", keys: [], suspended: false};
+              users.data.users.push(user);
+            }
+            if (actor.public_key && !user.keys.find((key) => normalizeKey(key.public_key || key) === normalizeKey(actor.public_key))) user.keys.push({public_key: actor.public_key, source: actor.source || "profile"});
+            user.profile = user.profile || {};
+            return user;
+          }
           function validBrokerRole(role) {
             return ["owner", "admin", "user"].includes(role);
           }
@@ -728,6 +769,48 @@ Resources:
             if (repoIsReadOnly(entry)) throw Object.assign(new Error("repository is read-only"), {statusCode: 403});
             if (repoIsPublic(entry)) return await effectiveSignedKey(event, entry) || anonymousKey();
             return await requireOperation(event, entry, "read");
+          }
+          async function requireBoardMutation(event, entry) {
+            return await requireOperation(event, entry, "write");
+          }
+          function normalizeBoardLane(value) {
+            const lane = String(value || "").trim().toLowerCase();
+            if (!lane || lane === "backlog") return "backlog";
+            if (lane === "ready" || lane === "todo" || lane === "to-do") return "ready";
+            if (lane === "doing" || lane === "in-progress" || lane === "in_progress" || lane === "progress") return "doing";
+            if (lane === "review" || lane === "in-review" || lane === "in_review") return "review";
+            if (lane === "done" || lane === "closed") return "done";
+            throw Object.assign(new Error("unknown board lane"), {statusCode: 400});
+          }
+          async function boardAssignableUsers(entry) {
+            const seen = new Set();
+            const users = [];
+            const addUser = (user, role, suspended) => {
+              user = String(user || "").trim();
+              if (!user || suspended || !roleAllows(normalizeRole(role || "read"), "write")) return;
+              const normalized = user.toLowerCase();
+              if (seen.has(normalized)) return;
+              seen.add(normalized);
+              users.push(user);
+            };
+            for (const key of entry.data.keys || []) {
+              addUser(key.user, key.role, key.suspended);
+            }
+            const brokerUsers = await loadBrokerUsers();
+            const usersByID = new Map((brokerUsers.data.users || []).map((user) => [user.id, user]));
+            for (const grant of entry.data.teams || []) {
+              const team = await loadTeam(grant.id || grant.team_id);
+              if (!team) continue;
+              for (const member of team.data.members || []) {
+                if (member.suspended) continue;
+                const user = usersByID.get(member.user_id);
+                if (!user || user.suspended || user.pending) continue;
+                const role = weakerRole(normalizeRole(member.role || "read"), normalizeRole(grant.role || "read"));
+                addUser(user.username || member.username || member.user_id, role, false);
+              }
+            }
+            users.sort((a, b) => a.toLowerCase().localeCompare(b.toLowerCase()));
+            return users;
           }
           function cleanObjectPath(value) {
             const path = String(value || "").replace(/^\/+/, "");
@@ -1671,11 +1754,12 @@ Resources:
               if (path === "/issues/create" && method === "POST") {
                 const entry = await loadRepo(body.repo);
                 if (entry.data.issues_enabled === false) throw Object.assign(new Error("issues are disabled"), {statusCode: 403});
-                const key = await requireIssueCreate(event, entry);
-                const title = String(body.title || "").trim();
+                const story = String(body.type || "").trim().toLowerCase() === "story";
+                const key = story ? await requireBoardMutation(event, entry) : await requireIssueCreate(event, entry);
                 const issueBody = String(body.body || "").trim();
-                if (!title) throw new Error("issue title is required");
-                const issue = {id: nextIssueID(entry.data), title, body: issueBody, status: "open", author: key.user || "anonymous", comments: [], created_at: new Date().toISOString(), updated_at: new Date().toISOString()};
+                const title = String(body.title || "").trim() || (story ? issueBody.replace(/\s+/g, " ").slice(0, 80) : "");
+                if (!title) throw new Error(story ? "story is required" : "issue title is required");
+                const issue = {id: nextIssueID(entry.data), type: story ? "story" : "issue", title, body: issueBody, status: "open", lane: story ? normalizeBoardLane(body.lane) : "", assignee: "", author: key.user || "anonymous", comments: [], created_at: new Date().toISOString(), updated_at: new Date().toISOString()};
                 await saveRepo(entry);
                 await saveIssue(entry, issue);
                 return response(200, {ok: true, issue});
@@ -1683,13 +1767,43 @@ Resources:
               if (path === "/issues/comment" && method === "POST") {
                 const entry = await loadRepo(body.repo);
                 if (entry.data.issues_enabled === false) throw Object.assign(new Error("issues are disabled"), {statusCode: 403});
-                const key = await requireIssueCreate(event, entry);
                 const issue = await loadIssue(entry, body.id);
                 if (!issue) throw Object.assign(new Error("issue not found"), {statusCode: 404});
+                const key = issue.type === "story" ? await requireBoardMutation(event, entry) : await requireIssueCreate(event, entry);
                 const comment = String(body.comment || "").trim();
                 if (!comment) throw new Error("comment is required");
                 issue.comments = issue.comments || [];
                 issue.comments.push({user: key.user || "anonymous", body: comment, at: new Date().toISOString()});
+                issue.updated_at = new Date().toISOString();
+                await saveIssue(entry, issue);
+                return response(200, {ok: true, issue});
+              }
+              if (path === "/issues/assignees" && method === "POST") {
+                const entry = await loadRepo(body.repo);
+                await requireBoardMutation(event, entry);
+                return response(200, {users: await boardAssignableUsers(entry)});
+              }
+              if (path === "/issues/move" || path === "/issues/take" || path === "/issues/assign") {
+                const entry = await loadRepo(body.repo);
+                const key = await requireBoardMutation(event, entry);
+                const issue = await loadIssue(entry, body.id);
+                if (!issue) throw Object.assign(new Error("issue not found"), {statusCode: 404});
+                if (issue.type !== "story") throw Object.assign(new Error("story not found"), {statusCode: 404});
+                if (path === "/issues/move") issue.lane = normalizeBoardLane(body.lane);
+                else if (path === "/issues/take") {
+                  issue.assignee = key.user || "";
+                  if (normalizeBoardLane(issue.lane) === "backlog") issue.lane = "doing";
+                } else {
+                  const assignee = String(body.assignee || "").trim();
+                  if (assignee) {
+                    const users = await boardAssignableUsers(entry);
+                    const canonical = users.find((user) => user.toLowerCase() === assignee.toLowerCase());
+                    if (!canonical) throw Object.assign(new Error("assignee is not assignable"), {statusCode: 400});
+                    issue.assignee = canonical;
+                  } else {
+                    issue.assignee = "";
+                  }
+                }
                 issue.updated_at = new Date().toISOString();
                 await saveIssue(entry, issue);
                 return response(200, {ok: true, issue});
@@ -1873,6 +1987,19 @@ Resources:
                   capabilities,
                   resolved_at: new Date().toISOString(),
                 });
+              }
+              if ((path === "/profile/get" || path === "/profile/update") && method === "POST") {
+                const entry = await loadRepo(body.repo);
+                const key = await effectiveSignedKey(event, entry);
+                if (!key) throw Object.assign(new Error("SSH signature required"), {statusCode: 403});
+                const users = await loadBrokerUsers();
+                const user = ensureProfileUser(users, key);
+                if (path === "/profile/update") {
+                  user.profile.bio = String(body.bio || "").trim().slice(0, 2000);
+                  user.profile.avatar = normalizeProfileAvatar(body.avatar || "");
+                  await saveBrokerUsers(users);
+                }
+                return response(200, {user: user.username || key.user || "", profile: publicProfileForUser(user), keys: profileKeysForUser(entry, users, key)});
               }
               if (path === "/repos/mine" && method === "POST") {
                 const fingerprint = header(event, "x-bgit-key-fingerprint") || "";

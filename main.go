@@ -147,6 +147,13 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 		}
 		return prCommand(cmdArgs, stdin, stdout)
 	}
+	if cmd == "board" || cmd == "kanban" {
+		if localCfg, err := readLocalConfig("."); err == nil {
+			cfg = mergeConfig(cfg, localCfg)
+			setBrokerIdentityPreference(cfg.identity)
+		}
+		return boardCommand(cmdArgs, stdin, stdout)
+	}
 	if cmd == "issue" || cmd == "issues" {
 		if localCfg, err := readLocalConfig("."); err == nil {
 			cfg = mergeConfig(cfg, localCfg)
@@ -908,6 +915,7 @@ collaborate
    push       Update remote refs and upload objects
    ls-remote  List remote refs
    pr         Create, review, merge, and close pull requests
+   board      Manage the repository task board
    issue      Create, comment on, close, and reopen issues
 
 administer
@@ -1050,6 +1058,7 @@ Configure a direct bucketgit origin using Git remote syntax.
 `,
 		"admin": `usage:
   bgit admin keys list|add|remove|suspend|import-github [args]
+  bgit admin broker upgrade
   bgit admin broker-users list|upsert USER [--role admin|user] [--key PATH_OR_PUBLIC_KEY]|delete USER
   bgit admin teams list|create NAME|delete TEAM|member add TEAM USER [--role ROLE]|member remove TEAM USER
   bgit admin teams repo list|repo add TEAM ROLE|repo remove TEAM
@@ -1073,6 +1082,7 @@ Broker-backed repository administration. Cloud IAM and bucket-policy
 administration moved to bgit direct admin.
 
 examples:
+  bgit admin broker upgrade
   bgit admin keys list
   bgit admin keys add --user ada --role developer --key ~/.ssh/ada.pub
   bgit admin keys import-github octocat --role read
@@ -1100,6 +1110,17 @@ examples:
 
 Broker-backed repository issues. Public repositories allow anonymous issue
 creation; private repositories require membership.
+`,
+		"board": `usage:
+  bgit board list
+  bgit board create STORY
+  bgit board move STORY_ID backlog|ready|doing|review|done
+  bgit board take STORY_ID
+  bgit board comment STORY_ID COMMENT
+
+Broker-backed repository task board. The board is available immediately for
+broker-backed repositories and stores stories in repository metadata. Viewers
+can read the board; developers and higher can create, take, move, and comment.
 `,
 		"pr": `usage:
   bgit pr create [--title TITLE] [--body BODY] [--source BRANCH] [--target BRANCH]

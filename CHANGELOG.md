@@ -26,6 +26,8 @@ Fixed
 
 - `bgit pull` defaults to the currently checked-out branch when no branch is
   provided, instead of using `bucketgit.branch` from repository configuration.
+- Updated `golang.org/x/crypto`, `google.golang.org/grpc`, and the AWS S3 SDK
+  to address dependency security advisories.
 
 ## 1.1.2
 

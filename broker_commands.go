@@ -17,6 +17,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 )
 
 type brokerProfile struct {
@@ -34,9 +35,11 @@ func brokerAdminCommand(cfg config, args []string, stdout io.Writer) error {
 
 func brokerAdminCommandWithInput(cfg config, args []string, stdin io.Reader, stdout io.Writer) error {
 	if len(args) == 0 {
-		return errors.New("usage: bgit admin keys|broker-users|teams|repo create|repo|owner|protect|members|confirm-ownership-transfer|accept-ownership-transfer|cancel-ownership-transfer|invite-user|accept-invite|cancel-invite|invite-broker-user|accept-broker-invite|cancel-broker-invite [args]\n\nCloud IAM administration moved to bgit direct admin.")
+		return errors.New("usage: bgit admin keys|broker|broker-users|teams|repo create|repo|owner|protect|members|confirm-ownership-transfer|accept-ownership-transfer|cancel-ownership-transfer|invite-user|accept-invite|cancel-invite|invite-broker-user|accept-broker-invite|cancel-broker-invite [args]\n\nCloud IAM administration moved to bgit direct admin.")
 	}
 	switch args[0] {
+	case "broker":
+		return brokerAdminBrokerCommand(cfg, args[1:], stdin, stdout)
 	case "broker-users":
 		return brokerUsersCommand(cfg, args[1:], stdout)
 	case "teams":
@@ -70,6 +73,154 @@ func brokerAdminCommandWithInput(cfg config, args []string, stdin io.Reader, std
 	default:
 		return fmt.Errorf("unknown admin command %q", args[0])
 	}
+}
+
+func brokerAdminBrokerCommand(cfg config, args []string, stdin io.Reader, stdout io.Writer) error {
+	_ = stdin
+	if len(args) == 0 {
+		return errors.New("usage: bgit admin broker upgrade [--config PATH]")
+	}
+	switch args[0] {
+	case "upgrade":
+		return brokerAdminBrokerUpgradeCommand(cfg, args[1:], stdin, stdout)
+	default:
+		return fmt.Errorf("unknown admin broker command %q", args[0])
+	}
+}
+
+func brokerAdminBrokerUpgradeCommand(cfg config, args []string, stdin io.Reader, stdout io.Writer) error {
+	_ = stdin
+	configPath := ""
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		name, value, hasValue := strings.Cut(arg, "=")
+		switch name {
+		case "--config":
+			var err error
+			value, i, err = optionValue(args, i, hasValue, value, name)
+			if err != nil {
+				return err
+			}
+			configPath = expandHome(value)
+		default:
+			return fmt.Errorf("unsupported admin broker upgrade option %s", arg)
+		}
+	}
+	global, path, err := loadGlobalConfigForInit(configPath)
+	if err != nil {
+		return err
+	}
+	target, err := brokerUpgradeTargetForCurrentRepo(cfg, global)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(stdout, "Upgrading broker %s for %s:%s/%s\n", target.BrokerURL, setupProviderLabel(target.Provider), target.Name, target.Region)
+	return brokerUpgradeResolvedTarget(path, target, &global, stdout)
+}
+
+func brokerUpgradeResolvedTarget(path string, target brokerProfile, global *globalConfig, stdout io.Writer) error {
+	cfg := config{
+		provider:                    target.Provider,
+		gcloudConfiguration:         target.Name,
+		gcloudConfigurationExplicit: target.Name != "",
+		region:                      target.Region,
+	}
+	brokerURL, err := provisionBrokerURL(cfg, sshSetupOptions{region: target.Region}, stdout)
+	if err != nil {
+		return err
+	}
+	if err := brokerEnsureCoreTeam(brokerURL); err != nil {
+		return err
+	}
+	now := time.Now().UTC().Format(time.RFC3339)
+	switch target.Provider {
+	case "gcs":
+		existing := findGlobalGCPProfile(*global, target.Name)
+		serviceAccount := existing.ServiceAccount
+		if serviceAccount == "" && strings.TrimSpace(existing.ProjectID) != "" {
+			serviceAccount = gcpBrokerServiceAccountEmail(existing.ProjectID)
+		}
+		*global = upsertGlobalGCPProfile(*global, globalGCPProfile{
+			Name:           target.Name,
+			ProjectID:      existing.ProjectID,
+			Account:        existing.Account,
+			ServiceAccount: serviceAccount,
+			Regions: []globalProfileRegion{{
+				Name:          target.Region,
+				BrokerURL:     brokerURL,
+				BrokerVersion: brokerVersion,
+				LastSetupAt:   now,
+			}},
+		})
+	case "s3":
+		existing := findGlobalAWSProfile(*global, target.Name)
+		*global = upsertGlobalAWSProfile(*global, globalAWSProfile{
+			Name:      target.Name,
+			AccountID: existing.AccountID,
+			ARN:       existing.ARN,
+			Regions: []globalProfileRegion{{
+				Name:          target.Region,
+				BrokerURL:     brokerURL,
+				BrokerVersion: brokerVersion,
+				LastSetupAt:   now,
+			}},
+		})
+	default:
+		return fmt.Errorf("unsupported broker provider %q", target.Provider)
+	}
+	if err := writeGlobalConfig(path, *global); err != nil {
+		return err
+	}
+	fmt.Fprintf(stdout, "upgraded broker %s\n", brokerURL)
+	return nil
+}
+
+func findGlobalGCPProfile(cfg globalConfig, name string) globalGCPProfile {
+	for _, profile := range cfg.GCPProfiles {
+		if profile.Name == name {
+			return profile
+		}
+	}
+	return globalGCPProfile{Name: name}
+}
+
+func findGlobalAWSProfile(cfg globalConfig, name string) globalAWSProfile {
+	for _, profile := range cfg.AWSProfiles {
+		if profile.Name == name {
+			return profile
+		}
+	}
+	return globalAWSProfile{Name: name}
+}
+
+func brokerUpgradeTargetForCurrentRepo(cfg config, global globalConfig) (brokerProfile, error) {
+	profiles := brokerProfilesFromGlobalConfig(global)
+	if len(profiles) == 0 {
+		return brokerProfile{}, errors.New("no configured brokers found; run bgit setup first")
+	}
+	if strings.TrimSpace(cfg.gcloudConfiguration) != "" {
+		if profile, err := selectBrokerProfileForCommand(profiles, cfg.gcloudConfiguration, cfg.region, "bgit admin broker upgrade"); err == nil {
+			return profile, nil
+		}
+	}
+	if strings.TrimSpace(cfg.brokerURL) != "" {
+		want := normalizeBrokerURLForCompare(cfg.brokerURL)
+		var matches []brokerProfile
+		for _, profile := range profiles {
+			if normalizeBrokerURLForCompare(profile.BrokerURL) == want {
+				if strings.TrimSpace(cfg.region) == "" || profile.Region == cfg.region {
+					matches = append(matches, profile)
+				}
+			}
+		}
+		if len(matches) == 1 {
+			return matches[0], nil
+		}
+		if len(matches) > 1 {
+			return brokerProfile{}, ambiguousBrokerProfileError(cfg.brokerURL, "bgit admin broker upgrade", matches)
+		}
+	}
+	return brokerProfile{}, errors.New("current repository is not attached to a configured broker profile")
 }
 
 type brokerRepoAdminRequest struct {
@@ -1682,6 +1833,124 @@ func issueCommand(args []string, stdin io.Reader, stdout io.Writer) error {
 	}
 }
 
+func boardCommand(args []string, stdin io.Reader, stdout io.Writer) error {
+	_ = stdin
+	if len(args) == 0 {
+		return errors.New("usage: bgit board list|create|move|take|comment [args]")
+	}
+	cfg, err := configForBrokerCommand(config{})
+	if err != nil {
+		return err
+	}
+	monogram := repoMonogram(cfg.logicalRepo)
+	switch args[0] {
+	case "list":
+		var resp struct {
+			Issues []brokerIssue `json:"issues"`
+		}
+		if err := brokerPost(cfg.brokerURL, "/issues/list", brokerIssueRequest{Repo: repoForBroker(cfg), Type: "story"}, &resp); err != nil {
+			return err
+		}
+		for _, lane := range kanbanLanes() {
+			fmt.Fprintf(stdout, "%s\n", lane)
+			for _, issue := range resp.Issues {
+				if issue.Type != "story" || normalizeKanbanLane(issue.Lane) != lane {
+					continue
+				}
+				assignee := ""
+				if issue.Assignee != "" {
+					assignee = "\t@" + issue.Assignee
+				}
+				fmt.Fprintf(stdout, "  %s\t%s%s\n", storyDisplayID(monogram, issue.ID), issue.Title, assignee)
+			}
+		}
+		return nil
+	case "create":
+		story := ""
+		for i := 1; i < len(args); i++ {
+			arg := args[i]
+			name, value, hasValue := strings.Cut(arg, "=")
+			switch name {
+			case "--body":
+				value, i, err = optionValue(args, i, hasValue, value, name)
+				if err != nil {
+					return err
+				}
+				story = value
+			default:
+				if strings.HasPrefix(arg, "-") {
+					return fmt.Errorf("unsupported board create option %s", arg)
+				}
+				if story != "" {
+					story += " "
+				}
+				story += arg
+			}
+		}
+		if strings.TrimSpace(story) == "" {
+			return errors.New("usage: bgit board create STORY")
+		}
+		var resp struct {
+			Issue brokerIssue `json:"issue"`
+		}
+		if err := brokerPost(cfg.brokerURL, "/issues/create", brokerIssueRequest{Repo: repoForBroker(cfg), Type: "story", Title: storySummary(story), Body: story, Lane: "backlog"}, &resp); err != nil {
+			return err
+		}
+		fmt.Fprintf(stdout, "created story %s\n", storyDisplayID(monogram, resp.Issue.ID))
+		return nil
+	case "move":
+		if len(args) != 3 {
+			return errors.New("usage: bgit board move STORY_ID backlog|ready|doing|review|done")
+		}
+		id, err := parseBoardStoryIDArg(args[:2], monogram)
+		if err != nil {
+			return err
+		}
+		lane, err := parseKanbanLane(args[2])
+		if err != nil {
+			return err
+		}
+		if err := brokerPost(cfg.brokerURL, "/issues/move", brokerIssueRequest{Repo: repoForBroker(cfg), ID: id, Lane: lane}, nil); err != nil {
+			return err
+		}
+		fmt.Fprintf(stdout, "moved story %s to %s\n", storyDisplayID(monogram, id), lane)
+		return nil
+	case "take":
+		id, err := parseBoardStoryIDArg(args, monogram)
+		if err != nil {
+			return err
+		}
+		if err := brokerPost(cfg.brokerURL, "/issues/take", brokerIssueRequest{Repo: repoForBroker(cfg), ID: id}, nil); err != nil {
+			return err
+		}
+		fmt.Fprintf(stdout, "took story %s\n", storyDisplayID(monogram, id))
+		return nil
+	case "comment":
+		if len(args) < 3 {
+			return errors.New("usage: bgit board comment STORY_ID COMMENT")
+		}
+		id, err := parseBoardStoryIDArg(args[:2], monogram)
+		if err != nil {
+			return err
+		}
+		comment := strings.Join(args[2:], " ")
+		if err := brokerPost(cfg.brokerURL, "/issues/comment", brokerIssueRequest{Repo: repoForBroker(cfg), ID: id, Comment: comment}, nil); err != nil {
+			return err
+		}
+		fmt.Fprintf(stdout, "commented on story %s\n", storyDisplayID(monogram, id))
+		return nil
+	default:
+		return fmt.Errorf("unknown board command %q", args[0])
+	}
+}
+
+func parseBoardStoryIDArg(args []string, monogram string) (int, error) {
+	if len(args) != 2 {
+		return 0, errors.New("story id is required")
+	}
+	return parseStoryDisplayID(args[1], monogram)
+}
+
 func parseIssueIDArg(args []string) (int, error) {
 	if len(args) != 2 {
 		return 0, errors.New("issue id is required")
@@ -1691,6 +1960,35 @@ func parseIssueIDArg(args []string) (int, error) {
 		return 0, errors.New("issue id is required")
 	}
 	return id, nil
+}
+
+func kanbanLanes() []string {
+	return []string{"backlog", "ready", "doing", "review", "done"}
+}
+
+func normalizeKanbanLane(lane string) string {
+	normalized, err := parseKanbanLane(lane)
+	if err != nil {
+		return "backlog"
+	}
+	return normalized
+}
+
+func parseKanbanLane(lane string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(lane)) {
+	case "", "backlog":
+		return "backlog", nil
+	case "ready", "todo", "to-do":
+		return "ready", nil
+	case "doing", "in-progress", "in_progress", "progress":
+		return "doing", nil
+	case "review", "in-review", "in_review":
+		return "review", nil
+	case "done", "closed":
+		return "done", nil
+	default:
+		return "", fmt.Errorf("unknown board lane %q", lane)
+	}
 }
 
 func prCommand(args []string, stdin io.Reader, stdout io.Writer) error {

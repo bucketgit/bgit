@@ -2951,6 +2951,52 @@ func TestNativeGitRepoFetchCopiesObjectsAndRemoteRefs(t *testing.T) {
 	}
 }
 
+func TestNativeGitRepoPullDefaultsToCurrentBranch(t *testing.T) {
+	remoteRoot := createBareFixture(t)
+	worktree := t.TempDir()
+	if _, err := runGit("", "clone", remoteRoot, worktree); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runGit(worktree, "config", "user.name", "Ada"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runGit(worktree, "config", "user.email", "ada@example.com"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runGit(worktree, "checkout", "-b", "feature/dennis"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(worktree, "feature.txt"), []byte("feature\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runGit(worktree, "add", "feature.txt"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runGit(worktree, "commit", "-m", "Feature commit"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runGit(worktree, "push", remoteRoot, "HEAD:refs/heads/feature/dennis"); err != nil {
+		t.Fatal(err)
+	}
+
+	oldDir, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(oldDir)
+	if err := os.Chdir(worktree); err != nil {
+		t.Fatal(err)
+	}
+	repo := newNativeGitRepoForStore(config{branch: "main", origin: "gs://bucket/repo.git"}, &localGitStore{root: remoteRoot})
+	var stdout bytes.Buffer
+	if err := repo.pull(context.Background(), nil, &stdout); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(stdout.String(), "Already up to date.") {
+		t.Fatalf("stdout = %q", stdout.String())
+	}
+}
+
 func TestNativeGitRepoPushDefaultsToCurrentBranch(t *testing.T) {
 	root := t.TempDir()
 	remoteRoot := filepath.Join(root, "remote.git")

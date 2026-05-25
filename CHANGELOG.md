@@ -4,7 +4,7 @@ All notable changes to `bgit` are documented in this file.
 
 This project follows semantic versioning.
 
-## Unreleased changes (Develop)
+## 1.1.3
 
 Added
 

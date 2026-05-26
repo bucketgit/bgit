@@ -59,7 +59,8 @@ function loadGCPHandler() {
 
 function awsZipFileSource() {
   const template = fs.readFileSync(path.join(__dirname, 'aws/template.yaml'), 'utf8').split(/\r?\n/);
-  const start = template.findIndex((line) => line.includes('ZipFile: |'));
+  const broker = template.findIndex((line) => /^  BrokerFunction:/.test(line));
+  const start = template.findIndex((line, i) => i > broker && line.includes('ZipFile: |'));
   if (start < 0) throw new Error('AWS template ZipFile not found');
   const lines = [];
   for (let i = start + 1; i < template.length; i++) {
@@ -158,4 +159,3 @@ main().catch((err) => {
   console.error(err && err.stack || err);
   process.exit(1);
 });
-

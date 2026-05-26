@@ -1113,6 +1113,10 @@ func provisionGCPBrokerURLWithBootstrap(cfg config, opts sshSetupOptions, stdout
 	if err != nil {
 		return "", err
 	}
+	ciMaterializerURL, err := provisionGCPMaterializerURL(cfg, region, serviceAccount, ciSecret, stdout)
+	if err != nil {
+		return "", err
+	}
 	sourceDir, err := os.MkdirTemp("", "bgit-gcp-broker-*")
 	if err != nil {
 		return "", err
@@ -1132,7 +1136,7 @@ func provisionGCPBrokerURLWithBootstrap(cfg config, opts sshSetupOptions, stdout
 		"--trigger-http",
 		"--allow-unauthenticated",
 		"--service-account", serviceAccount,
-		"--set-env-vars", gcpBrokerEnvVars(cfg, opts, serviceAccount, region, ciSecret, bootstrapHash),
+		"--set-env-vars", gcpBrokerEnvVars(cfg, opts, serviceAccount, ciSecret, ciMaterializerURL, bootstrapHash),
 		"--quiet",
 	)
 	out, err := cmd.CombinedOutput()
@@ -1143,6 +1147,40 @@ func provisionGCPBrokerURLWithBootstrap(cfg config, opts sshSetupOptions, stdout
 		return "", err
 	}
 	return discoverGCPBrokerURL(cfg, opts)
+}
+
+func provisionGCPMaterializerURL(cfg config, region, serviceAccount, ciSecret string, stdout io.Writer) (string, error) {
+	sourceDir, err := os.MkdirTemp("", "bgit-gcp-materializer-*")
+	if err != nil {
+		return "", err
+	}
+	defer os.RemoveAll(sourceDir)
+	if err := writeGCPMaterializerSource(sourceDir); err != nil {
+		return "", err
+	}
+	fmt.Fprintf(stdout, "deploying GCP Cloud Run function bgit-ci-materializer in %s\n", region)
+	cmd := gcloudCommand(cfg.gcloudConfiguration,
+		"functions", "deploy", "bgit-ci-materializer",
+		"--gen2",
+		"--runtime", "nodejs22",
+		"--region", region,
+		"--source", sourceDir,
+		"--entry-point", "materializer",
+		"--trigger-http",
+		"--no-allow-unauthenticated",
+		"--service-account", serviceAccount,
+		"--set-env-vars", gcpMaterializerEnvVars(serviceAccount, ciSecret),
+		"--quiet",
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("deploy GCP bgit CI materializer: %w\n%s", err, strings.TrimSpace(string(out)))
+	}
+	url := discoverGCPMaterializerURL(cfg, region)
+	if strings.TrimSpace(url) == "" {
+		return "", errors.New("discover GCP bgit CI materializer URL")
+	}
+	return url, nil
 }
 
 func ensureGCPBrokerServices(cfg config, stdout io.Writer) error {
@@ -1285,7 +1323,7 @@ func ensureGCPBrokerRuntimePermissions(cfg config, serviceAccount string, stdout
 	if project == "" {
 		return errors.New("GCP project is not configured")
 	}
-	for _, role := range []string{"roles/datastore.user", "roles/storage.admin", "roles/cloudbuild.builds.editor", "roles/run.invoker"} {
+	for _, role := range []string{"roles/datastore.user", "roles/storage.admin", "roles/cloudbuild.builds.editor", "roles/run.invoker", "roles/iam.serviceAccountUser"} {
 		fmt.Fprintf(stdout, "granting GCP broker %s to %s\n", role, serviceAccount)
 		cmd := gcloudCommand(cfg.gcloudConfiguration,
 			"projects", "add-iam-policy-binding", project,
@@ -1469,7 +1507,7 @@ func gcpBrokerFirestoreDatabase(opts sshSetupOptions) string {
 	return firstNonEmpty(strings.TrimSpace(opts.firestoreDatabase), os.Getenv("BGIT_FIRESTORE_DATABASE"), "bgit")
 }
 
-func gcpBrokerEnvVars(cfg config, opts sshSetupOptions, serviceAccount, region, ciSecret, bootstrapHash string) string {
+func gcpBrokerEnvVars(cfg config, opts sshSetupOptions, serviceAccount, ciSecret, ciMaterializerURL, bootstrapHash string) string {
 	values := []string{
 		"FIRESTORE_DATABASE=" + gcpBrokerFirestoreDatabase(opts),
 		"BROKER_VERSION=" + brokerVersion,
@@ -1477,10 +1515,18 @@ func gcpBrokerEnvVars(cfg config, opts sshSetupOptions, serviceAccount, region, 
 		"BGIT_CI_MATERIALIZER_SECRET=" + ciSecret,
 		"BGIT_OWNER_BOOTSTRAP_HASH=" + bootstrapHash,
 	}
-	if v := discoverGCPMaterializerURL(cfg, region); v != "" {
-		values = append(values, "BGIT_CI_MATERIALIZER_URL="+v)
+	if strings.TrimSpace(ciMaterializerURL) != "" {
+		values = append(values, "BGIT_CI_MATERIALIZER_URL="+strings.TrimSpace(ciMaterializerURL))
 	}
 	return strings.Join(values, ",")
+}
+
+func gcpMaterializerEnvVars(serviceAccount, ciSecret string) string {
+	return strings.Join([]string{
+		"BROKER_VERSION=" + brokerVersion,
+		"BGIT_CI_MATERIALIZER_SECRET=" + ciSecret,
+		"BGIT_CI_BUILD_SERVICE_ACCOUNT=" + serviceAccount,
+	}, ",")
 }
 
 func ensureGCPMaterializerSecret(cfg config, serviceAccount string, stdout io.Writer) (string, error) {

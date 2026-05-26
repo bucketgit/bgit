@@ -112,7 +112,7 @@ Resources:
               - Effect: Allow
                 Action:
                   - lambda:InvokeFunction
-                Resource: !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${CiMaterializerFunctionName}
+                Resource: !GetAtt CiMaterializerFunction.Arn
   BrokerTable:
     Type: AWS::DynamoDB::Table
     Properties:
@@ -154,6 +154,292 @@ Resources:
           KeyType: HASH
         - AttributeName: repo_id
           KeyType: RANGE
+  CiSourceBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub bgit-ci-source-${AWS::AccountId}-${AWS::Region}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+  CiMaterializerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub bgit-ci-materializer-${AWS::Region}
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: bgit-ci-materializer
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource: arn:aws:s3:::*/*
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                Resource: !Sub ${CiSourceBucket.Arn}/*
+              - Effect: Allow
+                Action:
+                  - codebuild:StartBuild
+                  - codebuild:BatchGetBuilds
+                Resource: !GetAtt CiCodeBuildProject.Arn
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: !Ref CiMaterializerTokenSecret
+  CiCodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub bgit-codebuild-${AWS::Region}
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: bgit-codebuild
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:PutObject
+                Resource: !Sub ${CiSourceBucket.Arn}/*
+  CiCodeBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: bgit-ci
+      ServiceRole: !GetAtt CiCodeBuildRole.Arn
+      Artifacts:
+        Type: S3
+        Location: !Ref CiSourceBucket
+        Path: artifacts
+        NamespaceType: BUILD_ID
+        Packaging: ZIP
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_LARGE
+        Image: aws/codebuild/standard:7.0
+      Source:
+        Type: S3
+        Location: !Sub ${CiSourceBucket}/placeholder.zip
+      TimeoutInMinutes: 60
+  CiMaterializerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Ref CiMaterializerFunctionName
+      Runtime: nodejs22.x
+      Handler: index.handler
+      Role: !GetAtt CiMaterializerRole.Arn
+      Timeout: 120
+      MemorySize: 512
+      Environment:
+        Variables:
+          BGIT_CI_SOURCE_BUCKET: !Ref CiSourceBucket
+          BGIT_CI_CODEBUILD_PROJECT: !Ref CiCodeBuildProject
+          BGIT_CI_MATERIALIZER_SECRET_ARN: !Ref CiMaterializerTokenSecret
+          BROKER_VERSION: {{BROKER_VERSION}}
+      Code:
+        ZipFile: |
+          const crypto = require("crypto");
+          const zlib = require("zlib");
+          const {S3Client, GetObjectCommand, PutObjectCommand} = require("@aws-sdk/client-s3");
+          const {CodeBuildClient, StartBuildCommand} = require("@aws-sdk/client-codebuild");
+          const {SecretsManagerClient, GetSecretValueCommand} = require("@aws-sdk/client-secrets-manager");
+          const s3 = new S3Client({});
+          const codebuild = new CodeBuildClient({});
+          const secrets = new SecretsManagerClient({});
+          const brokerVersion = process.env.BROKER_VERSION || "{{BROKER_VERSION}}";
+          function http(statusCode, body) { return {statusCode, headers: {"content-type": "application/json"}, body: JSON.stringify(body)}; }
+          function cleanPath(path) {
+            const out = String(path || "").replace(/^\/+/, "");
+            if (!out || out.includes("\\") || out.includes("\0") || out.split("/").includes("..")) throw new Error("invalid path");
+            return out;
+          }
+          async function streamBytes(body) {
+            if (!body) return Buffer.alloc(0);
+            if (Buffer.isBuffer(body)) return body;
+            const chunks = [];
+            for await (const chunk of body) chunks.push(Buffer.from(chunk));
+            return Buffer.concat(chunks);
+          }
+          async function readObject(repo, path) {
+            const Bucket = String(repo.bucket || "").trim();
+            const prefix = String(repo.prefix || "").replace(/^\/+|\/+$/g, "");
+            if (!Bucket || !prefix) throw new Error("repo bucket/prefix is required");
+            const Key = prefix + "/" + cleanPath(path);
+            const out = await s3.send(new GetObjectCommand({Bucket, Key}));
+            return streamBytes(out.Body);
+          }
+          async function readLooseGitObject(repo, hash) {
+            if (!/^[0-9a-f]{40}$/i.test(hash)) throw new Error("invalid git object hash");
+            const compressed = await readObject(repo, "objects/" + hash.slice(0, 2) + "/" + hash.slice(2));
+            const raw = zlib.inflateSync(compressed);
+            const nul = raw.indexOf(0);
+            if (nul < 0) throw new Error("invalid git object");
+            const header = raw.subarray(0, nul).toString("utf8");
+            const space = header.indexOf(" ");
+            return {type: header.slice(0, space), data: raw.subarray(nul + 1)};
+          }
+          async function treeForCommit(repo, commitHash) {
+            const obj = await readLooseGitObject(repo, commitHash);
+            if (obj.type !== "commit") throw new Error("CI commit is not a commit object");
+            const match = /^tree ([0-9a-f]{40})$/m.exec(obj.data.toString("utf8"));
+            if (!match) throw new Error("commit has no tree");
+            return match[1];
+          }
+          async function collectTree(repo, treeHash, base, files) {
+            const obj = await readLooseGitObject(repo, treeHash);
+            if (obj.type !== "tree") throw new Error("tree object expected");
+            let pos = 0;
+            while (pos < obj.data.length) {
+              const space = obj.data.indexOf(0x20, pos);
+              const nul = obj.data.indexOf(0, space + 1);
+              if (space < 0 || nul < 0 || nul + 21 > obj.data.length) throw new Error("invalid tree object");
+              const mode = obj.data.subarray(pos, space).toString("utf8");
+              const name = obj.data.subarray(space + 1, nul).toString("utf8");
+              const hash = obj.data.subarray(nul + 1, nul + 21).toString("hex");
+              const path = base ? base + "/" + name : name;
+              pos = nul + 21;
+              if (mode === "40000") {
+                await collectTree(repo, hash, path, files);
+                continue;
+              }
+              const child = await readLooseGitObject(repo, hash);
+              if (child.type !== "blob") continue;
+              files.push({path, mode: mode === "100755" ? 0o755 : 0o644, data: child.data});
+            }
+          }
+          function crc32(buf) {
+            let crc = -1;
+            for (const byte of buf) {
+              crc ^= byte;
+              for (let i = 0; i < 8; i++) crc = (crc >>> 1) ^ (0xedb88320 & -(crc & 1));
+            }
+            return (crc ^ -1) >>> 0;
+          }
+          function dosTimeDate(date) {
+            const year = Math.max(1980, date.getUTCFullYear());
+            const time = (date.getUTCSeconds() >> 1) | (date.getUTCMinutes() << 5) | (date.getUTCHours() << 11);
+            const day = date.getUTCDate();
+            const dosDate = day | ((date.getUTCMonth() + 1) << 5) | ((year - 1980) << 9);
+            return {time, date: dosDate};
+          }
+          function sourceZip(files) {
+            const now = dosTimeDate(new Date());
+            const locals = [];
+            const centrals = [];
+            let offset = 0;
+            for (const file of files) {
+              const name = Buffer.from(file.path);
+              const crc = crc32(file.data);
+              const local = Buffer.alloc(30 + name.length);
+              local.writeUInt32LE(0x04034b50, 0);
+              local.writeUInt16LE(20, 4);
+              local.writeUInt16LE(0, 6);
+              local.writeUInt16LE(0, 8);
+              local.writeUInt16LE(now.time, 10);
+              local.writeUInt16LE(now.date, 12);
+              local.writeUInt32LE(crc, 14);
+              local.writeUInt32LE(file.data.length, 18);
+              local.writeUInt32LE(file.data.length, 22);
+              local.writeUInt16LE(name.length, 26);
+              name.copy(local, 30);
+              locals.push(local, file.data);
+              const central = Buffer.alloc(46 + name.length);
+              central.writeUInt32LE(0x02014b50, 0);
+              central.writeUInt16LE(20, 4);
+              central.writeUInt16LE(20, 6);
+              central.writeUInt16LE(0, 8);
+              central.writeUInt16LE(0, 10);
+              central.writeUInt16LE(now.time, 12);
+              central.writeUInt16LE(now.date, 14);
+              central.writeUInt32LE(crc, 16);
+              central.writeUInt32LE(file.data.length, 20);
+              central.writeUInt32LE(file.data.length, 24);
+              central.writeUInt16LE(name.length, 28);
+              central.writeUInt32LE((file.mode & 0xffff) << 16, 38);
+              central.writeUInt32LE(offset, 42);
+              name.copy(central, 46);
+              centrals.push(central);
+              offset += local.length + file.data.length;
+            }
+            const centralSize = centrals.reduce((n, part) => n + part.length, 0);
+            const end = Buffer.alloc(22);
+            end.writeUInt32LE(0x06054b50, 0);
+            end.writeUInt16LE(files.length, 8);
+            end.writeUInt16LE(files.length, 10);
+            end.writeUInt32LE(centralSize, 12);
+            end.writeUInt32LE(offset, 16);
+            return Buffer.concat([...locals, ...centrals, end]);
+          }
+          async function materializerToken() {
+            const SecretId = process.env.BGIT_CI_MATERIALIZER_SECRET_ARN;
+            if (!SecretId) return "";
+            const out = await secrets.send(new GetSecretValueCommand({SecretId}));
+            return String(out.SecretString || "").trim();
+          }
+          async function verifyToken(headers) {
+            const want = await materializerToken();
+            if (!want) return;
+            const got = String((headers || {})["x-bgit-ci-token"] || (headers || {})["X-Bgit-Ci-Token"] || "").trim();
+            const a = Buffer.from(want);
+            const b = Buffer.from(got);
+            if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) throw Object.assign(new Error("invalid CI materializer token"), {statusCode: 403});
+          }
+          exports.handler = async (event) => {
+            try {
+              await verifyToken(event.headers || {});
+              const body = typeof event.body === "string" ? JSON.parse(event.body || "{}") : (event.body || {});
+              const repo = body.repo || {};
+              const run = body.run || {};
+              if (run.provider !== "aws") throw Object.assign(new Error("AWS materializer only accepts aws runs"), {statusCode: 400});
+              if (!/^[0-9a-f]{40}$/i.test(String(run.commit || ""))) throw Object.assign(new Error("invalid CI commit"), {statusCode: 400});
+              const files = [];
+              await collectTree(repo, await treeForCommit(repo, run.commit), "", files);
+              if (!files.some((file) => file.path === run.config)) throw Object.assign(new Error("CI config not found in commit: " + run.config), {statusCode: 400});
+              const Bucket = process.env.BGIT_CI_SOURCE_BUCKET;
+              const Key = "sources/run-" + run.id + "-" + run.commit + ".zip";
+              await s3.send(new PutObjectCommand({Bucket, Key, Body: sourceZip(files), ContentType: "application/zip"}));
+              const build = await codebuild.send(new StartBuildCommand({
+                projectName: process.env.BGIT_CI_CODEBUILD_PROJECT,
+                sourceTypeOverride: "S3",
+                sourceLocationOverride: Bucket + "/" + Key,
+                buildspecOverride: run.config,
+                environmentVariablesOverride: [
+                  {name: "BGIT_REPO", value: String(repo.logical || repo.prefix || ""), type: "PLAINTEXT"},
+                  {name: "BGIT_REF", value: String(run.ref || ""), type: "PLAINTEXT"},
+                  {name: "BGIT_COMMIT", value: String(run.commit || ""), type: "PLAINTEXT"},
+                  {name: "BGIT_BROKER_VERSION", value: brokerVersion, type: "PLAINTEXT"},
+                ],
+              }));
+              const b = build.build || {};
+              return http(200, {status: "queued", url: b.deepLink || "", message: b.id || "CodeBuild queued"});
+            } catch (err) {
+              return http(err.statusCode || 500, {error: err.message || String(err)});
+            }
+          };
   BrokerFunction:
     Type: AWS::Lambda::Function
     Properties:
@@ -161,6 +447,7 @@ Resources:
       Runtime: nodejs22.x
       Handler: index.handler
       Role: !GetAtt BrokerRole.Arn
+      Timeout: 30
       Environment:
         Variables:
           TABLE_NAME: !Ref BrokerTable
@@ -1224,11 +1511,14 @@ Resources:
             }));
             if (out.FunctionError) throw Object.assign(new Error("CI materializer failed: " + out.FunctionError), {statusCode: 502});
             let data = {};
+            let materializerStatus = 200;
             try {
               const text = out.Payload ? Buffer.from(out.Payload).toString("utf8") : "";
               const parsed = text ? JSON.parse(text) : {};
+              materializerStatus = Number(parsed.statusCode || 200);
               data = parsed && parsed.body ? JSON.parse(parsed.body) : parsed;
             } catch (_) {}
+            if (materializerStatus >= 400) throw Object.assign(new Error(data.error || "CI materializer returned HTTP " + materializerStatus), {statusCode: 502});
             run.status = data.status || "queued";
             run.url = data.url || run.url || "";
             run.message = data.message || run.message || "";
@@ -1287,6 +1577,7 @@ Resources:
             const oldData = out.Item && out.Item.data ? out.Item.data.S : "";
             const data = oldData ? JSON.parse(oldData || "{}") : {repo, keys: [], refs: {}, audit: []};
             data.repo = data.repo || repo;
+            const physicalRepo = data.repo;
             data.keys = data.keys || [];
             data.refs = data.refs || {};
             data.protections = data.protections || [];
@@ -1310,6 +1601,10 @@ Resources:
             } catch (err) {
               if (err.name === "ConditionalCheckFailedException") throw Object.assign(new Error("stale ref"), {statusCode: 409});
               throw err;
+            }
+            if (physicalRepo && physicalRepo.bucket) {
+              if (newHash === zero) await deleteObject(physicalRepo, ref);
+              else await writeTextObject(physicalRepo, ref, newHash + "\n");
             }
           }
           exports.handler = async (event) => {

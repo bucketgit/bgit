@@ -1027,7 +1027,7 @@ func TestProvisionGCPBrokerURLDeploysThenDiscoversFunction(t *testing.T) {
 		{match: "secrets create bgit-ci-materializer-token"},
 		{match: "secrets versions add bgit-ci-materializer-token"},
 		{match: "secrets add-iam-policy-binding bgit-ci-materializer-token"},
-		{match: "run services describe bgit-ci-materializer", exitCode: 1},
+		{match: "run services describe bgit-ci-materializer", stdout: "https://bgit-ci-materializer.example.test", requireFile: marker, exitCode: 1},
 		{match: "--service-account bgit-broker@project-id.iam.gserviceaccount.com", touch: marker},
 		{match: "iam service-accounts add-iam-policy-binding bgit-broker@project-id.iam.gserviceaccount.com"},
 	})
@@ -1249,6 +1249,10 @@ func TestAWSBrokerCloudFormationTemplateHasBrokerOutput(t *testing.T) {
 		"Type: AWS::DynamoDB::Table",
 		"Type: AWS::Lambda::Function",
 		"Type: AWS::Lambda::Url",
+		"Type: AWS::CodeBuild::Project",
+		"CiMaterializerFunction:",
+		"FunctionName: !Ref CiMaterializerFunctionName",
+		"BGIT_CI_CODEBUILD_PROJECT",
 		"dynamodb:GetItem",
 		"dynamodb:PutItem",
 		"BrokerUrl:",
@@ -1284,6 +1288,7 @@ func TestGCPBrokerSourceUsesFirestoreAndSignatureHeaders(t *testing.T) {
 		"@google-cloud/firestore",
 		"@google-cloud/storage",
 		"databaseId: process.env.FIRESTORE_DATABASE || 'bgit'",
+		"BGIT_CI_MATERIALIZER_URL",
 		"x-bgit-key",
 		"x-bgit-signature",
 		"admin SSH signature required",
@@ -1300,6 +1305,26 @@ func TestGCPBrokerSourceUsesFirestoreAndSignatureHeaders(t *testing.T) {
 	} {
 		if !strings.Contains(string(index), want) {
 			t.Fatalf("GCP broker source missing %q:\n%s", want, string(index))
+		}
+	}
+	materializerDir := t.TempDir()
+	if err := writeGCPMaterializerSource(materializerDir); err != nil {
+		t.Fatal(err)
+	}
+	materializer, err := os.ReadFile(filepath.Join(materializerDir, "index.js"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"exports.materializer",
+		"cloudbuild.googleapis.com",
+		"BGIT_CI_MATERIALIZER_SECRET",
+		"BGIT_CI_BUILD_SERVICE_ACCOUNT",
+		"collectTree",
+		"tarGz",
+	} {
+		if !strings.Contains(string(materializer), want) {
+			t.Fatalf("GCP materializer source missing %q:\n%s", want, string(materializer))
 		}
 	}
 }

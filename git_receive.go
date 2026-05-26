@@ -250,6 +250,8 @@ func applyReceivePackCommands(ctx context.Context, repo *nativeGitRepo, store wr
 					}
 					continue
 				}
+				refs[cmd.ref] = cmd.new
+				continue
 			}
 			if err := store.write(ctx, cmd.ref, []byte(cmd.new+"\n")); err != nil {
 				commandErrs[cmd.ref] = err
@@ -268,6 +270,11 @@ func applyReceivePackCommands(ctx context.Context, repo *nativeGitRepo, store wr
 					}
 					continue
 				}
+				delete(refs, cmd.ref)
+				if strings.HasPrefix(cmd.ref, "refs/heads/") {
+					_ = unsetGitBranchTracking(".", strings.TrimPrefix(cmd.ref, "refs/heads/"))
+				}
+				continue
 			}
 			if err := store.delete(ctx, cmd.ref); err != nil {
 				commandErrs[cmd.ref] = err

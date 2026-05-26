@@ -980,10 +980,12 @@ function assertRefAllowed(data, ref, key, opts) {
 async function updateRefCAS(repo, ref, oldHash, newHash, key, opts = {}) {
   const id = docID(repo);
   const refDoc = repos.doc(id);
+  let physicalRepo = null;
   await db.runTransaction(async (tx) => {
     const snap = await tx.get(refDoc);
     const data = snap.exists ? (snap.data() || {}) : {repo, keys: [], refs: {}, audit: []};
     data.repo = data.repo || repo;
+    physicalRepo = data.repo;
     data.keys = data.keys || [];
     data.refs = data.refs || {};
     data.protections = data.protections || [];
@@ -999,6 +1001,10 @@ async function updateRefCAS(repo, ref, oldHash, newHash, key, opts = {}) {
     data.audit = (data.audit || []).concat([{type: 'ref_update', ref, old: oldHash, new: newHash, at: new Date().toISOString()}]).slice(-500);
     tx.set(refDoc, data, {merge: true});
   });
+  if (physicalRepo && physicalRepo.bucket) {
+    if (newHash === zero) await deleteObject(physicalRepo, ref);
+    else await writeTextObject(physicalRepo, ref, newHash + '\n');
+  }
 }
 
 function nextPRID(data) {

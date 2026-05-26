@@ -672,7 +672,7 @@ func TestSetupCommandProvisionsGCPAndWritesGlobalConfig(t *testing.T) {
 		{match: "secrets create bgit-ci-materializer-token"},
 		{match: "secrets versions add bgit-ci-materializer-token"},
 		{match: "secrets add-iam-policy-binding bgit-ci-materializer-token"},
-		{match: "run services describe bgit-ci-materializer", exitCode: 1},
+		{match: "run services describe bgit-ci-materializer", stdout: "https://bgit-ci-materializer.example.test", requireFile: marker, exitCode: 1},
 		{match: "--service-account bgit-broker@example-test-123456.iam.gserviceaccount.com", touch: marker},
 		{match: "iam service-accounts add-iam-policy-binding bgit-broker@example-test-123456.iam.gserviceaccount.com"},
 	})
@@ -743,7 +743,7 @@ func TestSetupCommandOffersGCPProfileCreationWhenNoneExist(t *testing.T) {
 		{match: "secrets create bgit-ci-materializer-token"},
 		{match: "secrets versions add bgit-ci-materializer-token"},
 		{match: "secrets add-iam-policy-binding bgit-ci-materializer-token"},
-		{match: "run services describe bgit-ci-materializer", exitCode: 1},
+		{match: "run services describe bgit-ci-materializer", stdout: "https://bgit-ci-materializer.example.test", requireFile: deployMarker, exitCode: 1},
 		{match: "--service-account bgit-broker@example-test-123456.iam.gserviceaccount.com", touch: deployMarker},
 		{match: "iam service-accounts add-iam-policy-binding bgit-broker@example-test-123456.iam.gserviceaccount.com"},
 	})

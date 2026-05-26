@@ -1020,6 +1020,10 @@ func provisionGCPBrokerURL(cfg config, opts sshSetupOptions, stdout io.Writer) (
 	if err := ensureGCPBrokerDeployerPermission(cfg, serviceAccount, stdout); err != nil {
 		return "", err
 	}
+	ciSecret, err := ensureGCPMaterializerSecret(cfg, serviceAccount, stdout)
+	if err != nil {
+		return "", err
+	}
 	sourceDir, err := os.MkdirTemp("", "bgit-gcp-broker-*")
 	if err != nil {
 		return "", err
@@ -1039,7 +1043,7 @@ func provisionGCPBrokerURL(cfg config, opts sshSetupOptions, stdout io.Writer) (
 		"--trigger-http",
 		"--allow-unauthenticated",
 		"--service-account", serviceAccount,
-		"--set-env-vars", "FIRESTORE_DATABASE="+gcpBrokerFirestoreDatabase(opts)+",BROKER_VERSION="+brokerVersion+",BGIT_SIGNING_SERVICE_ACCOUNT="+serviceAccount,
+		"--set-env-vars", gcpBrokerEnvVars(cfg, opts, serviceAccount, region, ciSecret),
 		"--quiet",
 	)
 	out, err := cmd.CombinedOutput()
@@ -1066,6 +1070,7 @@ func ensureGCPBrokerServices(cfg config, stdout io.Writer) error {
 		"artifactregistry.googleapis.com",
 		"firestore.googleapis.com",
 		"iamcredentials.googleapis.com",
+		"secretmanager.googleapis.com",
 	}
 	fmt.Fprintf(stdout, "ensuring GCP broker APIs are enabled\n")
 	args := append([]string{"services", "enable"}, services...)
@@ -1191,7 +1196,7 @@ func ensureGCPBrokerRuntimePermissions(cfg config, serviceAccount string, stdout
 	if project == "" {
 		return errors.New("GCP project is not configured")
 	}
-	for _, role := range []string{"roles/datastore.user", "roles/storage.admin"} {
+	for _, role := range []string{"roles/datastore.user", "roles/storage.admin", "roles/cloudbuild.builds.editor"} {
 		fmt.Fprintf(stdout, "granting GCP broker %s to %s\n", role, serviceAccount)
 		cmd := gcloudCommand(cfg.gcloudConfiguration,
 			"projects", "add-iam-policy-binding", project,
@@ -1375,6 +1380,96 @@ func gcpBrokerFirestoreDatabase(opts sshSetupOptions) string {
 	return firstNonEmpty(strings.TrimSpace(opts.firestoreDatabase), os.Getenv("BGIT_FIRESTORE_DATABASE"), "bgit")
 }
 
+func gcpBrokerEnvVars(cfg config, opts sshSetupOptions, serviceAccount, region, ciSecret string) string {
+	values := []string{
+		"FIRESTORE_DATABASE=" + gcpBrokerFirestoreDatabase(opts),
+		"BROKER_VERSION=" + brokerVersion,
+		"BGIT_SIGNING_SERVICE_ACCOUNT=" + serviceAccount,
+		"BGIT_CI_MATERIALIZER_SECRET=" + ciSecret,
+	}
+	if v := discoverGCPMaterializerURL(cfg, region); v != "" {
+		values = append(values, "BGIT_CI_MATERIALIZER_URL="+v)
+	}
+	return strings.Join(values, ",")
+}
+
+func ensureGCPMaterializerSecret(cfg config, serviceAccount string, stdout io.Writer) (string, error) {
+	project := gcloudProject(cfg)
+	if project == "" {
+		return "", errors.New("GCP project is not configured")
+	}
+	secret := "bgit-ci-materializer-token"
+	fullName := "projects/" + project + "/secrets/" + secret
+	describe := gcloudCommand(cfg.gcloudConfiguration, "secrets", "describe", secret, "--project="+project, "--format=value(name)")
+	if out, err := describe.Output(); err != nil || strings.TrimSpace(string(out)) == "" {
+		fmt.Fprintf(stdout, "creating GCP CI materializer secret %s\n", secret)
+		create := gcloudCommand(cfg.gcloudConfiguration,
+			"secrets", "create", secret,
+			"--replication-policy=automatic",
+			"--project="+project,
+			"--quiet",
+		)
+		if createOut, createErr := create.CombinedOutput(); createErr != nil {
+			return "", fmt.Errorf("create GCP CI materializer secret: %w\n%s", createErr, strings.TrimSpace(string(createOut)))
+		}
+		token, err := randomBrokerSecret()
+		if err != nil {
+			return "", err
+		}
+		add := gcloudCommand(cfg.gcloudConfiguration,
+			"secrets", "versions", "add", secret,
+			"--data-file=-",
+			"--project="+project,
+			"--quiet",
+		)
+		add.Stdin = strings.NewReader(token)
+		if addOut, addErr := add.CombinedOutput(); addErr != nil {
+			return "", fmt.Errorf("seed GCP CI materializer secret: %w\n%s", addErr, strings.TrimSpace(string(addOut)))
+		}
+	}
+	for _, role := range []string{"roles/secretmanager.secretAccessor", "roles/secretmanager.admin"} {
+		fmt.Fprintf(stdout, "granting GCP broker %s on %s\n", role, secret)
+		cmd := gcloudCommand(cfg.gcloudConfiguration,
+			"secrets", "add-iam-policy-binding", secret,
+			"--member=serviceAccount:"+serviceAccount,
+			"--role="+role,
+			"--project="+project,
+			"--quiet",
+		)
+		out, err := runGcloudIAMBindingWithRetry(cmd)
+		if err != nil {
+			return "", fmt.Errorf("grant GCP broker %s on CI materializer secret: %w\n%s", role, err, strings.TrimSpace(string(out)))
+		}
+	}
+	return fullName, nil
+}
+
+func randomBrokerSecret() (string, error) {
+	var data [32]byte
+	if _, err := rand.Read(data[:]); err != nil {
+		return "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(data[:]), nil
+}
+
+func discoverGCPMaterializerURL(cfg config, region string) string {
+	project := gcloudProject(cfg)
+	if project == "" {
+		return ""
+	}
+	cmd := gcloudCommand(cfg.gcloudConfiguration,
+		"run", "services", "describe", "bgit-ci-materializer",
+		"--region", region,
+		"--project", project,
+		"--format=value(status.url)",
+	)
+	out, err := cmd.Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
 func provisionAWSBrokerURL(cfg config, opts sshSetupOptions, stdout io.Writer) (string, error) {
 	region := firstNonEmpty(strings.TrimSpace(opts.region), defaultAWSRegion())
 	template, err := os.CreateTemp("", "bgit-aws-broker-*.yaml")
@@ -1407,11 +1502,32 @@ func provisionAWSBrokerURL(cfg config, opts sshSetupOptions, stdout io.Writer) (
 		"--capabilities", "CAPABILITY_NAMED_IAM",
 		"--region", region,
 	}
+	if materializerURL := discoverAWSMaterializerURL(cfg, region); materializerURL != "" {
+		args = append(args, "--parameter-overrides", "CiMaterializerUrl="+materializerURL)
+	}
 	out, err := awsCommand(context.Background(), strings.TrimSpace(cfg.gcloudConfiguration), args...).CombinedOutput()
 	if err != nil {
 		return "", fmt.Errorf("deploy AWS bgit broker: %w\n%s", err, strings.TrimSpace(string(out)))
 	}
 	return discoverAWSBrokerURL(cfg, opts)
+}
+
+func discoverAWSMaterializerURL(cfg config, region string) string {
+	out, err := awsCommand(context.Background(), strings.TrimSpace(cfg.gcloudConfiguration),
+		"lambda", "get-function-url-config",
+		"--function-name", "bgit-ci-materializer",
+		"--region", region,
+		"--query", "FunctionUrl",
+		"--output", "text",
+	).Output()
+	if err != nil {
+		return ""
+	}
+	url := strings.TrimSpace(string(out))
+	if url == "" || strings.EqualFold(url, "none") {
+		return ""
+	}
+	return url
 }
 
 func ensureAWSBrokerDeploymentBucket(cfg config, region string, stdout io.Writer) (string, error) {

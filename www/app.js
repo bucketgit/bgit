@@ -370,6 +370,12 @@ document.addEventListener('submit', function (event) {
     handleBoardForm(boardForm);
     return;
   }
+  const ciForm = event.target.closest('[data-ci-form]');
+  if (ciForm) {
+    event.preventDefault();
+    handleCIForm(ciForm);
+    return;
+  }
   const prCreateForm = event.target.closest('[data-pr-create-form]');
   if (prCreateForm) {
     event.preventDefault();
@@ -1155,6 +1161,25 @@ async function handleBoardForm(form) {
     window.location.reload();
   } catch (err) {
     setSyncStatus(compactError(err), 'is-stale');
+  }
+}
+
+async function handleCIForm(form) {
+  if (!hasCapability(form.getAttribute('data-capability') || '')) {
+    setSyncStatus('Your current broker role does not allow this action.', 'is-stale');
+    return;
+  }
+  const payload = formDataObject(form);
+  payload.action = 'run';
+  const submit = form.querySelector('button[type="submit"]');
+  if (submit) submit.disabled = true;
+  try {
+    await postJSON('/api/actions/ci', payload);
+    window.location.reload();
+  } catch (err) {
+    setSyncStatus(err.message || String(err), 'is-stale');
+  } finally {
+    if (submit) submit.disabled = false;
   }
 }
 

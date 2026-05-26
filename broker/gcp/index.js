@@ -645,6 +645,7 @@ function roleCapabilities(role) {
     reopen_pr: ['owner', 'admin', 'maintainer'].includes(role),
     owner_transfer: role === 'owner',
     broker_upgrade: role === 'owner' || role === 'admin',
+    ci_run: roleAllows(role, 'write'),
   };
 }
 
@@ -927,6 +928,109 @@ async function loadIssue(entry, id) {
 async function listIssues(entry) {
   const snap = await entry.ref.collection('issues').orderBy('id', 'desc').get();
   return snap.docs.map((doc) => doc.data() || {});
+}
+
+function nextCIID(data) {
+  data.next_ci_id = Number(data.next_ci_id || 1);
+  return data.next_ci_id++;
+}
+
+function listCIRuns(data) {
+  const runs = Array.isArray(data.ci_runs) ? data.ci_runs : [];
+  return [...runs].sort((a, b) => Number(b.id || 0) - Number(a.id || 0));
+}
+
+function findCIRun(data, id) {
+  return (data.ci_runs || []).find((run) => Number(run.id) === Number(id));
+}
+
+function normalizeCIProvider(value, repo) {
+  const raw = String(value || '').trim().toLowerCase();
+  if (raw === 'aws' || raw === 'codebuild' || (raw === '' && repo.provider === 's3')) return 'aws';
+  return 'gcp';
+}
+
+function normalizeCIRef(value) {
+  const ref = String(value || '').trim();
+  if (!ref) throw new Error('CI ref is required');
+  if (ref.startsWith('refs/')) return ref;
+  return 'refs/heads/' + ref.replace(/^heads\//, '');
+}
+
+function cleanCIConfig(value, provider) {
+  const config = String(value || '').trim();
+  const defaults = provider === 'aws' ? ['buildspec.yml', 'buildspec.yaml'] : ['cloudbuild.yaml', 'cloudbuild.yml'];
+  const out = config || defaults[0];
+  if (out.startsWith('/') || out.includes('\\') || out.includes('\0') || out.split('/').includes('..')) {
+    throw Object.assign(new Error('invalid CI config path'), {status: 400});
+  }
+  if (!/\.(ya?ml)$/i.test(out)) throw Object.assign(new Error('CI config must be a YAML file'), {status: 400});
+  return out;
+}
+
+async function triggerCIRun(entry, run) {
+  const url = String(process.env.BGIT_CI_MATERIALIZER_URL || '').trim();
+  if (!url) {
+    run.status = 'queued';
+    run.message = 'CI materializer is not configured for this broker yet.';
+    return run;
+  }
+  const payload = {
+    repo: entry.data.repo,
+    run: {id: run.id, provider: run.provider, ref: run.ref, commit: run.commit, config: run.config},
+    broker_version: brokerVersion,
+  };
+  const headers = {'content-type': 'application/json'};
+  const token = await ciMaterializerToken();
+  if (token) headers.authorization = 'Bearer ' + token;
+  const resp = await fetch(url, {method: 'POST', headers, body: JSON.stringify(payload)});
+  const text = await resp.text();
+  if (!resp.ok) throw Object.assign(new Error(text || ('CI materializer returned HTTP ' + resp.status)), {status: 502});
+  let data = {};
+  try { data = text ? JSON.parse(text) : {}; } catch (_) {}
+  run.status = data.status || 'queued';
+  run.url = data.url || run.url || '';
+  run.message = data.message || run.message || '';
+  return run;
+}
+
+function randomCIToken() {
+  return crypto.randomBytes(32).toString('base64url');
+}
+
+async function secretManagerRequest(path, opts = {}) {
+  const client = await auth.getClient();
+  const accessToken = await client.getAccessToken();
+  const token = typeof accessToken === 'string' ? accessToken : accessToken && accessToken.token;
+  const resp = await fetch('https://secretmanager.googleapis.com/v1/' + path, {
+    method: opts.method || 'GET',
+    headers: {
+      authorization: 'Bearer ' + token,
+      'content-type': 'application/json',
+    },
+    body: opts.body ? JSON.stringify(opts.body) : undefined,
+  });
+  const text = await resp.text();
+  if (!resp.ok) throw Object.assign(new Error(text || ('Secret Manager returned HTTP ' + resp.status)), {status: 502});
+  try { return text ? JSON.parse(text) : {}; } catch (_) { return {}; }
+}
+
+async function ciMaterializerToken() {
+  const secret = String(process.env.BGIT_CI_MATERIALIZER_SECRET || '').trim();
+  if (!secret) return '';
+  const data = await secretManagerRequest(secret + '/versions/latest:access');
+  return Buffer.from(data.payload && data.payload.data || '', 'base64').toString('utf8').trim();
+}
+
+async function rotateCIMaterializerToken() {
+  const secret = String(process.env.BGIT_CI_MATERIALIZER_SECRET || '').trim();
+  if (!secret) throw Object.assign(new Error('CI materializer secret is not configured'), {status: 500});
+  const token = randomCIToken();
+  await secretManagerRequest(secret + ':addVersion', {
+    method: 'POST',
+    body: {payload: {data: Buffer.from(token).toString('base64')}},
+  });
+  return {rotated: true};
 }
 
 async function deleteRepoMetadata(entry) {
@@ -1820,6 +1924,51 @@ exports.broker = async (req, res) => {
       issue.updated_at = new Date().toISOString();
       await saveIssue(entry, issue);
       res.status(200).send(JSON.stringify({ok: true, issue}));
+      return;
+    }
+    if (req.path === '/ci/list' && req.method === 'POST') {
+      const entry = await ensureRepo(body.repo);
+      await requireRead(req, entry);
+      res.status(200).send(JSON.stringify({runs: listCIRuns(entry.data)}));
+      return;
+    }
+    if (req.path === '/ci/view' && req.method === 'POST') {
+      const entry = await ensureRepo(body.repo);
+      await requireRead(req, entry);
+      const run = findCIRun(entry.data, body.id);
+      if (!run) throw Object.assign(new Error('CI run not found'), {status: 404});
+      res.status(200).send(JSON.stringify({run}));
+      return;
+    }
+    if (req.path === '/ci/run' && req.method === 'POST') {
+      const entry = await ensureRepo(body.repo);
+      const key = await requireWrite(req, entry);
+      const repo = entry.data.repo || {};
+      const provider = normalizeCIProvider(body.provider, repo);
+      const ref = normalizeCIRef(body.ref || repo.default_branch || 'refs/heads/main');
+      const refs = entry.data.refs || {};
+      const commit = String(body.commit || refs[ref] || '').trim();
+      if (!commit || !/^[0-9a-f]{40}$/i.test(commit)) throw Object.assign(new Error('CI commit is required'), {status: 400});
+      if (!refs[ref]) throw Object.assign(new Error('CI ref not found'), {status: 404});
+      if (refs[ref] !== commit) throw Object.assign(new Error('CI commit does not match broker ref'), {status: 409});
+      const config = cleanCIConfig(body.config, provider);
+      const now = new Date().toISOString();
+      const run = {id: nextCIID(entry.data), provider, ref, commit, config, status: 'queued', url: '', message: '', author: key.user || '', created_at: now, updated_at: now};
+      await triggerCIRun(entry, run);
+      run.updated_at = new Date().toISOString();
+      entry.data.ci_runs = [run, ...(entry.data.ci_runs || [])].slice(0, 100);
+      audit(entry, {type: 'ci_run', id: run.id, provider, ref, commit, config, user: key.user});
+      await saveRepo(entry);
+      res.status(200).send(JSON.stringify({ok: true, run}));
+      return;
+    }
+    if (req.path === '/ci/secret/rotate' && req.method === 'POST') {
+      const entry = await ensureRepo(body.repo);
+      const key = await requireAdmin(req, entry);
+      await rotateCIMaterializerToken();
+      audit(entry, {type: 'ci_secret_rotate', user: key.user});
+      await saveRepo(entry);
+      res.status(200).send(JSON.stringify({ok: true}));
       return;
     }
     if (req.path === '/prs/create' && req.method === 'POST') {

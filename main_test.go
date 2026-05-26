@@ -1014,7 +1014,7 @@ func TestProvisionGCPBrokerURLDeploysThenDiscoversFunction(t *testing.T) {
 	writeFakeCLI(t, bin, "gcloud", []fakeCLIAction{
 		{match: "functions describe bgit-broker --gen2 --region europe-west1 --format=value(serviceConfig.uri)", stdout: "https://bgit-broker-provisioned.example.test", requireFile: marker, exitCode: 1},
 		{match: "services enable"},
-		{match: "services list --enabled", stdout: "serviceusage.googleapis.com cloudresourcemanager.googleapis.com cloudfunctions.googleapis.com run.googleapis.com cloudbuild.googleapis.com artifactregistry.googleapis.com firestore.googleapis.com iamcredentials.googleapis.com"},
+		{match: "services list --enabled", stdout: "serviceusage.googleapis.com cloudresourcemanager.googleapis.com cloudfunctions.googleapis.com run.googleapis.com cloudbuild.googleapis.com artifactregistry.googleapis.com firestore.googleapis.com iamcredentials.googleapis.com secretmanager.googleapis.com"},
 		{match: "firestore databases describe", exitCode: 1},
 		{match: "firestore databases create"},
 		{match: "config get-value project", stdout: "project-id"},
@@ -1022,6 +1022,11 @@ func TestProvisionGCPBrokerURLDeploysThenDiscoversFunction(t *testing.T) {
 		{match: "iam service-accounts describe bgit-broker@project-id.iam.gserviceaccount.com", exitCode: 1},
 		{match: "iam service-accounts create bgit-broker"},
 		{match: "projects add-iam-policy-binding project-id --member=serviceAccount:bgit-broker@project-id.iam.gserviceaccount.com"},
+		{match: "secrets describe bgit-ci-materializer-token", exitCode: 1},
+		{match: "secrets create bgit-ci-materializer-token"},
+		{match: "secrets versions add bgit-ci-materializer-token"},
+		{match: "secrets add-iam-policy-binding bgit-ci-materializer-token"},
+		{match: "run services describe bgit-ci-materializer", exitCode: 1},
 		{match: "--service-account bgit-broker@project-id.iam.gserviceaccount.com", touch: marker},
 		{match: "iam service-accounts add-iam-policy-binding bgit-broker@project-id.iam.gserviceaccount.com"},
 	})

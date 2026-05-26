@@ -35,7 +35,7 @@ func brokerAdminCommand(cfg config, args []string, stdout io.Writer) error {
 
 func brokerAdminCommandWithInput(cfg config, args []string, stdin io.Reader, stdout io.Writer) error {
 	if len(args) == 0 {
-		return errors.New("usage: bgit admin keys|broker|broker-users|teams|repo create|repo|owner|protect|members|confirm-ownership-transfer|accept-ownership-transfer|cancel-ownership-transfer|invite-user|accept-invite|cancel-invite|invite-broker-user|accept-broker-invite|cancel-broker-invite [args]\n\nCloud IAM administration moved to bgit direct admin.")
+		return errors.New("usage: bgit admin keys|broker|broker-users|teams|repo create|repo|owner|protect|ci|members|confirm-ownership-transfer|accept-ownership-transfer|cancel-ownership-transfer|invite-user|accept-invite|cancel-invite|invite-broker-user|accept-broker-invite|cancel-broker-invite [args]\n\nCloud IAM administration moved to bgit direct admin.")
 	}
 	switch args[0] {
 	case "broker":
@@ -52,6 +52,8 @@ func brokerAdminCommandWithInput(cfg config, args []string, stdin io.Reader, std
 		return brokerOwnerCommand(cfg, args[1:], stdout)
 	case "protect":
 		return brokerProtectionCommand(cfg, args[1:], stdout)
+	case "ci":
+		return brokerAdminCICommand(cfg, args[1:], stdout)
 	case "members":
 		return brokerMembersCommand(cfg, args[1:], stdout)
 	case "confirm-ownership-transfer", "accept-ownership-transfer", "cancel-ownership-transfer":
@@ -1727,6 +1729,189 @@ type brokerPullRequestRequest struct {
 	Comments        []brokerPullRequestComment `json:"comments,omitempty"`
 	TargetNoteID    int                        `json:"target_note_id,omitempty"`
 	TargetCommentID int                        `json:"target_comment_id,omitempty"`
+}
+
+type brokerCIRun struct {
+	ID        int    `json:"id,omitempty"`
+	Provider  string `json:"provider,omitempty"`
+	Ref       string `json:"ref,omitempty"`
+	Commit    string `json:"commit,omitempty"`
+	Config    string `json:"config,omitempty"`
+	Status    string `json:"status,omitempty"`
+	URL       string `json:"url,omitempty"`
+	Message   string `json:"message,omitempty"`
+	Author    string `json:"author,omitempty"`
+	CreatedAt string `json:"created_at,omitempty"`
+	UpdatedAt string `json:"updated_at,omitempty"`
+}
+
+type brokerCIRequest struct {
+	Repo     brokerRepo `json:"repo"`
+	ID       int        `json:"id,omitempty"`
+	Provider string     `json:"provider,omitempty"`
+	Ref      string     `json:"ref,omitempty"`
+	Commit   string     `json:"commit,omitempty"`
+	Config   string     `json:"config,omitempty"`
+}
+
+func brokerAdminCICommand(cfg config, args []string, stdout io.Writer) error {
+	if len(args) == 0 {
+		return errors.New("usage: bgit admin ci rotate-secret")
+	}
+	cfg, err := configForBrokerCommand(cfg)
+	if err != nil {
+		return err
+	}
+	switch args[0] {
+	case "rotate-secret":
+		if len(args) != 1 {
+			return errors.New("usage: bgit admin ci rotate-secret")
+		}
+		if err := brokerPost(cfg.brokerURL, "/ci/secret/rotate", brokerCIRequest{Repo: repoForBroker(cfg)}, nil); err != nil {
+			return err
+		}
+		fmt.Fprintln(stdout, "rotated CI materializer secret")
+		return nil
+	default:
+		return fmt.Errorf("unknown admin ci command %q", args[0])
+	}
+}
+
+func ciCommand(args []string, stdin io.Reader, stdout io.Writer) error {
+	_ = stdin
+	if len(args) == 0 {
+		return errors.New("usage: bgit ci list|run|view [args]")
+	}
+	cfg, err := configForBrokerCommand(config{})
+	if err != nil {
+		return err
+	}
+	switch args[0] {
+	case "list":
+		var resp struct {
+			Runs []brokerCIRun `json:"runs"`
+		}
+		if err := brokerPost(cfg.brokerURL, "/ci/list", brokerCIRequest{Repo: repoForBroker(cfg)}, &resp); err != nil {
+			return err
+		}
+		for _, run := range resp.Runs {
+			fmt.Fprintf(stdout, "#%d\t%s\t%s\t%s\t%s\n", run.ID, firstNonEmpty(run.Status, "queued"), shortRefName(run.Ref), shortHash(run.Commit), run.Config)
+		}
+		return nil
+	case "view":
+		if len(args) != 2 {
+			return errors.New("usage: bgit ci view ID")
+		}
+		id := parsePositiveInt(strings.TrimPrefix(args[1], "#"))
+		if id <= 0 {
+			return errors.New("CI run id is required")
+		}
+		var resp struct {
+			Run brokerCIRun `json:"run"`
+		}
+		if err := brokerPost(cfg.brokerURL, "/ci/view", brokerCIRequest{Repo: repoForBroker(cfg), ID: id}, &resp); err != nil {
+			return err
+		}
+		fmt.Fprintf(stdout, "#%d %s\nprovider: %s\nref: %s\ncommit: %s\nconfig: %s\n", resp.Run.ID, firstNonEmpty(resp.Run.Status, "queued"), resp.Run.Provider, resp.Run.Ref, resp.Run.Commit, resp.Run.Config)
+		if resp.Run.URL != "" {
+			fmt.Fprintf(stdout, "url: %s\n", resp.Run.URL)
+		}
+		if resp.Run.Message != "" {
+			fmt.Fprintf(stdout, "\n%s\n", resp.Run.Message)
+		}
+		return nil
+	case "run":
+		req := brokerCIRequest{Repo: repoForBroker(cfg), Provider: defaultCIProvider(cfg)}
+		for i := 1; i < len(args); i++ {
+			arg := args[i]
+			name, value, hasValue := strings.Cut(arg, "=")
+			switch name {
+			case "--ref":
+				value, i, err = optionValue(args, i, hasValue, value, name)
+				if err != nil {
+					return err
+				}
+				req.Ref = normalizeDestinationRef(value)
+			case "--config":
+				value, i, err = optionValue(args, i, hasValue, value, name)
+				if err != nil {
+					return err
+				}
+				req.Config = value
+			case "--provider":
+				value, i, err = optionValue(args, i, hasValue, value, name)
+				if err != nil {
+					return err
+				}
+				req.Provider = normalizeCIProvider(value)
+			default:
+				return fmt.Errorf("unsupported ci run option %s", arg)
+			}
+		}
+		if req.Ref == "" {
+			out, err := runGit(".", "branch", "--show-current")
+			if err != nil {
+				return err
+			}
+			req.Ref = branchRef(strings.TrimSpace(string(out)))
+		}
+		head, err := runGit(".", "rev-parse", "HEAD")
+		if err == nil {
+			req.Commit = strings.TrimSpace(string(head))
+		}
+		if req.Config == "" {
+			req.Config, err = detectCIConfig(req.Provider, req.Commit)
+			if err != nil {
+				return err
+			}
+		}
+		var resp struct {
+			Run brokerCIRun `json:"run"`
+		}
+		if err := brokerPost(cfg.brokerURL, "/ci/run", req, &resp); err != nil {
+			return err
+		}
+		fmt.Fprintf(stdout, "queued CI run #%d for %s at %s\n", resp.Run.ID, shortRefName(resp.Run.Ref), shortHash(resp.Run.Commit))
+		if resp.Run.Message != "" {
+			fmt.Fprintf(stdout, "%s\n", resp.Run.Message)
+		}
+		return nil
+	default:
+		return fmt.Errorf("unknown ci command %q", args[0])
+	}
+}
+
+func defaultCIProvider(cfg config) string {
+	if strings.EqualFold(cfg.provider, "s3") {
+		return "aws"
+	}
+	return "gcp"
+}
+
+func normalizeCIProvider(provider string) string {
+	switch strings.ToLower(strings.TrimSpace(provider)) {
+	case "aws", "codebuild", "s3":
+		return "aws"
+	default:
+		return "gcp"
+	}
+}
+
+func detectCIConfig(provider, commit string) (string, error) {
+	candidates := []string{"cloudbuild.yaml", "cloudbuild.yml"}
+	if normalizeCIProvider(provider) == "aws" {
+		candidates = []string{"buildspec.yml", "buildspec.yaml"}
+	}
+	revision := strings.TrimSpace(commit)
+	if revision == "" {
+		revision = "HEAD"
+	}
+	for _, candidate := range candidates {
+		if _, err := runGit(".", "cat-file", "-e", revision+":"+candidate); err == nil {
+			return candidate, nil
+		}
+	}
+	return "", fmt.Errorf("no CI config found in %s; expected %s", shortHash(revision), strings.Join(candidates, " or "))
 }
 
 func issueCommand(args []string, stdin io.Reader, stdout io.Writer) error {

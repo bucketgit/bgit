@@ -4,6 +4,13 @@ All notable changes to `bgit` are documented in this file.
 
 This project follows semantic versioning.
 
+## Unrelease changes
+
+- Added broker-backed CI run records, `bgit ci` commands, and a `bgit web` CI
+  view for trusted provider/materializer build handoff against broker refs.
+- Added managed CI materializer tokens with secret rotation via
+  `bgit admin ci rotate-secret`.
+
 ## 1.1.3
 
 Added

@@ -2245,6 +2245,36 @@ h2 {
   resize: vertical;
   line-height: 1.45;
 }
+.ci-run-form {
+  margin-bottom: 16px;
+  padding-bottom: 16px;
+  border-bottom: 1px solid var(--repo-border);
+}
+.ci-run-list {
+  display: grid;
+  border: 1px solid var(--repo-border);
+  border-radius: 8px;
+  overflow: hidden;
+}
+.ci-run-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 12px;
+  align-items: center;
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--repo-border);
+}
+.ci-run-row:last-child { border-bottom: 0; }
+.ci-run-row strong {
+  color: var(--heading);
+}
+.ci-run-row span,
+.ci-run-row small {
+  display: block;
+  margin-top: 3px;
+  color: var(--muted);
+  font-size: 12px;
+}
 .settings-check {
   align-content: center;
   grid-template-columns: auto 1fr;

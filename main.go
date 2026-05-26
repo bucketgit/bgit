@@ -147,6 +147,13 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 		}
 		return prCommand(cmdArgs, stdin, stdout)
 	}
+	if cmd == "ci" {
+		if localCfg, err := readLocalConfig("."); err == nil {
+			cfg = mergeConfig(cfg, localCfg)
+			setBrokerIdentityPreference(cfg.identity)
+		}
+		return ciCommand(cmdArgs, stdin, stdout)
+	}
 	if cmd == "board" || cmd == "kanban" {
 		if localCfg, err := readLocalConfig("."); err == nil {
 			cfg = mergeConfig(cfg, localCfg)
@@ -915,6 +922,7 @@ collaborate
    push       Update remote refs and upload objects
    ls-remote  List remote refs
    pr         Create, review, merge, and close pull requests
+   ci         Run and inspect broker CI builds
    board      Manage the repository task board
    issue      Create, comment on, close, and reopen issues
 
@@ -1097,6 +1105,7 @@ examples:
   bgit admin repo create --team platform app
   bgit admin invite-user --broker https://broker.example.com --user ada --role developer app
   bgit admin protect add main
+  bgit admin ci rotate-secret
   bgit admin repo visibility public
   bgit direct admin grant-read user:dev@example.com
 `,
@@ -1121,6 +1130,15 @@ creation; private repositories require membership.
 Broker-backed repository task board. The board is available immediately for
 broker-backed repositories and stores stories in repository metadata. Viewers
 can read the board; developers and higher can create, take, move, and comment.
+`,
+		"ci": `usage:
+  bgit ci list
+  bgit ci run [--ref REF] [--config FILE] [--provider gcp|aws]
+  bgit ci view ID
+
+Broker-backed CI records and provider build handoff. CI runs are requested for
+a broker ref and commit; the broker verifies repository state before queuing the
+trusted provider/materializer path.
 `,
 		"pr": `usage:
   bgit pr create [--title TITLE] [--body BODY] [--source BRANCH] [--target BRANCH]

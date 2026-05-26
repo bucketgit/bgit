@@ -433,6 +433,8 @@ func (s *webServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.handleAPIActionIssue(ctx, w, r)
 	case route == "api/actions/board":
 		s.handleAPIActionBoard(ctx, w, r)
+	case route == "api/actions/ci":
+		s.handleAPIActionCI(ctx, w, r)
 	case route == "api/actions/settings":
 		s.handleAPIActionSettings(ctx, w, r)
 	case route == "api/user/profile":
@@ -475,6 +477,8 @@ func (s *webServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.handleBoard(ctx, w, r)
 	case strings.HasPrefix(route, "board/"):
 		s.handleStory(ctx, w, r, strings.TrimPrefix(route, "board/"))
+	case route == "ci":
+		s.handleCI(ctx, w, r)
 	case route == "settings":
 		s.handleSettings(ctx, w, r)
 	case route == "user/settings" || route == "user/settings/":
@@ -1784,6 +1788,53 @@ func (s *webServer) handleAPIActionBoard(ctx context.Context, w http.ResponseWri
 	s.renderJSON(w, map[string]any{"ok": true})
 }
 
+func (s *webServer) handleAPIActionCI(ctx context.Context, w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if strings.TrimSpace(s.cfg.brokerURL) == "" || strings.TrimSpace(s.cfg.logicalRepo) == "" {
+		s.renderJSONError(w, http.StatusBadRequest, errors.New("CI actions require a broker-backed repository"))
+		return
+	}
+	var req struct {
+		Action   string `json:"action"`
+		Provider string `json:"provider"`
+		Ref      string `json:"ref"`
+		Config   string `json:"config"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		s.renderJSONError(w, http.StatusBadRequest, err)
+		return
+	}
+	if strings.TrimSpace(req.Action) != "run" {
+		s.renderJSONError(w, http.StatusBadRequest, fmt.Errorf("unsupported CI action %q", req.Action))
+		return
+	}
+	ref := normalizeDestinationRef(firstNonEmpty(strings.TrimSpace(req.Ref), s.cfg.branch, defaultBranch))
+	commit := ""
+	if head, err := runGit(".", "rev-parse", shortRefName(ref)); err == nil {
+		commit = strings.TrimSpace(string(head))
+	} else if head, err := runGit(".", "rev-parse", "HEAD"); err == nil {
+		commit = strings.TrimSpace(string(head))
+	}
+	config := strings.TrimSpace(req.Config)
+	if config == "" {
+		if detected, err := detectCIConfig(req.Provider, commit); err == nil {
+			config = detected
+		}
+	}
+	var resp struct {
+		Run brokerCIRun `json:"run"`
+	}
+	if err := brokerPostContext(ctx, s.cfg.brokerURL, "/ci/run", brokerCIRequest{Repo: repoForBroker(s.cfg), Provider: normalizeCIProvider(req.Provider), Ref: ref, Commit: commit, Config: config}, &resp); err != nil {
+		s.renderJSONError(w, http.StatusBadRequest, err)
+		return
+	}
+	runs, _ := s.listCIRuns(ctx)
+	s.renderJSON(w, map[string]any{"ok": true, "run": resp.Run, "runs": runs})
+}
+
 func (s *webServer) webRepositoryState(ctx context.Context, refreshRemote bool, selectedRef string) (webAPIState, error) {
 	localRepo, err := openLocalRepository(".")
 	if err != nil {
@@ -2426,6 +2477,39 @@ func (s *webServer) handleBoard(ctx context.Context, w http.ResponseWriter, r *h
 	}
 	body.WriteString(`</section></div></div></main>`)
 	s.renderPage(w, webPageTitle(s.title, "board"), body.String())
+}
+
+func (s *webServer) handleCI(ctx context.Context, w http.ResponseWriter, r *http.Request) {
+	runs, err := s.listCIRuns(ctx)
+	ref := branchRef(firstNonEmpty(s.cfg.branch, defaultBranch))
+	var body strings.Builder
+	body.WriteString(`<main class="layout" data-bgit-source="seed">`)
+	body.WriteString(s.headerHTML(ref, "ci"))
+	body.WriteString(`<div class="repo-content repo-content-single"><div class="repo-primary"><section class="panel ci-panel"><div class="panel-title">CI/CD</div>`)
+	if strings.TrimSpace(s.cfg.brokerURL) == "" {
+		body.WriteString(`<div class="empty">CI is available for broker-backed repositories.</div>`)
+	} else {
+		body.WriteString(ciRunFormHTML(s.cfg))
+		body.WriteString(ciRunListHTML(runs))
+	}
+	if err != nil {
+		body.WriteString(`<div class="settings-error">` + html.EscapeString(err.Error()) + `</div>`)
+	}
+	body.WriteString(`</section></div></div></main>`)
+	s.renderPage(w, webPageTitle(s.title, "ci"), body.String())
+}
+
+func (s *webServer) listCIRuns(ctx context.Context) ([]brokerCIRun, error) {
+	if strings.TrimSpace(s.cfg.brokerURL) == "" || strings.TrimSpace(s.cfg.logicalRepo) == "" {
+		return nil, errors.New("CI requires a broker-backed repository")
+	}
+	var resp struct {
+		Runs []brokerCIRun `json:"runs"`
+	}
+	if err := brokerPostContext(ctx, s.cfg.brokerURL, "/ci/list", brokerCIRequest{Repo: repoForBroker(s.cfg)}, &resp); err != nil {
+		return nil, err
+	}
+	return resp.Runs, nil
 }
 
 func (s *webServer) handleIssue(ctx context.Context, w http.ResponseWriter, r *http.Request, idPart string) {
@@ -3352,6 +3436,7 @@ func (s *webServer) headerHTML(ref, repoPath string) string {
 	commitsActive := ""
 	prsActive := ""
 	boardActive := ""
+	ciActive := ""
 	issuesActive := ""
 	settingsActive := ""
 	if repoPath == "commits" {
@@ -3366,6 +3451,9 @@ func (s *webServer) headerHTML(ref, repoPath string) string {
 	} else if repoPath == "board" {
 		codeActive = ""
 		boardActive = ` class="active"`
+	} else if repoPath == "ci" {
+		codeActive = ""
+		ciActive = ` class="active"`
 	} else if repoPath == "issues" {
 		codeActive = ""
 		issuesActive = ` class="active"`
@@ -3382,6 +3470,7 @@ func (s *webServer) headerHTML(ref, repoPath string) string {
 		b.WriteString(`<a` + prsActive + ` href="/prs" data-pr-tab` + hidden + `>Pull requests (<span data-pr-tab-count>` + strconv.Itoa(count) + `</span>)</a>`)
 	}
 	b.WriteString(`<a` + boardActive + ` href="/board">Board</a>`)
+	b.WriteString(`<a` + ciActive + ` href="/ci">CI</a>`)
 	b.WriteString(`<a` + issuesActive + ` href="/issues">Issues</a>`)
 	b.WriteString(`<a` + settingsActive + ` href="/settings" data-capability="read">Settings</a>`)
 	b.WriteString(`</nav>`)
@@ -4032,6 +4121,53 @@ func issueListHTML(issues []brokerIssue) string {
 	}
 	if count == 0 {
 		return `<div class="empty">No issues found.</div>`
+	}
+	b.WriteString(`</div>`)
+	return b.String()
+}
+
+func ciRunFormHTML(cfg config) string {
+	provider := defaultCIProvider(cfg)
+	ref := shortRefName(firstNonEmpty(cfg.branch, defaultBranch))
+	config := ""
+	if detected, err := detectCIConfig(provider, "HEAD"); err == nil {
+		config = detected
+	}
+	var b strings.Builder
+	b.WriteString(`<form class="ci-run-form settings-form" data-ci-form data-capability="push">`)
+	b.WriteString(`<h3>Run CI</h3><div class="settings-form-grid">`)
+	b.WriteString(`<label>Provider<select name="provider"><option value="gcp"`)
+	if provider == "gcp" {
+		b.WriteString(` selected`)
+	}
+	b.WriteString(`>GCP Cloud Build</option><option value="aws"`)
+	if provider == "aws" {
+		b.WriteString(` selected`)
+	}
+	b.WriteString(`>AWS CodeBuild</option></select></label>`)
+	b.WriteString(`<label>Branch or ref<input name="ref" value="` + html.EscapeString(ref) + `" autocomplete="off" required></label>`)
+	b.WriteString(`<label>Config<input name="config" value="` + html.EscapeString(config) + `" placeholder="cloudbuild.yaml or buildspec.yml" autocomplete="off"></label>`)
+	b.WriteString(`</div><div class="settings-actions"><button class="button-link primary" type="submit">Run CI</button></div></form>`)
+	return b.String()
+}
+
+func ciRunListHTML(runs []brokerCIRun) string {
+	if len(runs) == 0 {
+		return `<div class="empty">No CI runs yet.</div>`
+	}
+	var b strings.Builder
+	b.WriteString(`<div class="ci-run-list" data-ci-runs>`)
+	for _, run := range runs {
+		status := firstNonEmpty(run.Status, "queued")
+		b.WriteString(`<div class="ci-run-row"><div><strong>#` + strconv.Itoa(run.ID) + ` ` + html.EscapeString(status) + `</strong><span>` + html.EscapeString(strings.ToUpper(firstNonEmpty(run.Provider, "ci"))) + ` · ` + html.EscapeString(shortRefName(run.Ref)) + ` · ` + html.EscapeString(shortHash(run.Commit)) + ` · ` + html.EscapeString(run.Config) + `</span>`)
+		if run.Message != "" {
+			b.WriteString(`<small>` + html.EscapeString(run.Message) + `</small>`)
+		}
+		b.WriteString(`</div>`)
+		if run.URL != "" {
+			b.WriteString(`<a class="button-link" href="` + html.EscapeString(run.URL) + `" target="_blank" rel="noreferrer">Open</a>`)
+		}
+		b.WriteString(`</div>`)
 	}
 	b.WriteString(`</div>`)
 	return b.String()

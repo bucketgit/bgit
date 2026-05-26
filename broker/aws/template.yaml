@@ -1,6 +1,18 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: Minimal bgit SSH broker control-plane endpoint.
+Parameters:
+  CiMaterializerUrl:
+    Type: String
+    Default: ''
+    Description: Trusted CI materializer endpoint invoked by the broker.
 Resources:
+  CiMaterializerTokenSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: bgit-ci-materializer-token
+      GenerateSecretString:
+        PasswordLength: 43
+        ExcludePunctuation: true
   BrokerTransferRole:
     Type: AWS::IAM::Role
     Properties:
@@ -82,6 +94,16 @@ Resources:
                 Resource:
                   - arn:aws:s3:::*
                   - arn:aws:s3:::*/*
+              - Effect: Allow
+                Action:
+                  - codebuild:StartBuild
+                  - codebuild:BatchGetBuilds
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                  - secretsmanager:PutSecretValue
+                Resource: !Ref CiMaterializerTokenSecret
   BrokerTable:
     Type: AWS::DynamoDB::Table
     Properties:
@@ -137,19 +159,24 @@ Resources:
           MEMBER_TABLE_NAME: !Ref BrokerMemberTable
           TRANSFER_ROLE_ARN: !GetAtt BrokerTransferRole.Arn
           BROKER_VERSION: {{BROKER_VERSION}}
+          BGIT_CI_MATERIALIZER_URL: !Ref CiMaterializerUrl
+          BGIT_CI_MATERIALIZER_SECRET_ARN: !Ref CiMaterializerTokenSecret
       Code:
         ZipFile: |
           const crypto = require("crypto");
           const {DynamoDBClient, GetItemCommand, PutItemCommand, QueryCommand, ScanCommand, DeleteItemCommand} = require("@aws-sdk/client-dynamodb");
           const {S3Client, GetObjectCommand, PutObjectCommand, DeleteObjectCommand, ListObjectsV2Command, HeadBucketCommand, CreateBucketCommand, DeleteBucketCommand} = require("@aws-sdk/client-s3");
           const {STSClient, AssumeRoleCommand} = require("@aws-sdk/client-sts");
+          const {SecretsManagerClient, GetSecretValueCommand, PutSecretValueCommand} = require("@aws-sdk/client-secrets-manager");
           const db = new DynamoDBClient({});
           const s3 = new S3Client({});
           const sts = new STSClient({});
+          const secrets = new SecretsManagerClient({});
           const table = process.env.TABLE_NAME;
           const prTable = process.env.PR_TABLE_NAME;
           const memberTable = process.env.MEMBER_TABLE_NAME;
           const transferRoleArn = process.env.TRANSFER_ROLE_ARN;
+          const ciMaterializerSecretArn = process.env.BGIT_CI_MATERIALIZER_SECRET_ARN;
           const brokerVersion = process.env.BROKER_VERSION || "{{BROKER_VERSION}}";
           const zero = "0000000000000000000000000000000000000000";
           const coreTeamID = "t_core";
@@ -725,6 +752,7 @@ Resources:
               reopen_pr: ["owner", "admin", "maintainer"].includes(role),
               owner_transfer: role === "owner",
               broker_upgrade: role === "owner" || role === "admin",
+              ci_run: roleAllows(role, "write"),
             };
           }
           function anonymousKey() {
@@ -1045,6 +1073,75 @@ Resources:
               ScanIndexForward: false,
             }));
             return (out.Items || []).map((item) => JSON.parse(item.data.S || "{}"));
+          }
+          function nextCIID(data) {
+            data.next_ci_id = Number(data.next_ci_id || 1);
+            return data.next_ci_id++;
+          }
+          function listCIRuns(data) {
+            const runs = Array.isArray(data.ci_runs) ? data.ci_runs : [];
+            return [...runs].sort((a, b) => Number(b.id || 0) - Number(a.id || 0));
+          }
+          function findCIRun(data, id) {
+            return (data.ci_runs || []).find((run) => Number(run.id) === Number(id));
+          }
+          function normalizeCIProvider(value, repo) {
+            const raw = String(value || "").trim().toLowerCase();
+            if (raw === "gcp" || raw === "cloudbuild") return "gcp";
+            if (raw === "aws" || raw === "codebuild" || (raw === "" && repo.provider === "s3")) return "aws";
+            return "aws";
+          }
+          function normalizeCIRef(value) {
+            const ref = String(value || "").trim();
+            if (!ref) throw new Error("CI ref is required");
+            if (ref.startsWith("refs/")) return ref;
+            return "refs/heads/" + ref.replace(/^heads\//, "");
+          }
+          function cleanCIConfig(value, provider) {
+            const config = String(value || "").trim();
+            const defaults = provider === "aws" ? ["buildspec.yml", "buildspec.yaml"] : ["cloudbuild.yaml", "cloudbuild.yml"];
+            const out = config || defaults[0];
+            if (out.startsWith("/") || out.includes("\\") || out.includes("\0") || out.split("/").includes("..")) throw Object.assign(new Error("invalid CI config path"), {statusCode: 400});
+            if (!/\.(ya?ml)$/i.test(out)) throw Object.assign(new Error("CI config must be a YAML file"), {statusCode: 400});
+            return out;
+          }
+          async function triggerCIRun(entry, run) {
+            const url = String(process.env.BGIT_CI_MATERIALIZER_URL || "").trim();
+            if (!url) {
+              run.status = "queued";
+              run.message = "CI materializer is not configured for this broker yet.";
+              return run;
+            }
+            const payload = {
+              repo: entry.data.repo,
+              run: {id: run.id, provider: run.provider, ref: run.ref, commit: run.commit, config: run.config},
+              broker_version: brokerVersion,
+            };
+            const headers = {"content-type": "application/json"};
+            const token = await ciMaterializerToken();
+            if (token) headers.authorization = "Bearer " + token;
+            const resp = await fetch(url, {method: "POST", headers, body: JSON.stringify(payload)});
+            const text = await resp.text();
+            if (!resp.ok) throw Object.assign(new Error(text || ("CI materializer returned HTTP " + resp.status)), {statusCode: 502});
+            let data = {};
+            try { data = text ? JSON.parse(text) : {}; } catch (_) {}
+            run.status = data.status || "queued";
+            run.url = data.url || run.url || "";
+            run.message = data.message || run.message || "";
+            return run;
+          }
+          function randomCIToken() {
+            return crypto.randomBytes(32).toString("base64url");
+          }
+          async function ciMaterializerToken() {
+            if (!ciMaterializerSecretArn) return "";
+            const out = await secrets.send(new GetSecretValueCommand({SecretId: ciMaterializerSecretArn}));
+            return String(out.SecretString || "").trim();
+          }
+          async function rotateCIMaterializerToken() {
+            if (!ciMaterializerSecretArn) throw Object.assign(new Error("CI materializer secret is not configured"), {statusCode: 500});
+            await secrets.send(new PutSecretValueCommand({SecretId: ciMaterializerSecretArn, SecretString: randomCIToken()}));
+            return {rotated: true};
           }
           async function deleteRepoMetadata(entry) {
             const out = await db.send(new QueryCommand({
@@ -1817,6 +1914,47 @@ Resources:
                 issue.updated_at = new Date().toISOString();
                 await saveIssue(entry, issue);
                 return response(200, {ok: true, issue});
+              }
+              if (path === "/ci/list" && method === "POST") {
+                const entry = await loadRepo(body.repo);
+                await requireOperation(event, entry, "read");
+                return response(200, {runs: listCIRuns(entry.data)});
+              }
+              if (path === "/ci/view" && method === "POST") {
+                const entry = await loadRepo(body.repo);
+                await requireOperation(event, entry, "read");
+                const run = findCIRun(entry.data, body.id);
+                if (!run) throw Object.assign(new Error("CI run not found"), {statusCode: 404});
+                return response(200, {run});
+              }
+              if (path === "/ci/run" && method === "POST") {
+                const entry = await loadRepo(body.repo);
+                const key = await requireOperation(event, entry, "write");
+                const repo = entry.data.repo || {};
+                const provider = normalizeCIProvider(body.provider, repo);
+                const ref = normalizeCIRef(body.ref || repo.default_branch || "refs/heads/main");
+                const refs = entry.data.refs || {};
+                const commit = String(body.commit || refs[ref] || "").trim();
+                if (!commit || !/^[0-9a-f]{40}$/i.test(commit)) throw Object.assign(new Error("CI commit is required"), {statusCode: 400});
+                if (!refs[ref]) throw Object.assign(new Error("CI ref not found"), {statusCode: 404});
+                if (refs[ref] !== commit) throw Object.assign(new Error("CI commit does not match broker ref"), {statusCode: 409});
+                const config = cleanCIConfig(body.config, provider);
+                const now = new Date().toISOString();
+                const run = {id: nextCIID(entry.data), provider, ref, commit, config, status: "queued", url: "", message: "", author: key.user || "", created_at: now, updated_at: now};
+                await triggerCIRun(entry, run);
+                run.updated_at = new Date().toISOString();
+                entry.data.ci_runs = [run, ...(entry.data.ci_runs || [])].slice(0, 100);
+                audit(entry, {type: "ci_run", id: run.id, provider, ref, commit, config, user: key.user});
+                await saveRepo(entry);
+                return response(200, {ok: true, run});
+              }
+              if (path === "/ci/secret/rotate" && method === "POST") {
+                const entry = await loadRepo(body.repo);
+                const key = await requireAdmin(event, entry);
+                await rotateCIMaterializerToken();
+                audit(entry, {type: "ci_secret_rotate", user: key.user});
+                await saveRepo(entry);
+                return response(200, {ok: true});
               }
               if (path === "/prs/create" && method === "POST") {
                 const entry = await loadRepo(body.repo);

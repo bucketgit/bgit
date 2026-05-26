@@ -476,7 +476,7 @@ func TestSetupDialogCreatesAWSProfileInApp(t *testing.T) {
 	writeFakeCLI(t, bin, "aws", []fakeCLIAction{})
 	t.Setenv("PATH", bin)
 	var stdout bytes.Buffer
-	input := " demo\n\x1b[B\nAKIA1234567890ABCDEF\n\x1b[B\nsecretkeyvalue1234567890\n\x1b[B\nus-east-1\n\x04"
+	input := " demo\n\x1b[B\nA3T00123456789ABCDEF\n\x1b[B\ntest-secret-key-value-1234567890\n\x1b[B\nus-east-1\n\x04"
 	selected, err := runSetupDialog(strings.NewReader(input), &stdout, setupSelection{})
 	if err != nil {
 		t.Fatalf("%v\n%s", err, stdout.String())
@@ -484,7 +484,7 @@ func TestSetupDialogCreatesAWSProfileInApp(t *testing.T) {
 	if selected.Action != "create-profile" || selected.CreateProvider != "s3" {
 		t.Fatalf("selection = %#v", selected)
 	}
-	if selected.CreateName != "demo" || selected.CreateAccessKey != "AKIA1234567890ABCDEF" || selected.CreateSecretKey != "secretkeyvalue1234567890" || selected.CreateRegion != "us-east-1" {
+	if selected.CreateName != "demo" || selected.CreateAccessKey != "A3T00123456789ABCDEF" || selected.CreateSecretKey != "test-secret-key-value-1234567890" || selected.CreateRegion != "us-east-1" {
 		t.Fatalf("selection = %#v", selected)
 	}
 	if !strings.Contains(stdout.String(), "Create AWS profile") || strings.Contains(stdout.String(), "AWS Access Key ID [None]") {
@@ -503,7 +503,7 @@ func TestSetupCreateProfileDefaultsAvoidExistingDefault(t *testing.T) {
 }
 
 func TestSetupCreateProfileValidationAndSingleLinePaste(t *testing.T) {
-	state := setupDialogState{createProvider: "s3", createName: "default", createAccessKey: "bad", createSecretKey: "secretkeyvalue1234567890"}
+	state := setupDialogState{createProvider: "s3", createName: "default", createAccessKey: "bad", createSecretKey: "test-secret-key-value-1234567890"}
 	if _, ok := state.deployCreateProfile(); ok || !strings.Contains(state.message, "access key") {
 		t.Fatalf("message = %q ok=%v", state.message, ok)
 	}
@@ -519,13 +519,13 @@ func TestSetupCreateProfileValidationAndSingleLinePaste(t *testing.T) {
 func TestCreateAWSProfileConfiguredUsesAWSConfigureSet(t *testing.T) {
 	bin := t.TempDir()
 	writeFakeCLI(t, bin, "aws", []fakeCLIAction{
-		{match: "configure set aws_access_key_id AKIA1234567890ABCDEF --profile demo"},
-		{match: "configure set aws_secret_access_key secretkeyvalue1234567890 --profile demo"},
+		{match: "configure set aws_access_key_id A3T00123456789ABCDEF --profile demo"},
+		{match: "configure set aws_secret_access_key test-secret-key-value-1234567890 --profile demo"},
 		{match: "configure set region eu-west-1 --profile demo"},
 	})
 	t.Setenv("PATH", bin)
 	var stdout bytes.Buffer
-	if err := createAWSProfileConfigured("demo", "AKIA1234567890ABCDEF", "secretkeyvalue1234567890", "eu-west-1", &stdout); err != nil {
+	if err := createAWSProfileConfigured("demo", "A3T00123456789ABCDEF", "test-secret-key-value-1234567890", "eu-west-1", &stdout); err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(stdout.String(), "created AWS profile demo") {
@@ -636,9 +636,11 @@ func TestSetupCommandProvisionsGCPAndWritesGlobalConfig(t *testing.T) {
 		t.Fatal(err)
 	}
 	var ownerReq brokerOwnerRequest
+	var bootstrapToken string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/owners/upsert":
+			bootstrapToken = r.Header.Get("X-Bgit-Bootstrap-Token")
 			if err := json.NewDecoder(r.Body).Decode(&ownerReq); err != nil {
 				t.Fatal(err)
 			}
@@ -683,6 +685,9 @@ func TestSetupCommandProvisionsGCPAndWritesGlobalConfig(t *testing.T) {
 	}
 	if len(ownerReq.PublicKeys) != 1 || ownerReq.Role != "owner" {
 		t.Fatalf("owner request = %#v", ownerReq)
+	}
+	if bootstrapToken == "" {
+		t.Fatalf("missing bootstrap token header")
 	}
 	cfg, err := readGlobalConfig(configPath)
 	if err != nil {

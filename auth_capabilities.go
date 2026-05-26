@@ -158,7 +158,7 @@ func reposCommand(ctx context.Context, cfg config, args []string, stdout io.Writ
 
 func brokerReposMineAllKeys(ctx context.Context, brokerURL string) ([]brokerRepoMembership, error) {
 	data := []byte(`{}`)
-	headerSets := brokerSignatureHeaderSetsForBroker(brokerURL, data)
+	headerSets := brokerSignatureHeaderSetsForBroker(brokerURL, "/repos/mine", data)
 	if len(headerSets) == 0 {
 		return nil, errors.New("no SSH agent keys available")
 	}
@@ -247,7 +247,7 @@ func brokerPostContextWithHeaders(ctx context.Context, brokerURL, path string, d
 		if msg == "" {
 			msg = httpResp.Status
 		}
-		return fmt.Errorf("broker %s: %s", path, msg)
+		return brokerHTTPError(path, msg)
 	}
 	if resp != nil && len(body) > 0 {
 		if err := json.Unmarshal(body, resp); err != nil {

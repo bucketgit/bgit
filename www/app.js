@@ -957,9 +957,10 @@ async function fetchJSON(path) {
 }
 
 async function postJSON(path, body) {
+  const csrf = document.querySelector('meta[name="bgit-csrf-token"]')?.getAttribute('content') || '';
   const response = await fetch(path, {
     method: 'POST',
-    headers: {'accept': 'application/json', 'content-type': 'application/json'},
+    headers: {'accept': 'application/json', 'content-type': 'application/json', 'x-bgit-csrf': csrf},
     body: JSON.stringify(body || {})
   });
   if (!response.ok) throw new Error(await response.text());

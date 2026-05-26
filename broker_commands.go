@@ -80,14 +80,53 @@ func brokerAdminCommandWithInput(cfg config, args []string, stdin io.Reader, std
 func brokerAdminBrokerCommand(cfg config, args []string, stdin io.Reader, stdout io.Writer) error {
 	_ = stdin
 	if len(args) == 0 {
-		return errors.New("usage: bgit admin broker upgrade [--config PATH]")
+		return errors.New("usage: bgit admin broker upgrade [--config PATH] | owner-bootstrap reset [--config PATH]")
 	}
 	switch args[0] {
 	case "upgrade":
 		return brokerAdminBrokerUpgradeCommand(cfg, args[1:], stdin, stdout)
+	case "owner-bootstrap":
+		return brokerAdminBrokerOwnerBootstrapCommand(cfg, args[1:], stdout)
 	default:
 		return fmt.Errorf("unknown admin broker command %q", args[0])
 	}
+}
+
+func brokerAdminBrokerOwnerBootstrapCommand(cfg config, args []string, stdout io.Writer) error {
+	if len(args) == 0 || args[0] != "reset" {
+		return errors.New("usage: bgit admin broker owner-bootstrap reset [--config PATH]")
+	}
+	configPath := ""
+	for i := 1; i < len(args); i++ {
+		arg := args[i]
+		name, value, hasValue := strings.Cut(arg, "=")
+		switch name {
+		case "--config":
+			var err error
+			value, i, err = optionValue(args, i, hasValue, value, name)
+			if err != nil {
+				return err
+			}
+			configPath = expandHome(value)
+		default:
+			return fmt.Errorf("unsupported owner-bootstrap reset option %s", arg)
+		}
+	}
+	global, path, err := loadGlobalConfigForInit(configPath)
+	if err != nil {
+		return err
+	}
+	target, err := brokerUpgradeTargetForCurrentRepo(cfg, global)
+	if err != nil {
+		return err
+	}
+	provisioned, err := brokerProvisionResolvedTarget(path, target, &global, stdout)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(stdout, "reset owner bootstrap token for broker %s\n", provisioned.URL)
+	fmt.Fprintf(stdout, "bootstrap token: %s\n", provisioned.BootstrapToken)
+	return nil
 }
 
 func brokerAdminBrokerUpgradeCommand(cfg config, args []string, stdin io.Reader, stdout io.Writer) error {
@@ -117,22 +156,23 @@ func brokerAdminBrokerUpgradeCommand(cfg config, args []string, stdin io.Reader,
 		return err
 	}
 	fmt.Fprintf(stdout, "Upgrading broker %s for %s:%s/%s\n", target.BrokerURL, setupProviderLabel(target.Provider), target.Name, target.Region)
-	return brokerUpgradeResolvedTarget(path, target, &global, stdout)
+	_, err = brokerProvisionResolvedTarget(path, target, &global, stdout)
+	return err
 }
 
-func brokerUpgradeResolvedTarget(path string, target brokerProfile, global *globalConfig, stdout io.Writer) error {
+func brokerProvisionResolvedTarget(path string, target brokerProfile, global *globalConfig, stdout io.Writer) (provisionedBroker, error) {
 	cfg := config{
 		provider:                    target.Provider,
 		gcloudConfiguration:         target.Name,
 		gcloudConfigurationExplicit: target.Name != "",
 		region:                      target.Region,
 	}
-	brokerURL, err := provisionBrokerURL(cfg, sshSetupOptions{region: target.Region}, stdout)
+	provisioned, err := provisionBroker(cfg, sshSetupOptions{region: target.Region}, stdout)
 	if err != nil {
-		return err
+		return provisionedBroker{}, err
 	}
-	if err := brokerEnsureCoreTeam(brokerURL); err != nil {
-		return err
+	if err := brokerEnsureCoreTeam(provisioned.URL); err != nil {
+		return provisionedBroker{}, err
 	}
 	now := time.Now().UTC().Format(time.RFC3339)
 	switch target.Provider {
@@ -149,7 +189,7 @@ func brokerUpgradeResolvedTarget(path string, target brokerProfile, global *glob
 			ServiceAccount: serviceAccount,
 			Regions: []globalProfileRegion{{
 				Name:          target.Region,
-				BrokerURL:     brokerURL,
+				BrokerURL:     provisioned.URL,
 				BrokerVersion: brokerVersion,
 				LastSetupAt:   now,
 			}},
@@ -162,19 +202,19 @@ func brokerUpgradeResolvedTarget(path string, target brokerProfile, global *glob
 			ARN:       existing.ARN,
 			Regions: []globalProfileRegion{{
 				Name:          target.Region,
-				BrokerURL:     brokerURL,
+				BrokerURL:     provisioned.URL,
 				BrokerVersion: brokerVersion,
 				LastSetupAt:   now,
 			}},
 		})
 	default:
-		return fmt.Errorf("unsupported broker provider %q", target.Provider)
+		return provisionedBroker{}, fmt.Errorf("unsupported broker provider %q", target.Provider)
 	}
 	if err := writeGlobalConfig(path, *global); err != nil {
-		return err
+		return provisionedBroker{}, err
 	}
-	fmt.Fprintf(stdout, "upgraded broker %s\n", brokerURL)
-	return nil
+	fmt.Fprintf(stdout, "upgraded broker %s\n", provisioned.URL)
+	return provisioned, nil
 }
 
 func findGlobalGCPProfile(cfg globalConfig, name string) globalGCPProfile {

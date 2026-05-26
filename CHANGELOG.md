@@ -10,6 +10,9 @@ This project follows semantic versioning.
   view for trusted provider/materializer build handoff against broker refs.
 - Added managed CI materializer tokens with secret rotation via
   `bgit admin ci rotate-secret`.
+- Hardened broker security with replay-resistant v2 request signatures,
+  one-time owner bootstrap tokens, constrained object capabilities, private CI
+  materializer invocation, and CSRF protection for local `bgit web` mutations.
 
 ## 1.1.3
 

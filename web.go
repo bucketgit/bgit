@@ -4,6 +4,7 @@ import (
 	"archive/zip"
 	"bytes"
 	"context"
+	"crypto/rand"
 	"embed"
 	"encoding/base64"
 	"encoding/json"
@@ -57,6 +58,7 @@ type webServer struct {
 	title       string
 	events      *webEventHub
 	localGitDir string
+	csrfToken   string
 }
 
 type brokerGitStore struct {
@@ -379,7 +381,11 @@ func newWebHandlerWithAPI(repo, apiRepo *nativeGitRepo, cfg config) *webServer {
 			localGitDir = store.root
 		}
 	}
-	return &webServer{repo: repo, apiRepo: apiRepo, cfg: cfg, title: webRepoTitle(cfg), events: newWebEventHub(), localGitDir: localGitDir}
+	csrfToken, err := randomWebCSRFToken()
+	if err != nil {
+		csrfToken = fmt.Sprintf("%d", time.Now().UnixNano())
+	}
+	return &webServer{repo: repo, apiRepo: apiRepo, cfg: cfg, title: webRepoTitle(cfg), events: newWebEventHub(), localGitDir: localGitDir, csrfToken: csrfToken}
 }
 
 func webRepoTitle(cfg config) string {
@@ -400,6 +406,12 @@ func (s *webServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	route := strings.TrimPrefix(r.URL.Path, "/")
 	srv := s.serverForRequest(r, strings.HasPrefix(route, "api/"))
+	if s.isMutationRoute(route, r.Method) {
+		if err := s.validateWebMutation(r); err != nil {
+			http.Error(w, err.Error(), http.StatusForbidden)
+			return
+		}
+	}
 	switch {
 	case r.Method != http.MethodGet && r.Method != http.MethodHead && !strings.HasPrefix(route, "api/actions/") && route != "api/user/profile":
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -498,6 +510,44 @@ func (s *webServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.NotFound(w, r)
 	}
+}
+
+func randomWebCSRFToken() (string, error) {
+	var data [32]byte
+	if _, err := rand.Read(data[:]); err != nil {
+		return "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(data[:]), nil
+}
+
+func (s *webServer) isMutationRoute(route, method string) bool {
+	if method == http.MethodGet || method == http.MethodHead || method == http.MethodOptions {
+		return false
+	}
+	return strings.HasPrefix(route, "api/actions/") || route == "api/user/profile"
+}
+
+func (s *webServer) validateWebMutation(r *http.Request) error {
+	if r.Header.Get("X-Bgit-CSRF") != s.csrfToken {
+		return errors.New("invalid CSRF token")
+	}
+	origin := strings.TrimSpace(r.Header.Get("Origin"))
+	if origin == "" {
+		return nil
+	}
+	u, err := url.Parse(origin)
+	if err != nil {
+		return errors.New("invalid origin")
+	}
+	host, _, err := net.SplitHostPort(u.Host)
+	if err != nil {
+		host = u.Hostname()
+	}
+	host = strings.ToLower(strings.Trim(host, "[]"))
+	if u.Scheme != "http" || (host != "localhost" && host != "127.0.0.1" && host != "::1") {
+		return errors.New("foreign origin rejected")
+	}
+	return nil
 }
 
 func (s *webServer) handleWebAsset(w http.ResponseWriter, path string) {
@@ -3856,6 +3906,7 @@ func (s *webServer) renderPage(w http.ResponseWriter, title, body string) {
 	page = strings.ReplaceAll(page, "{{TITLE}}", html.EscapeString(title))
 	page = strings.ReplaceAll(page, "{{CSS}}", webAssetString(webCSSPath))
 	page = strings.ReplaceAll(page, "{{SOURCE}}", source)
+	page = strings.ReplaceAll(page, "{{CSRF}}", html.EscapeString(s.csrfToken))
 	page = strings.ReplaceAll(page, "{{BODY}}", body)
 	page = strings.ReplaceAll(page, "{{WHOAMI}}", s.cachedWhoamiJSON())
 	page = strings.ReplaceAll(page, "{{JS}}", webAssetString(webJSPath))

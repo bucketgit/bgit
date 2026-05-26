@@ -577,12 +577,13 @@ func setupProvisionSelectedProfile(base config, path, now string, profile setupP
 	cfg.provider = profile.Provider
 	cfg.gcloudConfiguration = profile.Name
 	cfg.gcloudConfigurationExplicit = profile.Name != ""
-	brokerURL, err := provisionBrokerURL(cfg, sshSetupOptions{region: firstNonEmpty(opts.region, profile.Region)}, stdout)
+	broker, err := provisionBroker(cfg, sshSetupOptions{region: firstNonEmpty(opts.region, profile.Region)}, stdout)
 	if err != nil {
 		return err
 	}
+	brokerURL := broker.URL
 	if len(publicKeys) > 0 {
-		if err := brokerUpsertOwners(brokerURL, publicKeys); err != nil {
+		if err := brokerUpsertOwners(brokerURL, broker.BootstrapToken, publicKeys); err != nil {
 			return err
 		}
 		fmt.Fprintf(stdout, "imported %d owner key(s) into broker %s\n", len(publicKeys), brokerURL)
@@ -6335,8 +6336,12 @@ func shortSetupKey(key string) string {
 	return fields[0] + " " + part
 }
 
-func brokerUpsertOwners(brokerURL string, publicKeys []string) error {
-	return brokerPost(brokerURL, "/owners/upsert", brokerOwnerRequest{User: "owner", Role: "owner", PublicKeys: publicKeys}, nil)
+func brokerUpsertOwners(brokerURL, bootstrapToken string, publicKeys []string) error {
+	headers := map[string]string{}
+	if strings.TrimSpace(bootstrapToken) != "" {
+		headers["X-Bgit-Bootstrap-Token"] = strings.TrimSpace(bootstrapToken)
+	}
+	return brokerPostJSONContextWithHeaders(context.Background(), brokerURL, "/owners/upsert", brokerOwnerRequest{User: "owner", Role: "owner", PublicKeys: publicKeys}, nil, headers)
 }
 
 func brokerEnsureCoreTeam(brokerURL string) error {

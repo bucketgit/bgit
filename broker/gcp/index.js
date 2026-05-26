@@ -8,6 +8,7 @@ const {GoogleAuth} = require('google-auth-library');
 const db = new Firestore({databaseId: process.env.FIRESTORE_DATABASE || 'bgit'});
 const repos = db.collection('bgit_broker_repos');
 const members = db.collection('bgit_broker_members');
+const nonces = db.collection('bgit_broker_nonces');
 const storage = new Storage();
 const auth = new GoogleAuth({scopes: ['https://www.googleapis.com/auth/cloud-platform']});
 const brokerVersion = process.env.BROKER_VERSION || '{{BROKER_VERSION}}';
@@ -312,12 +313,12 @@ async function signedBrokerUser(req) {
   const publicKey = normalizeKey(req.get('x-bgit-key'));
   const message = String(req.get('x-bgit-signature-message') || '');
   const signature = String(req.get('x-bgit-signature') || '');
-  if (!publicKey || !message || !signature || message !== expectedMessage(req)) return null;
+  if (!publicKey || !message || !signature) return null;
   for (const user of users.data.users || []) {
     if (user.suspended) continue;
     for (const key of user.keys || []) {
       const keyValue = normalizeKey(key.public_key || key);
-      if (keyValue === publicKey && verifySSHSignature(publicKey, message, signature)) {
+      if (keyValue === publicKey && await verifySignedRequest(req, publicKey, message, signature)) {
         return {user: user.username || user.id, user_id: user.id, broker_role: user.broker_role || 'user', public_key: publicKey, source: 'broker-user'};
       }
     }
@@ -329,7 +330,7 @@ async function requireBrokerAdmin(req) {
   const user = await signedBrokerUser(req);
   if (user && (user.broker_role === 'owner' || user.broker_role === 'admin')) return user;
   const owners = await loadOwners();
-  const key = signedKey(req, owners);
+  const key = await signedKey(req, owners);
   if (key && (key.role === 'owner' || key.role === 'admin')) return {user: key.user || 'owner', broker_role: key.role, public_key: key.public_key};
   throw Object.assign(new Error('broker admin SSH signature required'), {status: 403});
 }
@@ -392,7 +393,7 @@ function weakerRole(a, b) {
 }
 
 async function effectiveSignedKey(req, entry) {
-  let direct = signedKey(req, entry);
+  let direct = await signedKey(req, entry);
   let role = direct ? direct.role : '';
   const brokerUser = await signedBrokerUser(req);
   if (brokerUser) {
@@ -429,8 +430,77 @@ function rawBody(req) {
 }
 
 function expectedMessage(req) {
-  const digest = crypto.createHash('sha256').update(rawBody(req)).digest('base64');
-  return Buffer.from('bgit-broker-v1\n' + digest).toString('base64');
+  const timestamp = String(req.get('x-bgit-timestamp') || '').trim();
+  const nonce = String(req.get('x-bgit-nonce') || '').trim();
+  const signedHost = String(req.get('x-bgit-signed-host') || '').trim().toLowerCase();
+  const digest = crypto.createHash('sha256').update(rawBody(req)).digest('hex');
+  return Buffer.from([
+    'bgit-broker-v2',
+    String(req.method || '').toUpperCase(),
+    requestPathWithQuery(req),
+    signedHost,
+    timestamp,
+    nonce,
+    digest,
+  ].join('\n')).toString('base64');
+}
+
+function requestPathWithQuery(req) {
+  const original = String(req.originalUrl || req.url || req.path || '/');
+  if (!original) return '/';
+  if (original.startsWith('/')) return original;
+  try {
+    return new URL(original).pathname + new URL(original).search;
+  } catch (_) {
+    return req.path || '/';
+  }
+}
+
+function observedHost(req) {
+  return String(req.get('x-forwarded-host') || req.get('host') || '').split(',')[0].trim().toLowerCase();
+}
+
+function validateSignatureHeaders(req, message) {
+  if (String(req.get('x-bgit-signature-version') || '') !== '2') return false;
+  const timestamp = String(req.get('x-bgit-timestamp') || '').trim();
+  const nonce = String(req.get('x-bgit-nonce') || '').trim();
+  const signedHost = String(req.get('x-bgit-signed-host') || '').trim().toLowerCase();
+  if (!timestamp || !nonce || !signedHost || !message) return false;
+  if (message !== expectedMessage(req)) return false;
+  const ts = Number(timestamp);
+  if (!Number.isInteger(ts)) return false;
+  const now = Math.floor(Date.now() / 1000);
+  if (Math.abs(now - ts) > 300) return false;
+  const host = observedHost(req);
+  if (!host || signedHost !== host) return false;
+  return true;
+}
+
+async function consumeSignatureNonce(fingerprint, nonce, timestamp) {
+  const nonceID = Buffer.from(fingerprint + '\n' + nonce).toString('base64url');
+  const ref = nonces.doc(nonceID);
+  const expiresAt = new Date((Number(timestamp) + 300) * 1000).toISOString();
+  await db.runTransaction(async (tx) => {
+    const snap = await tx.get(ref);
+    if (snap.exists) {
+      const data = snap.data() || {};
+      if (!data.expires_at || Date.parse(data.expires_at) > Date.now()) {
+        throw Object.assign(new Error('broker signature replay detected'), {status: 403});
+      }
+    }
+    tx.set(ref, {fingerprint, nonce, expires_at: expiresAt, created_at: new Date().toISOString()}, {merge: false});
+  });
+}
+
+async function verifySignedRequest(req, publicKey, message, signature) {
+  const fingerprint = keyFingerprint(publicKey);
+  const verified = req.bgitVerifiedSignature || {};
+  if (verified[fingerprint]) return true;
+  if (!validateSignatureHeaders(req, message)) return false;
+  if (!verifySSHSignature(publicKey, message, signature)) return false;
+  await consumeSignatureNonce(fingerprint, String(req.get('x-bgit-nonce') || '').trim(), String(req.get('x-bgit-timestamp') || '').trim());
+  req.bgitVerifiedSignature = {...verified, [fingerprint]: true};
+  return true;
 }
 
 function normalizeKey(key) {
@@ -521,24 +591,24 @@ function verifySSHSignature(publicKey, message, signature) {
   return crypto.verify(signatureVerifyAlgorithm(alg), Buffer.from(message, 'base64'), publicKeyObject(publicKey), signatureBlobForVerify(alg, sig));
 }
 
-function signedKey(req, entry) {
+async function signedKey(req, entry) {
   const keys = (entry.data.keys || []).filter((k) => !k.suspended);
   const publicKey = normalizeKey(req.get('x-bgit-key'));
   const message = String(req.get('x-bgit-signature-message') || '');
   const signature = String(req.get('x-bgit-signature') || '');
-  if (!publicKey || !message || !signature || message !== expectedMessage(req)) return null;
+  if (!publicKey || !message || !signature) return null;
   const key = keys.find((k) => normalizeKey(k.public_key) === publicKey);
   if (!key) return null;
-  if (!verifySSHSignature(publicKey, message, signature)) return null;
+  if (!await verifySignedRequest(req, publicKey, message, signature)) return null;
   return key;
 }
 
-function submittedSignedKey(req) {
+async function submittedSignedKey(req) {
   const publicKey = normalizeKey(req.get('x-bgit-key'));
   const message = String(req.get('x-bgit-signature-message') || '');
   const signature = String(req.get('x-bgit-signature') || '');
-  if (!publicKey || !message || !signature || message !== expectedMessage(req)) return null;
-  if (!verifySSHSignature(publicKey, message, signature)) return null;
+  if (!publicKey || !message || !signature) return null;
+  if (!await verifySignedRequest(req, publicKey, message, signature)) return null;
   return {public_key: publicKey, fingerprint: keyFingerprint(publicKey)};
 }
 
@@ -565,11 +635,22 @@ function brokerUserInviteCode(brokerURL, user, role, token) {
   return 'bgituser_' + payload;
 }
 
-function verifySignature(req, entry) {
+async function verifySignature(req, entry) {
   const adminKeys = (entry.data.keys || []).filter((k) => (k.role === 'admin' || k.role === 'owner') && !k.suspended);
-  if (adminKeys.length === 0) return true;
-  const key = signedKey(req, entry);
+  if (adminKeys.length === 0) return verifyBootstrapToken(req, entry);
+  const key = await signedKey(req, entry);
   return !!key && (key.role === 'admin' || key.role === 'owner');
+}
+
+function bootstrapTokenHash(token) {
+  return crypto.createHash('sha256').update(String(token || '')).digest('hex');
+}
+
+function verifyBootstrapToken(req, entry) {
+  const expected = String(process.env.BGIT_OWNER_BOOTSTRAP_HASH || '').trim();
+  if (!expected || entry.data.bootstrap_used_at) return false;
+  const token = String(req.get('x-bgit-bootstrap-token') || '').trim();
+  return !!token && bootstrapTokenHash(token) === expected;
 }
 
 function roleAllows(role, operation) {
@@ -772,8 +853,27 @@ async function boardAssignableUsers(entry) {
 
 function cleanObjectPath(value) {
   const path = String(value || '').replace(/^\/+/, '');
-  if (path.includes('\0') || path.includes('..')) throw new Error('invalid object path');
+  if (path.includes('\0') || path.includes('\\') || path.split('/').some((part) => part === '.' || part === '..' || (part === '' && path !== ''))) throw new Error('invalid object path');
   return path;
+}
+
+function isGitObjectDatabasePath(path) {
+  return path === 'objects' || path.startsWith('objects/');
+}
+
+function validateCapabilityPath(operation, objectPath) {
+  const path = cleanObjectPath(objectPath);
+  if (!path) throw Object.assign(new Error('invalid object path'), {status: 400});
+  if (operation === 'delete') throw Object.assign(new Error('delete capabilities are not supported'), {status: 400});
+  if (operation === 'write') {
+    if (!isGitObjectDatabasePath(path)) throw Object.assign(new Error('write capabilities are restricted to git object paths'), {status: 403});
+    return path;
+  }
+  if (operation === 'read') {
+    if (path === 'HEAD' || path === 'packed-refs' || path.startsWith('refs/') || isGitObjectDatabasePath(path)) return path;
+    throw Object.assign(new Error('read capabilities are restricted to git repository paths'), {status: 403});
+  }
+  throw Object.assign(new Error('unsupported object capability operation'), {status: 400});
 }
 
 function objectName(repo, objectPath) {
@@ -982,12 +1082,10 @@ async function triggerCIRun(entry, run) {
   };
   const headers = {'content-type': 'application/json'};
   const token = await ciMaterializerToken();
-  if (token) headers.authorization = 'Bearer ' + token;
-  const resp = await fetch(url, {method: 'POST', headers, body: JSON.stringify(payload)});
-  const text = await resp.text();
-  if (!resp.ok) throw Object.assign(new Error(text || ('CI materializer returned HTTP ' + resp.status)), {status: 502});
-  let data = {};
-  try { data = text ? JSON.parse(text) : {}; } catch (_) {}
+  if (token) headers['x-bgit-ci-token'] = token;
+  const client = await auth.getIdTokenClient(url);
+  const resp = await client.request({url, method: 'POST', headers, data: payload});
+  const data = resp.data && typeof resp.data === 'object' ? resp.data : {};
   run.status = data.status || 'queued';
   run.url = data.url || run.url || '';
   run.message = data.message || run.message || '';
@@ -1192,12 +1290,17 @@ exports.broker = async (req, res) => {
     const body = req.body || {};
     if (req.path === '/owners/upsert' && req.method === 'POST') {
       const entry = await loadOwners();
-      if (!verifySignature(req, entry)) throw Object.assign(new Error('owner SSH signature required'), {status: 403});
+      const bootstrapping = !(entry.data.keys || []).some((k) => (k.role === 'admin' || k.role === 'owner') && !k.suspended);
+      if (!await verifySignature(req, entry)) throw Object.assign(new Error('owner SSH signature required'), {status: 403});
       const user = body.user || 'owner';
       const role = normalizeRole(body.role || 'owner');
       if (role !== 'owner') throw new Error('owner bootstrap only accepts owner role');
       for (const publicKey of body.public_keys || []) {
         if (!assertUniqueRepoKey(entry, publicKey, user)) entry.data.keys.push({user, role, public_key: publicKey, source: body.source || '', suspended: false});
+      }
+      if (bootstrapping) {
+        entry.data.bootstrap_used_at = new Date().toISOString();
+        audit(entry, {type: 'owner_bootstrap', user, source_ip: req.get('x-forwarded-for') || req.ip || '', user_agent: req.get('user-agent') || ''});
       }
       await saveRepo(entry);
       await ensureCoreTeam(user);
@@ -1320,7 +1423,7 @@ exports.broker = async (req, res) => {
     }
     if (req.path === '/broker/users/invite/accept' && req.method === 'POST') {
       const users = await loadBrokerUsers();
-      const signed = submittedSignedKey(req);
+      const signed = await submittedSignedKey(req);
       if (!signed) throw Object.assign(new Error('SSH signature required'), {status: 403});
       const tokenHash = ownershipTransferTokenHash(body.token);
       const invites = users.data.invites || [];
@@ -1672,7 +1775,7 @@ exports.broker = async (req, res) => {
     }
     if (req.path === '/keys/invite/accept' && req.method === 'POST') {
       const entry = await ensureRepo(body.repo);
-      const signed = submittedSignedKey(req);
+      const signed = await submittedSignedKey(req);
       if (!signed) throw Object.assign(new Error('SSH signature required'), {status: 403});
       const tokenHash = ownershipTransferTokenHash(body.token);
       const invites = entry.data.invites || [];
@@ -1790,7 +1893,7 @@ exports.broker = async (req, res) => {
       const transfer = entry.data.owner_transfer;
       if (!transfer || ownershipTransferExpired(transfer)) throw Object.assign(new Error('ownership transfer is not pending or has expired'), {status: 404});
       if (ownershipTransferTokenHash(body.token) !== transfer.token_hash) throw Object.assign(new Error('ownership transfer code is invalid'), {status: 403});
-      const accepted = submittedSignedKey(req);
+      const accepted = await submittedSignedKey(req);
       if (!accepted) throw Object.assign(new Error('SSH signature required'), {status: 403});
       const user = String(body.user || 'owner').trim() || 'owner';
       const ownerFingerprint = transfer.requested_by_fingerprint || '';
@@ -2173,6 +2276,8 @@ exports.broker = async (req, res) => {
     if (req.path === '/repos/mine' && req.method === 'POST') {
       const fingerprint = req.get('x-bgit-key-fingerprint') || '';
       if (!fingerprint) throw Object.assign(new Error('SSH signature required'), {status: 403});
+      const signed = await submittedSignedKey(req);
+      if (!signed || signed.fingerprint !== fingerprint) throw Object.assign(new Error('SSH signature required'), {status: 403});
       const snap = await members.doc(memberDocID(fingerprint)).collection('repos').get();
       const out = [];
       snap.forEach((doc) => {
@@ -2192,7 +2297,7 @@ exports.broker = async (req, res) => {
         return;
       }
       const owners = await loadOwners();
-      if (!verifySignature(req, owners)) throw Object.assign(new Error('owner SSH signature required'), {status: 403});
+      if (!await verifySignature(req, owners)) throw Object.assign(new Error('owner SSH signature required'), {status: 403});
       const count = await syncAllMembershipIndexes();
       res.status(200).send(JSON.stringify({ok: true, repositories: count}));
       return;
@@ -2202,10 +2307,11 @@ exports.broker = async (req, res) => {
       const operation = body.operation || 'read';
       const key = operation === 'read' ? await requireRead(req, entry) : await requireWrite(req, entry);
       const repo = await ensurePhysicalRepo(entry);
-      const capability = body.resumable ? await resumableUpload(repo, body.path) : await signedURL(repo, body.path, operation);
-      audit(entry, {type: 'capability_issued', operation, path: body.path, user: key.user, role: key.role});
+      const capabilityPath = validateCapabilityPath(operation, body.path);
+      const capability = body.resumable ? await resumableUpload(repo, capabilityPath) : await signedURL(repo, capabilityPath, operation);
+      audit(entry, {type: 'capability_issued', operation, path: capabilityPath, user: key.user, role: key.role});
       await saveRepo(entry);
-      res.status(200).send(JSON.stringify({...capability, bucket: repo.bucket, prefix: repo.prefix, object: objectName(repo, body.path)}));
+      res.status(200).send(JSON.stringify({...capability, bucket: repo.bucket, prefix: repo.prefix, object: objectName(repo, capabilityPath)}));
       return;
     }
     if (req.path === '/objects/read' && req.method === 'POST') {

@@ -1067,6 +1067,7 @@ Configure a direct bucketgit origin using Git remote syntax.
 		"admin": `usage:
   bgit admin keys list|add|remove|suspend|import-github [args]
   bgit admin broker upgrade
+  bgit admin broker owner-bootstrap reset
   bgit admin broker-users list|upsert USER [--role admin|user] [--key PATH_OR_PUBLIC_KEY]|delete USER
   bgit admin teams list|create NAME|delete TEAM|member add TEAM USER [--role ROLE]|member remove TEAM USER
   bgit admin teams repo list|repo add TEAM ROLE|repo remove TEAM
@@ -1091,6 +1092,7 @@ administration moved to bgit direct admin.
 
 examples:
   bgit admin broker upgrade
+  bgit admin broker owner-bootstrap reset
   bgit admin keys list
   bgit admin keys add --user ada --role developer --key ~/.ssh/ada.pub
   bgit admin keys import-github octocat --role read

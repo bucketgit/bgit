@@ -109,7 +109,32 @@ async function loadExistingRepo(repo) {
   return null;
 }
 
+function mergeCIState(current, next) {
+  current = current || {};
+  next = next || {};
+  const byID = new Map();
+  function add(run) {
+    if (!run || run.id === undefined || run.id === null) return;
+    const id = Number(run.id);
+    const existing = byID.get(id);
+    if (!existing) {
+      byID.set(id, run);
+      return;
+    }
+    const existingTime = Date.parse(existing.updated_at || existing.created_at || '') || 0;
+    const runTime = Date.parse(run.updated_at || run.created_at || '') || 0;
+    if (runTime >= existingTime) byID.set(id, run);
+  }
+  for (const run of current.ci_runs || []) add(run);
+  for (const run of next.ci_runs || []) add(run);
+  next.ci_runs = [...byID.values()].sort((a, b) => Number(b.id || 0) - Number(a.id || 0)).slice(0, 100);
+  next.next_ci_id = Math.max(Number(current.next_ci_id || 1), Number(next.next_ci_id || 1));
+  return next;
+}
+
 async function saveRepo(entry) {
+  const snap = await entry.ref.get();
+  if (snap.exists) entry.data = mergeCIState(snap.data() || {}, entry.data);
   await entry.ref.set(entry.data, {merge: false});
   await syncMembershipIndex(entry);
 }
@@ -143,6 +168,13 @@ async function syncMembershipIndex(entry) {
       for (const key of user.keys || []) {
         addMembership(key.public_key || key, user.username || member.username || member.user_id, role, 'team', false);
       }
+    }
+  }
+  for (const grant of entry.data.user_grants || []) {
+    const user = usersByID.get(grant.user_id) || (users.data.users || []).find((item) => String(item.username || '').trim().toLowerCase() === String(grant.user || grant.username || '').trim().toLowerCase());
+    if (!user || user.suspended || user.pending) continue;
+    for (const key of user.keys || []) {
+      addMembership(key.public_key || key, user.username || grant.username || grant.user_id, normalizeRole(grant.role || 'read'), 'repo-user', false);
     }
   }
   const writes = [];
@@ -397,6 +429,12 @@ async function effectiveSignedKey(req, entry) {
   let role = direct ? direct.role : '';
   const brokerUser = await signedBrokerUser(req);
   if (brokerUser) {
+    for (const grant of entry.data.user_grants || []) {
+      const grantUser = String(grant.user || grant.username || '').trim().toLowerCase();
+      if ((grant.user_id && grant.user_id === brokerUser.user_id) || (grantUser && grantUser === String(brokerUser.user || '').trim().toLowerCase())) {
+        role = strongerRole(role, normalizeRole(grant.role || 'read'));
+      }
+    }
     for (const grant of entry.data.teams || []) {
       const teamRole = await teamRoleForUser(grant.id || grant.team_id, brokerUser.user_id);
       if (teamRole) role = strongerRole(role, weakerRole(teamRole, grant.role || teamRole));
@@ -909,6 +947,10 @@ async function writeTextObject(repo, objectPath, value) {
   await storage.bucket(repo.bucket).file(objectName(repo, objectPath)).save(value);
 }
 
+async function readTextObject(repo, objectPath) {
+  return Buffer.from(await readObject(repo, objectPath), 'base64').toString('utf8');
+}
+
 async function deleteObject(repo, objectPath) {
   await storage.bucket(repo.bucket).file(objectName(repo, objectPath)).delete({ignoreNotFound: true});
 }
@@ -1050,6 +1092,106 @@ function findCIRun(data, id) {
   return (data.ci_runs || []).find((run) => Number(run.id) === Number(id));
 }
 
+function ciTerminal(status) {
+  return ['passed', 'failed', 'cancelled', 'timed_out'].includes(String(status || '').toLowerCase());
+}
+
+function mapGCPBuildStatus(status) {
+  switch (String(status || '').toUpperCase()) {
+    case 'SUCCESS': return 'passed';
+    case 'FAILURE':
+    case 'INTERNAL_ERROR': return 'failed';
+    case 'TIMEOUT':
+    case 'EXPIRED': return 'timed_out';
+    case 'CANCELLED': return 'cancelled';
+    case 'WORKING': return 'building';
+    case 'QUEUED':
+    case 'PENDING': return 'queued';
+    default: return 'queued';
+  }
+}
+
+async function googleAPI(method, url, body) {
+  const client = await auth.getClient();
+  const accessToken = await client.getAccessToken();
+  const token = typeof accessToken === 'string' ? accessToken : accessToken && accessToken.token;
+  const resp = await fetch(url, {
+    method,
+    headers: {authorization: 'Bearer ' + token, 'content-type': 'application/json'},
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const text = await resp.text();
+  if (!resp.ok) throw Object.assign(new Error(text || ('Google API returned HTTP ' + resp.status)), {status: 502});
+  try { return text ? JSON.parse(text) : {}; } catch (_) { return {}; }
+}
+
+function gcpProjectID() {
+  return String(process.env.BGIT_GCP_PROJECT || process.env.GOOGLE_CLOUD_PROJECT || process.env.GCP_PROJECT || '').trim();
+}
+
+async function refreshCIRun(run) {
+  if (!run || run.provider !== 'gcp' || ciTerminal(run.status)) return false;
+  const project = gcpProjectID();
+  const buildID = String(run.provider_build_id || '').trim();
+  if (!project || !buildID) return false;
+  const before = JSON.stringify(run);
+  const buildName = String(run.provider_build_name || '').trim() || 'projects/' + project + '/builds/' + buildID;
+  const build = await googleAPI('GET', 'https://cloudbuild.googleapis.com/v1/' + buildName);
+  run.status = mapGCPBuildStatus(build.status);
+  run.result = run.status;
+  run.url = build.logUrl || run.url || '';
+  run.provider_build_id = build.id || run.provider_build_id || '';
+  run.provider_build_name = build.name || run.provider_build_name || '';
+  run.started_at = build.startTime || run.started_at || '';
+  run.finished_at = build.finishTime || run.finished_at || '';
+  run.message = build.statusDetail || build.failureInfo && build.failureInfo.detail || run.message || '';
+  run.updated_at = new Date().toISOString();
+  return JSON.stringify(run) !== before;
+}
+
+async function refreshCIRuns(entry) {
+  let changed = false;
+  for (const run of entry.data.ci_runs || []) {
+    if (await refreshCIRun(run)) changed = true;
+  }
+  if (changed) await saveRepo(entry);
+  return changed;
+}
+
+function logEntryText(entry) {
+  if (!entry) return '';
+  if (entry.textPayload) return String(entry.textPayload);
+  if (entry.jsonPayload) {
+    if (entry.jsonPayload.message) return String(entry.jsonPayload.message);
+    return JSON.stringify(entry.jsonPayload);
+  }
+  if (entry.protoPayload && entry.protoPayload.status && entry.protoPayload.status.message) return String(entry.protoPayload.status.message);
+  return '';
+}
+
+async function ciRunLogs(run) {
+  const project = gcpProjectID();
+  const buildID = String(run.provider_build_id || '').trim();
+  if (!project || !buildID) return '';
+  const filter = 'resource.type="build" AND resource.labels.build_id="' + buildID + '"';
+  let data = await googleAPI('POST', 'https://logging.googleapis.com/v2/entries:list', {
+    resourceNames: ['projects/' + project],
+    filter,
+    orderBy: 'timestamp asc',
+    pageSize: 1000,
+  });
+  if (!Array.isArray(data.entries) || data.entries.length === 0) {
+    data = await googleAPI('POST', 'https://logging.googleapis.com/v2/entries:list', {
+      resourceNames: ['projects/' + project],
+      filter: 'resource.type="build"',
+      orderBy: 'timestamp desc',
+      pageSize: 1000,
+    });
+    data.entries = (data.entries || []).filter((entry) => entry && entry.resource && entry.resource.labels && entry.resource.labels.build_id === buildID).reverse();
+  }
+  return (data.entries || []).map(logEntryText).filter(Boolean).join('\n');
+}
+
 function normalizeCIProvider(value, repo) {
   const raw = String(value || '').trim().toLowerCase();
   if (raw === 'aws' || raw === 'codebuild' || (raw === '' && repo.provider === 's3')) return 'aws';
@@ -1095,6 +1237,8 @@ async function triggerCIRun(entry, run) {
   run.status = data.status || 'queued';
   run.url = data.url || run.url || '';
   run.message = data.message || run.message || '';
+  run.provider_build_id = data.provider_build_id || run.provider_build_id || '';
+  run.provider_build_name = data.provider_build_name || run.provider_build_name || '';
   return run;
 }
 
@@ -1145,9 +1289,18 @@ async function deleteRepoMetadata(entry) {
   issueSnap.forEach((doc) => deletes.push(doc.ref.delete()));
   const repo = entry.data.repo || {};
   const oldRepoDocID = docID(repo);
+  const users = await loadBrokerUsers();
   for (const key of entry.data.keys || []) {
     if (!key.public_key) continue;
     deletes.push(members.doc(memberDocID(keyFingerprint(key.public_key))).collection('repos').doc(oldRepoDocID).delete());
+  }
+  for (const grant of entry.data.user_grants || []) {
+    const user = (users.data.users || []).find((item) => item.id === grant.user_id || String(item.username || '').trim().toLowerCase() === String(grant.user || grant.username || '').trim().toLowerCase());
+    for (const key of user && user.keys || []) {
+      const publicKey = key.public_key || key;
+      if (!publicKey) continue;
+      deletes.push(members.doc(memberDocID(keyFingerprint(publicKey))).collection('repos').doc(oldRepoDocID).delete());
+    }
   }
   deletes.push(entry.ref.delete());
   await Promise.all(deletes);
@@ -1167,9 +1320,18 @@ async function moveRepoSubcollections(oldEntry, newRef) {
 async function deleteMembershipIndex(entry) {
   const repoDocID = docID(entry.data.repo || {});
   const deletes = [];
+  const users = await loadBrokerUsers();
   for (const key of entry.data.keys || []) {
     if (!key.public_key) continue;
     deletes.push(members.doc(memberDocID(keyFingerprint(key.public_key))).collection('repos').doc(repoDocID).delete());
+  }
+  for (const grant of entry.data.user_grants || []) {
+    const user = (users.data.users || []).find((item) => item.id === grant.user_id || String(item.username || '').trim().toLowerCase() === String(grant.user || grant.username || '').trim().toLowerCase());
+    for (const key of user && user.keys || []) {
+      const publicKey = key.public_key || key;
+      if (!publicKey) continue;
+      deletes.push(members.doc(memberDocID(keyFingerprint(publicKey))).collection('repos').doc(repoDocID).delete());
+    }
   }
   await Promise.all(deletes);
 }
@@ -1639,6 +1801,51 @@ exports.broker = async (req, res) => {
       res.status(200).send(JSON.stringify({ok: true, teams: entry.data.teams}));
       return;
     }
+    if (req.path === '/repo/users/list' && req.method === 'POST') {
+      const entry = await loadExistingRepo(body.repo);
+      if (!entry) throw Object.assign(new Error('repository not found'), {status: 404});
+      await requireAdmin(req, entry);
+      res.status(200).send(JSON.stringify({users: entry.data.user_grants || []}));
+      return;
+    }
+    if (req.path === '/repo/users/upsert' && req.method === 'POST') {
+      const entry = await loadExistingRepo(body.repo);
+      if (!entry) throw Object.assign(new Error('repository not found'), {status: 404});
+      await requireBrokerAdmin(req);
+      await requireAdmin(req, entry);
+      const users = await loadBrokerUsers();
+      const wantID = String(body.user_id || '').trim();
+      const wantUser = String(body.user || body.username || '').trim().toLowerCase();
+      const user = (users.data.users || []).find((item) => (wantID && item.id === wantID) || (wantUser && String(item.username || '').trim().toLowerCase() === wantUser));
+      if (!user) throw Object.assign(new Error('broker user not found'), {status: 404});
+      const role = normalizeRole(body.role || 'read');
+      if (!validRole(role) || role === 'owner') throw new Error('invalid role');
+      entry.data.user_grants = (entry.data.user_grants || []).filter((grant) => grant.user_id !== user.id && String(grant.user || grant.username || '').trim().toLowerCase() !== String(user.username || '').trim().toLowerCase());
+      entry.data.user_grants.push({user_id: user.id, user: user.username || user.id, role});
+      audit(entry, {type: 'repo_user_grant', user: user.username || user.id, role});
+      await saveRepo(entry);
+      res.status(200).send(JSON.stringify({ok: true, users: entry.data.user_grants}));
+      return;
+    }
+    if (req.path === '/repo/users/remove' && req.method === 'POST') {
+      const entry = await loadExistingRepo(body.repo);
+      if (!entry) throw Object.assign(new Error('repository not found'), {status: 404});
+      await requireBrokerAdmin(req);
+      await requireAdmin(req, entry);
+      const wantID = String(body.user_id || '').trim();
+      const wantUser = String(body.user || body.username || '').trim().toLowerCase();
+      const before = (entry.data.user_grants || []).length;
+      entry.data.user_grants = (entry.data.user_grants || []).filter((grant) => {
+        if (wantID && grant.user_id === wantID) return false;
+        if (wantUser && String(grant.user || grant.username || '').trim().toLowerCase() === wantUser) return false;
+        return true;
+      });
+      if (entry.data.user_grants.length === before) throw Object.assign(new Error('repo user grant not found'), {status: 404});
+      audit(entry, {type: 'repo_user_remove', user: body.user || body.user_id || ''});
+      await saveRepo(entry);
+      res.status(200).send(JSON.stringify({ok: true, users: entry.data.user_grants || []}));
+      return;
+    }
     if (req.path === '/repos/list' && req.method === 'POST') {
       await requireBrokerAdmin(req);
       const snap = await repos.get();
@@ -2038,6 +2245,7 @@ exports.broker = async (req, res) => {
     if (req.path === '/ci/list' && req.method === 'POST') {
       const entry = await ensureRepo(body.repo);
       await requireRead(req, entry);
+      await refreshCIRuns(entry);
       res.status(200).send(JSON.stringify({runs: listCIRuns(entry.data)}));
       return;
     }
@@ -2046,7 +2254,18 @@ exports.broker = async (req, res) => {
       await requireRead(req, entry);
       const run = findCIRun(entry.data, body.id);
       if (!run) throw Object.assign(new Error('CI run not found'), {status: 404});
+      if (await refreshCIRun(run)) await saveRepo(entry);
       res.status(200).send(JSON.stringify({run}));
+      return;
+    }
+    if (req.path === '/ci/logs' && req.method === 'POST') {
+      const entry = await ensureRepo(body.repo);
+      await requireRead(req, entry);
+      const run = findCIRun(entry.data, body.id);
+      if (!run) throw Object.assign(new Error('CI run not found'), {status: 404});
+      if (await refreshCIRun(run)) await saveRepo(entry);
+      const logs = await ciRunLogs(run);
+      res.status(200).send(JSON.stringify({run, logs}));
       return;
     }
     if (req.path === '/ci/run' && req.method === 'POST') {
@@ -2059,6 +2278,15 @@ exports.broker = async (req, res) => {
       const commit = String(body.commit || refs[ref] || '').trim();
       if (!commit || !/^[0-9a-f]{40}$/i.test(commit)) throw Object.assign(new Error('CI commit is required'), {status: 400});
       if (!refs[ref]) throw Object.assign(new Error('CI ref not found'), {status: 404});
+      if (refs[ref] !== commit && repo.bucket && repo.prefix) {
+        try {
+          const physicalRef = (await readTextObject(repo, ref)).trim();
+          if (physicalRef === commit) {
+            refs[ref] = commit;
+            entry.data.refs = refs;
+          }
+        } catch (_) {}
+      }
       if (refs[ref] !== commit) throw Object.assign(new Error('CI commit does not match broker ref'), {status: 409});
       const config = cleanCIConfig(body.config, provider);
       const now = new Date().toISOString();

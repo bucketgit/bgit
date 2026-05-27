@@ -2,10 +2,15 @@ const crypto = require('crypto');
 const zlib = require('zlib');
 const {Storage} = require('@google-cloud/storage');
 const {GoogleAuth} = require('google-auth-library');
+const yaml = require('js-yaml');
 
 const storage = new Storage();
 const auth = new GoogleAuth({scopes: ['https://www.googleapis.com/auth/cloud-platform']});
 const brokerVersion = process.env.BROKER_VERSION || '{{BROKER_VERSION}}';
+
+function gcpProjectID() {
+  return String(process.env.BGIT_GCP_PROJECT || process.env.GOOGLE_CLOUD_PROJECT || process.env.GCP_PROJECT || '').trim();
+}
 
 function response(res, status, body) {
   res.status(status).type('application/json').send(JSON.stringify(body));
@@ -131,27 +136,25 @@ function tarGz(files) {
   return zlib.gzipSync(Buffer.concat(chunks));
 }
 
-async function startCloudBuild(repo, run, sourceBucket, sourceObject) {
-  const project = String(process.env.BGIT_GCP_PROJECT || process.env.GOOGLE_CLOUD_PROJECT || process.env.GCP_PROJECT || '').trim();
+async function startCloudBuild(repo, run, sourceBucket, sourceObject, configText) {
+  const project = gcpProjectID();
   if (!project) throw new Error('GCP project is not configured');
   const client = await auth.getClient();
   const accessToken = await client.getAccessToken();
   const token = typeof accessToken === 'string' ? accessToken : accessToken && accessToken.token;
+  const parsed = yaml.load(configText);
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw Object.assign(new Error('CI config must contain a Cloud Build object'), {status: 400});
   const build = {
+    ...parsed,
     source: {storageSource: {bucket: sourceBucket, object: sourceObject}},
-    steps: [{
-      name: 'gcr.io/google.com/cloudsdktool/cloud-sdk:slim',
-      entrypoint: 'bash',
-      args: ['-lc', 'gcloud builds submit --project "$PROJECT_ID" --config "$_BGIT_CONFIG" .'],
-    }],
     substitutions: {
+      ...(parsed.substitutions || {}),
       _BGIT_REPO: String(repo.logical || repo.prefix || ''),
       _BGIT_REF: run.ref,
       _BGIT_COMMIT: run.commit,
       _BGIT_BROKER_VERSION: brokerVersion,
-      _BGIT_CONFIG: run.config,
     },
-    options: {logging: 'CLOUD_LOGGING_ONLY', substitutionOption: 'ALLOW_LOOSE'},
+    options: {...(parsed.options || {}), logging: 'CLOUD_LOGGING_ONLY', substitutionOption: 'ALLOW_LOOSE'},
   };
   const serviceAccount = String(process.env.BGIT_CI_BUILD_SERVICE_ACCOUNT || '').trim();
   if (serviceAccount) build.serviceAccount = 'projects/' + project + '/serviceAccounts/' + serviceAccount;
@@ -175,12 +178,28 @@ exports.materializer = async (req, res) => {
     if (!/^[0-9a-f]{40}$/i.test(String(run.commit || ''))) throw Object.assign(new Error('invalid CI commit'), {status: 400});
     const files = [];
     await collectTree(repo, await treeForCommit(repo, run.commit), '', files);
-    if (!files.some((file) => file.path === run.config)) throw Object.assign(new Error('CI config not found in commit: ' + run.config), {status: 400});
+    const configFile = files.find((file) => file.path === run.config);
+    if (!configFile) throw Object.assign(new Error('CI config not found in commit: ' + run.config), {status: 400});
     const bucket = repo.bucket;
     const object = String(repo.prefix || '').replace(/^\/+|\/+$/g, '') + '/_bgit-ci/run-' + run.id + '-' + run.commit + '.tar.gz';
     await storage.bucket(bucket).file(object).save(tarGz(files), {contentType: 'application/gzip'});
-    const build = await startCloudBuild(repo, run, bucket, object);
-    response(res, 200, {status: 'queued', url: build.logUrl || '', message: build.name || build.id || 'Cloud Build queued'});
+    const build = await startCloudBuild(repo, run, bucket, object, configFile.data.toString('utf8'));
+    const operationName = String(build.name || '');
+    const operationID = operationName.split('/').pop() || '';
+    let buildID = build.id || build.metadata && build.metadata.build && build.metadata.build.id || '';
+    if (!buildID && operationID) {
+      try { buildID = Buffer.from(operationID, 'base64url').toString('utf8'); } catch (_) {}
+    }
+    const buildName = build.name && String(build.name).startsWith('projects/') && String(build.name).includes('/builds/')
+      ? build.name
+      : (buildID ? 'projects/' + gcpProjectID() + '/builds/' + buildID : '');
+    response(res, 200, {
+      status: 'queued',
+      url: build.logUrl || build.metadata && build.metadata.build && build.metadata.build.logUrl || '',
+      message: operationName || buildID || 'Cloud Build queued',
+      provider_build_id: buildID,
+      provider_build_name: buildName,
+    });
   } catch (err) {
     response(res, err.status || 500, {error: err.message || String(err)});
   }

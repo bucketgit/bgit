@@ -16,7 +16,7 @@ func writeGCPBrokerSource(dir string) error {
 		if err != nil {
 			return err
 		}
-		body := strings.ReplaceAll(string(data), "{{BROKER_VERSION}}", brokerVersion)
+		body := strings.ReplaceAll(string(data), "{{BROKER_VERSION}}", brokerVersion())
 		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o644); err != nil {
 			return err
 		}
@@ -30,7 +30,7 @@ func writeGCPMaterializerSource(dir string) error {
 		if err != nil {
 			return err
 		}
-		body := strings.ReplaceAll(string(data), "{{BROKER_VERSION}}", brokerVersion)
+		body := strings.ReplaceAll(string(data), "{{BROKER_VERSION}}", brokerVersion())
 		target := name
 		if name == "materializer.js" {
 			target = "index.js"
@@ -47,5 +47,5 @@ func awsBrokerCloudFormationTemplate() string {
 	if err != nil {
 		return ""
 	}
-	return strings.ReplaceAll(string(data), "{{BROKER_VERSION}}", brokerVersion)
+	return strings.ReplaceAll(string(data), "{{BROKER_VERSION}}", brokerVersion())
 }

@@ -4,7 +4,7 @@ All notable changes to `bgit` are documented in this file.
 
 This project follows semantic versioning.
 
-## Unrelease changes
+## 1.2.0
 
 - Added broker-backed CI run records, `bgit ci` commands, and a `bgit web` CI
   view for trusted provider/materializer build handoff against broker refs.
@@ -13,6 +13,7 @@ This project follows semantic versioning.
 - Hardened broker security with replay-resistant v2 request signatures,
   one-time owner bootstrap tokens, constrained object capabilities, private CI
   materializer invocation, and CSRF protection for local `bgit web` mutations.
+- Various bug fixes
 
 ## 1.1.3
 

@@ -24,7 +24,7 @@ func TestGlobalConfigRoundTrip(t *testing.T) {
 			Regions: []globalProfileRegion{{
 				Name:          "europe-west1",
 				BrokerURL:     "https://gcp.example.test",
-				BrokerVersion: brokerVersion,
+				BrokerVersion: brokerVersion(),
 				LastSetupAt:   "2026-05-16T10:00:00Z",
 			}},
 		}},
@@ -35,7 +35,7 @@ func TestGlobalConfigRoundTrip(t *testing.T) {
 			Regions: []globalProfileRegion{{
 				Name:          "us-east-1",
 				BrokerURL:     "https://aws.example.test",
-				BrokerVersion: brokerVersion,
+				BrokerVersion: brokerVersion(),
 				LastSetupAt:   "2026-05-16T10:00:00Z",
 			}},
 		}},

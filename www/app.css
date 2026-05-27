@@ -2246,12 +2246,21 @@ h2 {
   line-height: 1.45;
 }
 .ci-run-form {
-  margin-bottom: 16px;
-  padding-bottom: 16px;
-  border-bottom: 1px solid var(--repo-border);
+  margin: 16px;
+  padding: 16px;
+  border: 1px solid var(--repo-border);
+  border-radius: 8px;
+  background: var(--surface-2);
+}
+.ci-run-form h3 {
+  margin: 0;
+  color: var(--heading);
+  font-size: 15px;
+  font-weight: 800;
 }
 .ci-run-list {
   display: grid;
+  margin: 16px;
   border: 1px solid var(--repo-border);
   border-radius: 8px;
   overflow: hidden;
@@ -2274,6 +2283,19 @@ h2 {
   margin-top: 3px;
   color: var(--muted);
   font-size: 12px;
+}
+.ci-run-log {
+  margin: 10px 0 0;
+  max-height: 260px;
+  overflow: auto;
+  border: 1px solid var(--repo-border);
+  border-radius: 7px;
+  background: var(--code-bg);
+  color: var(--text);
+  padding: 10px;
+  font-size: 12px;
+  line-height: 1.45;
+  white-space: pre-wrap;
 }
 .settings-check {
   align-content: center;
@@ -2371,13 +2393,19 @@ h2 {
   gap: 10px;
 }
 .settings-error {
-  margin-top: 8px;
+  margin: 8px 16px 0;
   color: var(--del);
   font-size: 13px;
 }
 
+.issues-panel > .empty,
+.ci-panel > .empty {
+  margin: 16px;
+}
+
 .issue-list {
   display: grid;
+  margin: 16px;
   border: 1px solid var(--repo-border);
   border-radius: 8px;
   overflow: hidden;
@@ -2417,9 +2445,15 @@ h2 {
 .issue-form {
   display: grid;
   gap: 12px;
-  margin-top: 16px;
-  padding-top: 16px;
+  margin: 16px;
+  padding: 16px 0 0;
   border-top: 1px solid var(--repo-border);
+}
+.issue-form h3 {
+  margin: 0;
+  color: var(--heading);
+  font-size: 15px;
+  font-weight: 800;
 }
 .issue-form label {
   display: grid;

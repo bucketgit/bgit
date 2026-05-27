@@ -699,7 +699,7 @@ func TestSetupCommandProvisionsGCPAndWritesGlobalConfig(t *testing.T) {
 	profile := cfg.GCPProfiles[0]
 	if profile.Name != "work" || profile.ProjectID != "example-test-123456" ||
 		len(profile.Regions) != 1 || profile.Regions[0].Name != "europe-west1" ||
-		profile.Regions[0].BrokerURL != server.URL || profile.Regions[0].BrokerVersion != brokerVersion {
+		profile.Regions[0].BrokerURL != server.URL || profile.Regions[0].BrokerVersion != brokerVersion() {
 		t.Fatalf("profile = %#v", profile)
 	}
 	if !strings.Contains(stdout.String(), "Next steps:") {
@@ -1051,7 +1051,7 @@ func TestBrokerDeleteAWSDeletesStackAndClearsConfig(t *testing.T) {
 			Regions: []globalProfileRegion{{
 				Name:          "eu-west-1",
 				BrokerURL:     "https://broker.example.test",
-				BrokerVersion: brokerVersion,
+				BrokerVersion: brokerVersion(),
 			}},
 		}},
 	}); err != nil {
@@ -1145,6 +1145,8 @@ func TestSetupAvailableRepoInviteUsersExcludeMembersAndPendingInvites(t *testing
 			]}`))
 		case "/keys/list":
 			_, _ = w.Write([]byte(`{"keys":[{"user":"member","role":"developer","public_key":"ssh-ed25519 AAAA member"}]}`))
+		case "/repo/users/list":
+			_, _ = w.Write([]byte(`{"users":[]}`))
 		case "/keys/invite/list":
 			_, _ = w.Write([]byte(`{"invites":[{"user":"pending","role":"read"}]}`))
 		default:
@@ -1231,11 +1233,15 @@ func TestSetupBrokerRegularUserShowsDelete(t *testing.T) {
 func TestSetupRepoUserManagementChoicesListsDirectUsers(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
+		case "/broker/users/list":
+			http.Error(w, "forbidden", http.StatusForbidden)
 		case "/keys/list":
 			_, _ = w.Write([]byte(`{"keys":[
 				{"user":"ada","role":"read","public_key":"ssh-ed25519 AAAA ada1"},
 				{"user":"ada","role":"developer","public_key":"ssh-ed25519 AAAA ada2"}
 			]}`))
+		case "/repo/users/list":
+			_, _ = w.Write([]byte(`{"users":[]}`))
 		default:
 			t.Fatalf("unexpected path %s", r.URL.Path)
 		}

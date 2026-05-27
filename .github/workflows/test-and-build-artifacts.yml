@@ -158,18 +158,33 @@ jobs:
           "Latest development release for $version" | Out-File -FilePath "release-notes.md" -Encoding utf8
 
           "APP_VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          "RELEASE_TAG=dev-latest" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          "RELEASE_NAME=dev-latest" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "RELEASE_TAG=$version" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "RELEASE_NAME=$version" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
       - name: Resolve Manual Development Release
         if: github.ref != 'refs/heads/main' && github.ref != 'refs/heads/develop'
         shell: pwsh
         run: |
-          "Manual development build" | Out-File -FilePath "release-notes.md" -Encoding utf8
+          if (!(Test-Path "CHANGELOG.md")) {
+            throw "Missing CHANGELOG.md"
+          }
 
-          "APP_VERSION=dev" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          "RELEASE_TAG=dev" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          "RELEASE_NAME=dev" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          $lines = Get-Content "CHANGELOG.md"
+          $line = $lines | Where-Object { $_ -match '^\s*##\s+v?(\d+\.\d+\.\d+)(?:\s|$)' } | Select-Object -First 1
+          if (-not $line) {
+            throw "Could not find semantic version heading in CHANGELOG.md"
+          }
+          if ($line -notmatch '^\s*##\s+v?(\d+\.\d+\.\d+)(?:\s|$)') {
+            throw "Invalid semantic version heading in CHANGELOG.md"
+          }
+
+          $version = "$($Matches[1])-dev"
+
+          "Manual development build for $version" | Out-File -FilePath "release-notes.md" -Encoding utf8
+
+          "APP_VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "RELEASE_TAG=$version" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "RELEASE_NAME=$version" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
       - name: Build
         shell: pwsh
@@ -187,7 +202,7 @@ jobs:
 
           foreach ($target in $targets) {
             $artifact = $target.Artifact
-            if ($env:RELEASE_TAG -eq "dev-latest") {
+            if ($env:RELEASE_TAG.EndsWith("-dev")) {
               if ($artifact.EndsWith(".exe")) {
                 $artifact = $artifact.Substring(0, $artifact.Length - 4) + "-dev.exe"
               } else {
@@ -361,10 +376,25 @@ jobs:
         if: github.ref == 'refs/heads/develop'
         shell: pwsh
         run: |
-          "Latest development release" | Out-File -FilePath "release-notes.md" -Encoding utf8
+          if (!(Test-Path "CHANGELOG.md")) {
+            throw "Missing CHANGELOG.md"
+          }
 
-          "RELEASE_TAG=dev-latest" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          "RELEASE_NAME=dev-latest" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          $lines = Get-Content "CHANGELOG.md"
+          $line = $lines | Where-Object { $_ -match '^\s*##\s+v?(\d+\.\d+\.\d+)(?:\s|$)' } | Select-Object -First 1
+          if (-not $line) {
+            throw "Could not find semantic version heading in CHANGELOG.md"
+          }
+          if ($line -notmatch '^\s*##\s+v?(\d+\.\d+\.\d+)(?:\s|$)') {
+            throw "Invalid semantic version heading in CHANGELOG.md"
+          }
+
+          $version = "$($Matches[1])-dev"
+
+          "Latest development release for $version" | Out-File -FilePath "release-notes.md" -Encoding utf8
+
+          "RELEASE_TAG=$version" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "RELEASE_NAME=$version" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
       - name: Publish To Release
         shell: pwsh
@@ -376,14 +406,14 @@ jobs:
           $repo = "${{ github.repository }}"
           $target = "${{ github.ref_name }}"
 
-          if ($tag -eq "dev-latest") {
+          if ($tag.EndsWith("-dev")) {
             git tag -f $tag "${{ github.sha }}"
             git push origin "refs/tags/$tag" --force
           }
 
           gh release view $tag --repo $repo *> $null
           if ($LASTEXITCODE -ne 0) {
-            if ($tag -eq "dev-latest") {
+            if ($tag.EndsWith("-dev")) {
               gh release create $tag --repo $repo --target $target --title $name --notes-file release-notes.md --prerelease
             } else {
               gh release create $tag --repo $repo --target $target --title $name --notes-file release-notes.md

@@ -841,7 +841,15 @@ func brokerHTTPError(path, msg string) error {
 
 func brokerLooksIncompatibleWithV2Signatures(msg string) bool {
 	msg = strings.ToLower(strings.TrimSpace(msg))
-	return strings.Contains(msg, "ssh signature required")
+	if !strings.Contains(msg, "ssh signature required") {
+		return false
+	}
+	for _, scoped := range []string{"read ssh signature required", "write ssh signature required", "admin ssh signature required", "owner ssh signature required", "merge ssh signature required", "broker admin ssh signature required"} {
+		if strings.Contains(msg, scoped) {
+			return false
+		}
+	}
+	return true
 }
 
 func brokerForbiddenAllowsSignatureRetry(msg string) bool {
@@ -1323,7 +1331,7 @@ func ensureGCPBrokerRuntimePermissions(cfg config, serviceAccount string, stdout
 	if project == "" {
 		return errors.New("GCP project is not configured")
 	}
-	for _, role := range []string{"roles/datastore.user", "roles/storage.admin", "roles/cloudbuild.builds.editor", "roles/run.invoker", "roles/iam.serviceAccountUser", "roles/logging.logWriter"} {
+	for _, role := range []string{"roles/datastore.user", "roles/storage.admin", "roles/cloudbuild.builds.editor", "roles/run.invoker", "roles/iam.serviceAccountUser", "roles/logging.logWriter", "roles/logging.viewer"} {
 		fmt.Fprintf(stdout, "granting GCP broker %s to %s\n", role, serviceAccount)
 		cmd := gcloudCommand(cfg.gcloudConfiguration,
 			"projects", "add-iam-policy-binding", project,
@@ -1510,7 +1518,7 @@ func gcpBrokerFirestoreDatabase(opts sshSetupOptions) string {
 func gcpBrokerEnvVars(cfg config, opts sshSetupOptions, serviceAccount, ciSecret, ciMaterializerURL, bootstrapHash string) string {
 	values := []string{
 		"FIRESTORE_DATABASE=" + gcpBrokerFirestoreDatabase(opts),
-		"BROKER_VERSION=" + brokerVersion,
+		"BROKER_VERSION=" + brokerVersion(),
 		"BGIT_GCP_PROJECT=" + gcloudProject(cfg),
 		"BGIT_SIGNING_SERVICE_ACCOUNT=" + serviceAccount,
 		"BGIT_CI_MATERIALIZER_SECRET=" + ciSecret,
@@ -1524,7 +1532,7 @@ func gcpBrokerEnvVars(cfg config, opts sshSetupOptions, serviceAccount, ciSecret
 
 func gcpMaterializerEnvVars(cfg config, serviceAccount, ciSecret string) string {
 	return strings.Join([]string{
-		"BROKER_VERSION=" + brokerVersion,
+		"BROKER_VERSION=" + brokerVersion(),
 		"BGIT_GCP_PROJECT=" + gcloudProject(cfg),
 		"BGIT_CI_MATERIALIZER_SECRET=" + ciSecret,
 		"BGIT_CI_BUILD_SERVICE_ACCOUNT=" + serviceAccount,

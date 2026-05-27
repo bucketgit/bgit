@@ -169,6 +169,44 @@ func TestVersionCommand(t *testing.T) {
 	}
 }
 
+func TestDefaultVersionComesFromChangelog(t *testing.T) {
+	oldVersion := version
+	version = ""
+	defer func() { version = oldVersion }()
+
+	got := appVersion()
+	wantPrefix := firstChangelogVersion(embeddedChangelog)
+	if wantPrefix == "" {
+		t.Fatal("test changelog has no semantic version")
+	}
+	if got != wantPrefix+"-dev" {
+		t.Fatalf("appVersion = %q, want %q", got, wantPrefix+"-dev")
+	}
+}
+
+func TestNoArgsUsagePrintsBannerWithVersion(t *testing.T) {
+	oldVersion := version
+	version = "9.8.7-dev"
+	defer func() { version = oldVersion }()
+
+	var stderr bytes.Buffer
+	if err := run(nil, strings.NewReader(""), ioDiscard{}, &stderr); err != nil {
+		t.Fatal(err)
+	}
+	out := stderr.String()
+	for _, want := range []string{
+		"bucketgit.com / github.com/bucketgit / bgit 9.8.7",
+		"usage: bgit <command> [args]",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("output missing %q:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "bgit 9.8.7-dev") {
+		t.Fatalf("banner should not include -dev suffix:\n%s", out)
+	}
+}
+
 func TestGcloudCommandUsesCloudSDKActiveConfigName(t *testing.T) {
 	cmd := gcloudCommand("test-profile", "auth", "print-access-token")
 	if strings.Join(cmd.Args, " ") != "gcloud auth print-access-token" {
@@ -1266,12 +1304,34 @@ func TestAWSBrokerCloudFormationTemplateHasBrokerOutput(t *testing.T) {
 		"normalizeLogicalRepo",
 		"logical repo names must be flat",
 		"ConditionalCheckFailedException",
-		"BROKER_VERSION: " + brokerVersion,
+		`BROKER_VERSION: "` + brokerVersion() + `"`,
 		`version: brokerVersion`,
 	} {
 		if !strings.Contains(template, want) {
 			t.Fatalf("template missing %q:\n%s", want, template)
 		}
+	}
+}
+
+func TestBrokerAssetsUseBgitVersion(t *testing.T) {
+	oldVersion := version
+	version = "9.8.7"
+	defer func() { version = oldVersion }()
+
+	template := awsBrokerCloudFormationTemplate()
+	if !strings.Contains(template, `BROKER_VERSION: "9.8.7"`) {
+		t.Fatalf("template did not use bgit version:\n%s", template)
+	}
+	dir := t.TempDir()
+	if err := writeGCPBrokerSource(dir); err != nil {
+		t.Fatal(err)
+	}
+	index, err := os.ReadFile(filepath.Join(dir, "index.js"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(index), "|| '9.8.7'") {
+		t.Fatalf("GCP broker source did not use bgit version:\n%s", string(index))
 	}
 }
 
@@ -3217,6 +3277,74 @@ func TestNativeGitRepoPushWritesObjectsAndRefsWithoutBareSync(t *testing.T) {
 	}
 	if strings.TrimSpace(stdout.String()) != "Everything up-to-date" {
 		t.Fatalf("second push stdout = %q", stdout.String())
+	}
+}
+
+func TestNativeGitRepoBrokerPushDoesNotWriteRefThroughObjectStore(t *testing.T) {
+	root := t.TempDir()
+	remoteRoot := filepath.Join(root, "remote.git")
+	worktree := filepath.Join(root, "worktree")
+	if err := os.MkdirAll(remoteRoot, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runGit("", "init", "--initial-branch", "main", worktree); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runGit(worktree, "config", "user.name", "Ada"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runGit(worktree, "config", "user.email", "ada@example.com"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(worktree, "README.md"), []byte("# Demo\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runGit(worktree, "add", "README.md"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runGit(worktree, "commit", "-m", "Initial commit"); err != nil {
+		t.Fatal(err)
+	}
+
+	var gotUpdate brokerRefUpdateRequest
+	updateCalls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/refs/update" {
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+		updateCalls++
+		if err := json.NewDecoder(r.Body).Decode(&gotUpdate); err != nil {
+			t.Fatal(err)
+		}
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer server.Close()
+	if _, err := runGit(worktree, "config", "bucketgit.broker", server.URL); err != nil {
+		t.Fatal(err)
+	}
+
+	oldDir, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(oldDir)
+	if err := os.Chdir(worktree); err != nil {
+		t.Fatal(err)
+	}
+
+	repo := newNativeGitRepoForStore(config{branch: "main", origin: "gs://bucket/repo.git"}, &localGitStore{root: remoteRoot})
+	var stdout bytes.Buffer
+	if err := repo.push(context.Background(), nil, &stdout); err != nil {
+		t.Fatal(err)
+	}
+	if updateCalls != 1 {
+		t.Fatalf("updateCalls = %d, want 1", updateCalls)
+	}
+	if gotUpdate.Ref != "refs/heads/main" || gotUpdate.Old != zeroObjectID() || !isHexHash(gotUpdate.New) {
+		t.Fatalf("broker update = %#v", gotUpdate)
+	}
+	if _, err := os.Stat(filepath.Join(remoteRoot, "refs", "heads", "main")); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("broker-backed push wrote ref through object store, stat err = %v", err)
 	}
 }
 

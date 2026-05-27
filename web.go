@@ -813,6 +813,7 @@ type webSettingsInfo struct {
 	ReadOnly      bool                      `json:"read_only,omitempty"`
 	IssuesEnabled bool                      `json:"issues_enabled"`
 	Keys          []brokerKey               `json:"keys,omitempty"`
+	UserGrants    []brokerRepoUserGrant     `json:"user_grants,omitempty"`
 	Protections   []brokerProtectionRequest `json:"protections,omitempty"`
 	Errors        map[string]string         `json:"errors,omitempty"`
 }
@@ -838,6 +839,7 @@ type brokerRepoInfoRequest struct {
 	Logical       string     `json:"logical,omitempty"`
 	TeamID        string     `json:"team_id,omitempty"`
 	Name          string     `json:"name,omitempty"`
+	UserID        string     `json:"user_id,omitempty"`
 	User          string     `json:"user,omitempty"`
 	Role          string     `json:"role,omitempty"`
 	BrokerRole    string     `json:"broker_role,omitempty"`
@@ -975,6 +977,12 @@ func (s *webServer) settingsInfo(ctx context.Context) webSettingsInfo {
 		info.Errors["members"] = err.Error()
 	} else {
 		info.Keys = keys
+	}
+	var repoUsers brokerRepoUsersResponse
+	if err := brokerPostContext(ctx, s.cfg.brokerURL, "/repo/users/list", brokerRepoAdminRequest{Repo: repoForBroker(s.cfg)}, &repoUsers); err != nil {
+		info.Errors["repo users"] = err.Error()
+	} else {
+		info.UserGrants = repoUsers.Users
 	}
 	var protections struct {
 		Protections []brokerProtectionRequest `json:"protections"`
@@ -1605,6 +1613,7 @@ func (s *webServer) handleAPIActionSettings(ctx context.Context, w http.Response
 		ReadOnly       bool   `json:"read_only"`
 		IssuesEnabled  bool   `json:"issues_enabled"`
 		Logical        string `json:"logical"`
+		UserID         string `json:"user_id"`
 		User           string `json:"user"`
 		Role           string `json:"role"`
 		Key            string `json:"key"`
@@ -1645,6 +1654,15 @@ func (s *webServer) handleAPIActionSettings(ctx context.Context, w http.Response
 	case "remove-member":
 		endpoint = "/keys/remove"
 		payload = brokerKeyRequest{Repo: repoForBroker(s.cfg), Key: strings.TrimSpace(req.Key)}
+	case "remove-repo-user":
+		user := strings.TrimSpace(req.User)
+		userID := strings.TrimSpace(req.UserID)
+		if user == "" && userID == "" {
+			s.renderJSONError(w, http.StatusBadRequest, errors.New("user is required"))
+			return
+		}
+		endpoint = "/repo/users/remove"
+		payload = brokerRepoAdminRequest{Repo: repoForBroker(s.cfg), UserID: userID, User: user}
 	case "suspend-member":
 		endpoint = "/keys/suspend"
 		payload = brokerKeyRequest{Repo: repoForBroker(s.cfg), Key: strings.TrimSpace(req.Key)}
@@ -1849,6 +1867,7 @@ func (s *webServer) handleAPIActionCI(ctx context.Context, w http.ResponseWriter
 	}
 	var req struct {
 		Action   string `json:"action"`
+		ID       int    `json:"id"`
 		Provider string `json:"provider"`
 		Ref      string `json:"ref"`
 		Config   string `json:"config"`
@@ -1857,7 +1876,28 @@ func (s *webServer) handleAPIActionCI(ctx context.Context, w http.ResponseWriter
 		s.renderJSONError(w, http.StatusBadRequest, err)
 		return
 	}
-	if strings.TrimSpace(req.Action) != "run" {
+	switch strings.TrimSpace(req.Action) {
+	case "list":
+		runs, err := s.listCIRuns(ctx)
+		if err != nil {
+			s.renderJSONError(w, http.StatusBadRequest, err)
+			return
+		}
+		s.renderJSON(w, map[string]any{"ok": true, "runs": runs})
+		return
+	case "logs":
+		var resp struct {
+			Run  brokerCIRun `json:"run"`
+			Logs string      `json:"logs"`
+		}
+		if err := brokerPostContext(ctx, s.cfg.brokerURL, "/ci/logs", brokerCIRequest{Repo: repoForBroker(s.cfg), ID: req.ID}, &resp); err != nil {
+			s.renderJSONError(w, http.StatusBadRequest, err)
+			return
+		}
+		s.renderJSON(w, map[string]any{"ok": true, "run": resp.Run, "logs": resp.Logs})
+		return
+	case "run":
+	default:
 		s.renderJSONError(w, http.StatusBadRequest, fmt.Errorf("unsupported CI action %q", req.Action))
 		return
 	}
@@ -1969,7 +2009,7 @@ func (s *webServer) fetchWebRemoteTracking(ctx context.Context, branch string) e
 	}
 	defer closeStore()
 	repo := openNativeGitRepo(store, cfg)
-	return repo.fetchIntoWorktree(ctx, worktree, true, io.Discard)
+	return repo.fetchRefsIntoWorktree(ctx, worktree, true, io.Discard)
 }
 
 type webWorkingTreeStatus struct {
@@ -2803,9 +2843,21 @@ func (s *webServer) settingsAccessHTML(info webSettingsInfo) string {
 	var b strings.Builder
 	b.WriteString(`<section class="settings-section"><h2>Access</h2>`)
 	b.WriteString(`<div class="settings-table" data-settings-members>`)
-	if len(info.Keys) == 0 {
+	if len(info.Keys) == 0 && len(info.UserGrants) == 0 {
 		b.WriteString(`<div class="empty">No members found.</div>`)
 	} else {
+		for _, grant := range info.UserGrants {
+			user := firstNonEmpty(grant.User, grant.Username, grant.UserID, "unknown")
+			role := firstNonEmpty(grant.Role, "read")
+			b.WriteString(`<div class="settings-row" data-repo-user="` + html.EscapeString(user) + `" data-repo-user-id="` + html.EscapeString(grant.UserID) + `">`)
+			b.WriteString(`<div><strong>` + html.EscapeString(user) + `</strong><span>` + html.EscapeString(role) + ` · broker user grant</span>`)
+			if grant.UserID != "" {
+				b.WriteString(`<small>` + html.EscapeString(grant.UserID) + `</small>`)
+			}
+			b.WriteString(`</div><div class="settings-row-actions" data-capability="admin_keys">`)
+			b.WriteString(`<button class="button-link" type="button" data-settings-action="remove-repo-user">Remove</button>`)
+			b.WriteString(`</div></div>`)
+		}
 		for _, key := range info.Keys {
 			fingerprint := publicKeyFingerprint(key.PublicKey)
 			if fingerprint == "" {
@@ -4210,10 +4262,11 @@ func ciRunListHTML(runs []brokerCIRun) string {
 	b.WriteString(`<div class="ci-run-list" data-ci-runs>`)
 	for _, run := range runs {
 		status := firstNonEmpty(run.Status, "queued")
-		b.WriteString(`<div class="ci-run-row"><div><strong>#` + strconv.Itoa(run.ID) + ` ` + html.EscapeString(status) + `</strong><span>` + html.EscapeString(strings.ToUpper(firstNonEmpty(run.Provider, "ci"))) + ` · ` + html.EscapeString(shortRefName(run.Ref)) + ` · ` + html.EscapeString(shortHash(run.Commit)) + ` · ` + html.EscapeString(run.Config) + `</span>`)
+		b.WriteString(`<div class="ci-run-row" data-ci-run-id="` + strconv.Itoa(run.ID) + `" data-ci-status="` + html.EscapeString(status) + `"><div><strong>#` + strconv.Itoa(run.ID) + ` ` + html.EscapeString(status) + `</strong><span>` + html.EscapeString(strings.ToUpper(firstNonEmpty(run.Provider, "ci"))) + ` · ` + html.EscapeString(shortRefName(run.Ref)) + ` · ` + html.EscapeString(shortHash(run.Commit)) + ` · ` + html.EscapeString(run.Config) + `</span>`)
 		if run.Message != "" {
 			b.WriteString(`<small>` + html.EscapeString(run.Message) + `</small>`)
 		}
+		b.WriteString(`<pre class="ci-run-log" data-ci-log hidden></pre>`)
 		b.WriteString(`</div>`)
 		if run.URL != "" {
 			b.WriteString(`<a class="button-link" href="` + html.EscapeString(run.URL) + `" target="_blank" rel="noreferrer">Open</a>`)
@@ -5820,12 +5873,12 @@ func webPathFingerprint(root string) string {
 		}
 		name := entry.Name()
 		if entry.IsDir() {
-			if name == "objects" || name == "tmp" || name == "bucketgit" {
+			if name == "objects" || name == "tmp" || name == "bucketgit" || name == "bgit" {
 				return filepath.SkipDir
 			}
 			return nil
 		}
-		if strings.HasSuffix(name, ".lock") {
+		if strings.HasSuffix(name, ".lock") || name == "index" || name == "FETCH_HEAD" {
 			return nil
 		}
 		info, err := entry.Info()

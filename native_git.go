@@ -12,6 +12,7 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -486,16 +487,23 @@ func (r *nativeGitRepo) pushWorktree(ctx context.Context, worktree string, opts 
 	if err != nil {
 		return err
 	}
+	brokerURL := ""
+	if !opts.skipBroker {
+		brokerURL = optionalBrokerURLForPush()
+	}
+	if brokerURL != "" {
+		cfg := r.cfg
+		cfg.brokerURL = brokerURL
+		if err := brokerRequirePush(ctx, cfg); err != nil {
+			return brokerPushError(err)
+		}
+	}
 	if err := uploadLocalObjects(ctx, store, gitDir); err != nil {
 		return err
 	}
 	refs, err := r.refs(ctx)
 	if err != nil {
 		return err
-	}
-	brokerURL := ""
-	if !opts.skipBroker {
-		brokerURL = optionalBrokerURLForPush()
 	}
 	updateRef := func(ref, oldHash, newHash string) error {
 		if brokerURL != "" {
@@ -949,20 +957,28 @@ func (r *nativeGitRepo) parsePackIndex(ctx context.Context, path string) (packIn
 	if err != nil {
 		return packIndex{}, err
 	}
+	hashes, offsets, err := parsePackIndexData(data)
+	if err != nil {
+		return packIndex{}, err
+	}
+	return packIndex{idxPath: path, packPath: strings.TrimSuffix(path, ".idx") + ".pack", hashes: hashes, offsets: offsets}, nil
+}
+
+func parsePackIndexData(data []byte) ([]string, []uint64, error) {
 	if len(data) < 8 || !bytes.Equal(data[:4], []byte{0xff, 't', 'O', 'c'}) {
-		return packIndex{}, errors.New("unsupported pack index format")
+		return nil, nil, errors.New("unsupported pack index format")
 	}
 	if version := binary.BigEndian.Uint32(data[4:8]); version != 2 {
-		return packIndex{}, fmt.Errorf("unsupported pack index version %d", version)
+		return nil, nil, fmt.Errorf("unsupported pack index version %d", version)
 	}
 	pos := 8
 	if len(data) < pos+256*4 {
-		return packIndex{}, errors.New("truncated pack index fanout")
+		return nil, nil, errors.New("truncated pack index fanout")
 	}
 	count := int(binary.BigEndian.Uint32(data[pos+255*4 : pos+256*4]))
 	pos += 256 * 4
 	if len(data) < pos+count*20 {
-		return packIndex{}, errors.New("truncated pack index hashes")
+		return nil, nil, errors.New("truncated pack index hashes")
 	}
 	hashes := make([]string, count)
 	for i := 0; i < count; i++ {
@@ -971,7 +987,7 @@ func (r *nativeGitRepo) parsePackIndex(ctx context.Context, path string) (packIn
 	pos += count * 20
 	pos += count * 4
 	if len(data) < pos+count*4 {
-		return packIndex{}, errors.New("truncated pack index offsets")
+		return nil, nil, errors.New("truncated pack index offsets")
 	}
 	rawOffsets := make([]uint32, count)
 	for i := 0; i < count; i++ {
@@ -986,11 +1002,11 @@ func (r *nativeGitRepo) parsePackIndex(ctx context.Context, path string) (packIn
 		}
 		largeIndex := int(raw & 0x7fffffff)
 		if len(data) < pos+(largeIndex+1)*8 {
-			return packIndex{}, errors.New("truncated pack index large offsets")
+			return nil, nil, errors.New("truncated pack index large offsets")
 		}
 		offsets[i] = binary.BigEndian.Uint64(data[pos+largeIndex*8 : pos+(largeIndex+1)*8])
 	}
-	return packIndex{idxPath: path, packPath: strings.TrimSuffix(path, ".idx") + ".pack", hashes: hashes, offsets: offsets}, nil
+	return hashes, offsets, nil
 }
 
 func (r *nativeGitRepo) objectAtPackOffset(ctx context.Context, idx packIndex, offset uint64) (gitObject, error) {
@@ -1476,6 +1492,23 @@ func (r *nativeGitRepo) copyRemoteObjectsToLocal(ctx context.Context, gitDir str
 }
 
 func uploadLocalObjects(ctx context.Context, store writableGitRemoteStore, gitDir string) error {
+	existing, _ := remoteObjectSet(ctx, store)
+	packed, packFiles, cleanup, err := packLocalObjects(gitDir)
+	if err == nil {
+		defer cleanup()
+		for _, file := range packFiles {
+			if existing[file.remotePath] {
+				continue
+			}
+			data, err := os.ReadFile(file.localPath)
+			if err != nil {
+				return err
+			}
+			if err := store.write(ctx, file.remotePath, data); err != nil {
+				return err
+			}
+		}
+	}
 	objectRoot := filepath.Join(gitDir, "objects")
 	return filepath.WalkDir(objectRoot, func(path string, entry fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
@@ -1495,12 +1528,92 @@ func uploadLocalObjects(ctx context.Context, store writableGitRemoteStore, gitDi
 		if err != nil {
 			return err
 		}
+		rel = filepath.ToSlash(rel)
+		if existing[rel] {
+			return nil
+		}
+		if hash, ok := looseObjectHashFromPath(rel); ok && packed[hash] {
+			return nil
+		}
 		data, err := os.ReadFile(path)
 		if err != nil {
 			return err
 		}
-		return store.write(ctx, filepath.ToSlash(rel), data)
+		return store.write(ctx, rel, data)
 	})
+}
+
+type localPackUploadFile struct {
+	localPath  string
+	remotePath string
+}
+
+func remoteObjectSet(ctx context.Context, store gitRemoteStore) (map[string]bool, error) {
+	paths, err := store.list(ctx, "objects")
+	if err != nil {
+		return nil, err
+	}
+	existing := make(map[string]bool, len(paths))
+	for _, path := range paths {
+		existing[strings.TrimPrefix(path, "/")] = true
+	}
+	return existing, nil
+}
+
+func packLocalObjects(gitDir string) (map[string]bool, []localPackUploadFile, func(), error) {
+	tmpDir, err := os.MkdirTemp("", "bgit-push-pack-*")
+	if err != nil {
+		return nil, nil, func() {}, err
+	}
+	cleanup := func() { _ = os.RemoveAll(tmpDir) }
+	prefix := filepath.Join(tmpDir, "pack")
+	cmd := exec.Command("git", "--git-dir", gitDir, "pack-objects", "--all", prefix)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
+	if err != nil {
+		cleanup()
+		return nil, nil, func() {}, fmt.Errorf("git pack-objects: %w %s", err, strings.TrimSpace(stderr.String()))
+	}
+	packID := strings.TrimSpace(string(out))
+	if packID == "" {
+		cleanup()
+		return nil, nil, func() {}, errors.New("git pack-objects produced no pack")
+	}
+	base := "pack-" + packID
+	packPath := filepath.Join(tmpDir, base+".pack")
+	idxPath := filepath.Join(tmpDir, base+".idx")
+	idxData, err := os.ReadFile(idxPath)
+	if err != nil {
+		cleanup()
+		return nil, nil, func() {}, err
+	}
+	hashes, _, err := parsePackIndexData(idxData)
+	if err != nil {
+		cleanup()
+		return nil, nil, func() {}, err
+	}
+	packed := make(map[string]bool, len(hashes))
+	for _, hash := range hashes {
+		packed[hash] = true
+	}
+	files := []localPackUploadFile{
+		{localPath: packPath, remotePath: "objects/pack/" + base + ".pack"},
+		{localPath: idxPath, remotePath: "objects/pack/" + base + ".idx"},
+	}
+	return packed, files, cleanup, nil
+}
+
+func looseObjectHashFromPath(path string) (string, bool) {
+	path = strings.TrimPrefix(filepath.ToSlash(path), "/")
+	if len(path) != len("objects/00/00000000000000000000000000000000000000") {
+		return "", false
+	}
+	if !strings.HasPrefix(path, "objects/") || path[10] != '/' {
+		return "", false
+	}
+	hash := path[8:10] + path[11:]
+	return hash, isHexHash(hash)
 }
 
 func localGitDir(worktree string) (string, error) {

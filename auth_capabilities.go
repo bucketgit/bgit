@@ -299,6 +299,25 @@ func brokerWhoami(ctx context.Context, cfg config, refresh bool) (brokerAuthStat
 	return status, nil
 }
 
+func brokerRequirePush(ctx context.Context, cfg config) error {
+	status, err := brokerWhoami(ctx, cfg, true)
+	if err != nil {
+		return err
+	}
+	if allowed, ok := status.Capabilities["push"]; ok {
+		if allowed {
+			return nil
+		}
+		return brokerHTTPError("/auth/status", `{"error":"write SSH signature required"}`)
+	}
+	switch status.Role {
+	case "owner", "admin", "maintainer", "developer":
+		return nil
+	default:
+		return brokerHTTPError("/auth/status", `{"error":"write SSH signature required"}`)
+	}
+}
+
 func readWhoamiCache(brokerURL string) (brokerAuthStatus, error) {
 	path, err := whoamiCachePath(brokerURL)
 	if err != nil {

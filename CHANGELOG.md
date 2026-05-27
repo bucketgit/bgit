@@ -4,6 +4,12 @@ All notable changes to `bgit` are documented in this file.
 
 This project follows semantic versioning.
 
+## 1.2.1
+
+Fixed
+
+- Improved push efficiency
+
 ## 1.2.0
 
 - Added broker-backed CI run records, `bgit ci` commands, and a `bgit web` CI

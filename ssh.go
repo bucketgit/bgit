@@ -1169,7 +1169,7 @@ func provisionGCPMaterializerURL(cfg config, region, serviceAccount, ciSecret st
 		"--trigger-http",
 		"--no-allow-unauthenticated",
 		"--service-account", serviceAccount,
-		"--set-env-vars", gcpMaterializerEnvVars(serviceAccount, ciSecret),
+		"--set-env-vars", gcpMaterializerEnvVars(cfg, serviceAccount, ciSecret),
 		"--quiet",
 	)
 	out, err := cmd.CombinedOutput()
@@ -1323,7 +1323,7 @@ func ensureGCPBrokerRuntimePermissions(cfg config, serviceAccount string, stdout
 	if project == "" {
 		return errors.New("GCP project is not configured")
 	}
-	for _, role := range []string{"roles/datastore.user", "roles/storage.admin", "roles/cloudbuild.builds.editor", "roles/run.invoker", "roles/iam.serviceAccountUser"} {
+	for _, role := range []string{"roles/datastore.user", "roles/storage.admin", "roles/cloudbuild.builds.editor", "roles/run.invoker", "roles/iam.serviceAccountUser", "roles/logging.logWriter"} {
 		fmt.Fprintf(stdout, "granting GCP broker %s to %s\n", role, serviceAccount)
 		cmd := gcloudCommand(cfg.gcloudConfiguration,
 			"projects", "add-iam-policy-binding", project,
@@ -1511,6 +1511,7 @@ func gcpBrokerEnvVars(cfg config, opts sshSetupOptions, serviceAccount, ciSecret
 	values := []string{
 		"FIRESTORE_DATABASE=" + gcpBrokerFirestoreDatabase(opts),
 		"BROKER_VERSION=" + brokerVersion,
+		"BGIT_GCP_PROJECT=" + gcloudProject(cfg),
 		"BGIT_SIGNING_SERVICE_ACCOUNT=" + serviceAccount,
 		"BGIT_CI_MATERIALIZER_SECRET=" + ciSecret,
 		"BGIT_OWNER_BOOTSTRAP_HASH=" + bootstrapHash,
@@ -1521,9 +1522,10 @@ func gcpBrokerEnvVars(cfg config, opts sshSetupOptions, serviceAccount, ciSecret
 	return strings.Join(values, ",")
 }
 
-func gcpMaterializerEnvVars(serviceAccount, ciSecret string) string {
+func gcpMaterializerEnvVars(cfg config, serviceAccount, ciSecret string) string {
 	return strings.Join([]string{
 		"BROKER_VERSION=" + brokerVersion,
+		"BGIT_GCP_PROJECT=" + gcloudProject(cfg),
 		"BGIT_CI_MATERIALIZER_SECRET=" + ciSecret,
 		"BGIT_CI_BUILD_SERVICE_ACCOUNT=" + serviceAccount,
 	}, ",")

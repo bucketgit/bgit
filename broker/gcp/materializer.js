@@ -132,20 +132,26 @@ function tarGz(files) {
 }
 
 async function startCloudBuild(repo, run, sourceBucket, sourceObject) {
-  const project = String(process.env.GOOGLE_CLOUD_PROJECT || process.env.GCP_PROJECT || '').trim();
+  const project = String(process.env.BGIT_GCP_PROJECT || process.env.GOOGLE_CLOUD_PROJECT || process.env.GCP_PROJECT || '').trim();
   if (!project) throw new Error('GCP project is not configured');
   const client = await auth.getClient();
   const accessToken = await client.getAccessToken();
   const token = typeof accessToken === 'string' ? accessToken : accessToken && accessToken.token;
   const build = {
     source: {storageSource: {bucket: sourceBucket, object: sourceObject}},
-    filename: run.config,
+    steps: [{
+      name: 'gcr.io/google.com/cloudsdktool/cloud-sdk:slim',
+      entrypoint: 'bash',
+      args: ['-lc', 'gcloud builds submit --project "$PROJECT_ID" --config "$_BGIT_CONFIG" .'],
+    }],
     substitutions: {
       _BGIT_REPO: String(repo.logical || repo.prefix || ''),
       _BGIT_REF: run.ref,
       _BGIT_COMMIT: run.commit,
       _BGIT_BROKER_VERSION: brokerVersion,
+      _BGIT_CONFIG: run.config,
     },
+    options: {logging: 'CLOUD_LOGGING_ONLY', substitutionOption: 'ALLOW_LOOSE'},
   };
   const serviceAccount = String(process.env.BGIT_CI_BUILD_SERVICE_ACCOUNT || '').trim();
   if (serviceAccount) build.serviceAccount = 'projects/' + project + '/serviceAccounts/' + serviceAccount;

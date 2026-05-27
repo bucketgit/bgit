@@ -8,6 +8,7 @@ const {GoogleAuth} = require('google-auth-library');
 const db = new Firestore({databaseId: process.env.FIRESTORE_DATABASE || 'bgit'});
 const repos = db.collection('bgit_broker_repos');
 const members = db.collection('bgit_broker_members');
+const nonces = db.collection('bgit_broker_nonces');
 const storage = new Storage();
 const auth = new GoogleAuth({scopes: ['https://www.googleapis.com/auth/cloud-platform']});
 const brokerVersion = process.env.BROKER_VERSION || '{{BROKER_VERSION}}';
@@ -108,7 +109,32 @@ async function loadExistingRepo(repo) {
   return null;
 }
 
+function mergeCIState(current, next) {
+  current = current || {};
+  next = next || {};
+  const byID = new Map();
+  function add(run) {
+    if (!run || run.id === undefined || run.id === null) return;
+    const id = Number(run.id);
+    const existing = byID.get(id);
+    if (!existing) {
+      byID.set(id, run);
+      return;
+    }
+    const existingTime = Date.parse(existing.updated_at || existing.created_at || '') || 0;
+    const runTime = Date.parse(run.updated_at || run.created_at || '') || 0;
+    if (runTime >= existingTime) byID.set(id, run);
+  }
+  for (const run of current.ci_runs || []) add(run);
+  for (const run of next.ci_runs || []) add(run);
+  next.ci_runs = [...byID.values()].sort((a, b) => Number(b.id || 0) - Number(a.id || 0)).slice(0, 100);
+  next.next_ci_id = Math.max(Number(current.next_ci_id || 1), Number(next.next_ci_id || 1));
+  return next;
+}
+
 async function saveRepo(entry) {
+  const snap = await entry.ref.get();
+  if (snap.exists) entry.data = mergeCIState(snap.data() || {}, entry.data);
   await entry.ref.set(entry.data, {merge: false});
   await syncMembershipIndex(entry);
 }
@@ -142,6 +168,13 @@ async function syncMembershipIndex(entry) {
       for (const key of user.keys || []) {
         addMembership(key.public_key || key, user.username || member.username || member.user_id, role, 'team', false);
       }
+    }
+  }
+  for (const grant of entry.data.user_grants || []) {
+    const user = usersByID.get(grant.user_id) || (users.data.users || []).find((item) => String(item.username || '').trim().toLowerCase() === String(grant.user || grant.username || '').trim().toLowerCase());
+    if (!user || user.suspended || user.pending) continue;
+    for (const key of user.keys || []) {
+      addMembership(key.public_key || key, user.username || grant.username || grant.user_id, normalizeRole(grant.role || 'read'), 'repo-user', false);
     }
   }
   const writes = [];
@@ -312,12 +345,12 @@ async function signedBrokerUser(req) {
   const publicKey = normalizeKey(req.get('x-bgit-key'));
   const message = String(req.get('x-bgit-signature-message') || '');
   const signature = String(req.get('x-bgit-signature') || '');
-  if (!publicKey || !message || !signature || message !== expectedMessage(req)) return null;
+  if (!publicKey || !message || !signature) return null;
   for (const user of users.data.users || []) {
     if (user.suspended) continue;
     for (const key of user.keys || []) {
       const keyValue = normalizeKey(key.public_key || key);
-      if (keyValue === publicKey && verifySSHSignature(publicKey, message, signature)) {
+      if (keyValue === publicKey && await verifySignedRequest(req, publicKey, message, signature)) {
         return {user: user.username || user.id, user_id: user.id, broker_role: user.broker_role || 'user', public_key: publicKey, source: 'broker-user'};
       }
     }
@@ -329,7 +362,7 @@ async function requireBrokerAdmin(req) {
   const user = await signedBrokerUser(req);
   if (user && (user.broker_role === 'owner' || user.broker_role === 'admin')) return user;
   const owners = await loadOwners();
-  const key = signedKey(req, owners);
+  const key = await signedKey(req, owners);
   if (key && (key.role === 'owner' || key.role === 'admin')) return {user: key.user || 'owner', broker_role: key.role, public_key: key.public_key};
   throw Object.assign(new Error('broker admin SSH signature required'), {status: 403});
 }
@@ -392,10 +425,16 @@ function weakerRole(a, b) {
 }
 
 async function effectiveSignedKey(req, entry) {
-  let direct = signedKey(req, entry);
+  let direct = await signedKey(req, entry);
   let role = direct ? direct.role : '';
   const brokerUser = await signedBrokerUser(req);
   if (brokerUser) {
+    for (const grant of entry.data.user_grants || []) {
+      const grantUser = String(grant.user || grant.username || '').trim().toLowerCase();
+      if ((grant.user_id && grant.user_id === brokerUser.user_id) || (grantUser && grantUser === String(brokerUser.user || '').trim().toLowerCase())) {
+        role = strongerRole(role, normalizeRole(grant.role || 'read'));
+      }
+    }
     for (const grant of entry.data.teams || []) {
       const teamRole = await teamRoleForUser(grant.id || grant.team_id, brokerUser.user_id);
       if (teamRole) role = strongerRole(role, weakerRole(teamRole, grant.role || teamRole));
@@ -429,8 +468,77 @@ function rawBody(req) {
 }
 
 function expectedMessage(req) {
-  const digest = crypto.createHash('sha256').update(rawBody(req)).digest('base64');
-  return Buffer.from('bgit-broker-v1\n' + digest).toString('base64');
+  const timestamp = String(req.get('x-bgit-timestamp') || '').trim();
+  const nonce = String(req.get('x-bgit-nonce') || '').trim();
+  const signedHost = String(req.get('x-bgit-signed-host') || '').trim().toLowerCase();
+  const digest = crypto.createHash('sha256').update(rawBody(req)).digest('hex');
+  return Buffer.from([
+    'bgit-broker-v2',
+    String(req.method || '').toUpperCase(),
+    requestPathWithQuery(req),
+    signedHost,
+    timestamp,
+    nonce,
+    digest,
+  ].join('\n')).toString('base64');
+}
+
+function requestPathWithQuery(req) {
+  const original = String(req.originalUrl || req.url || req.path || '/');
+  if (!original) return '/';
+  if (original.startsWith('/')) return original;
+  try {
+    return new URL(original).pathname + new URL(original).search;
+  } catch (_) {
+    return req.path || '/';
+  }
+}
+
+function observedHost(req) {
+  return String(req.get('x-forwarded-host') || req.get('host') || '').split(',')[0].trim().toLowerCase();
+}
+
+function validateSignatureHeaders(req, message) {
+  if (String(req.get('x-bgit-signature-version') || '') !== '2') return false;
+  const timestamp = String(req.get('x-bgit-timestamp') || '').trim();
+  const nonce = String(req.get('x-bgit-nonce') || '').trim();
+  const signedHost = String(req.get('x-bgit-signed-host') || '').trim().toLowerCase();
+  if (!timestamp || !nonce || !signedHost || !message) return false;
+  if (message !== expectedMessage(req)) return false;
+  const ts = Number(timestamp);
+  if (!Number.isInteger(ts)) return false;
+  const now = Math.floor(Date.now() / 1000);
+  if (Math.abs(now - ts) > 300) return false;
+  const host = observedHost(req);
+  if (!host || signedHost !== host) return false;
+  return true;
+}
+
+async function consumeSignatureNonce(fingerprint, nonce, timestamp) {
+  const nonceID = Buffer.from(fingerprint + '\n' + nonce).toString('base64url');
+  const ref = nonces.doc(nonceID);
+  const expiresAt = new Date((Number(timestamp) + 300) * 1000).toISOString();
+  await db.runTransaction(async (tx) => {
+    const snap = await tx.get(ref);
+    if (snap.exists) {
+      const data = snap.data() || {};
+      if (!data.expires_at || Date.parse(data.expires_at) > Date.now()) {
+        throw Object.assign(new Error('broker signature replay detected'), {status: 403});
+      }
+    }
+    tx.set(ref, {fingerprint, nonce, expires_at: expiresAt, created_at: new Date().toISOString()}, {merge: false});
+  });
+}
+
+async function verifySignedRequest(req, publicKey, message, signature) {
+  const fingerprint = keyFingerprint(publicKey);
+  const verified = req.bgitVerifiedSignature || {};
+  if (verified[fingerprint]) return true;
+  if (!validateSignatureHeaders(req, message)) return false;
+  if (!verifySSHSignature(publicKey, message, signature)) return false;
+  await consumeSignatureNonce(fingerprint, String(req.get('x-bgit-nonce') || '').trim(), String(req.get('x-bgit-timestamp') || '').trim());
+  req.bgitVerifiedSignature = {...verified, [fingerprint]: true};
+  return true;
 }
 
 function normalizeKey(key) {
@@ -521,24 +629,24 @@ function verifySSHSignature(publicKey, message, signature) {
   return crypto.verify(signatureVerifyAlgorithm(alg), Buffer.from(message, 'base64'), publicKeyObject(publicKey), signatureBlobForVerify(alg, sig));
 }
 
-function signedKey(req, entry) {
+async function signedKey(req, entry) {
   const keys = (entry.data.keys || []).filter((k) => !k.suspended);
   const publicKey = normalizeKey(req.get('x-bgit-key'));
   const message = String(req.get('x-bgit-signature-message') || '');
   const signature = String(req.get('x-bgit-signature') || '');
-  if (!publicKey || !message || !signature || message !== expectedMessage(req)) return null;
+  if (!publicKey || !message || !signature) return null;
   const key = keys.find((k) => normalizeKey(k.public_key) === publicKey);
   if (!key) return null;
-  if (!verifySSHSignature(publicKey, message, signature)) return null;
+  if (!await verifySignedRequest(req, publicKey, message, signature)) return null;
   return key;
 }
 
-function submittedSignedKey(req) {
+async function submittedSignedKey(req) {
   const publicKey = normalizeKey(req.get('x-bgit-key'));
   const message = String(req.get('x-bgit-signature-message') || '');
   const signature = String(req.get('x-bgit-signature') || '');
-  if (!publicKey || !message || !signature || message !== expectedMessage(req)) return null;
-  if (!verifySSHSignature(publicKey, message, signature)) return null;
+  if (!publicKey || !message || !signature) return null;
+  if (!await verifySignedRequest(req, publicKey, message, signature)) return null;
   return {public_key: publicKey, fingerprint: keyFingerprint(publicKey)};
 }
 
@@ -565,11 +673,22 @@ function brokerUserInviteCode(brokerURL, user, role, token) {
   return 'bgituser_' + payload;
 }
 
-function verifySignature(req, entry) {
+async function verifySignature(req, entry) {
   const adminKeys = (entry.data.keys || []).filter((k) => (k.role === 'admin' || k.role === 'owner') && !k.suspended);
-  if (adminKeys.length === 0) return true;
-  const key = signedKey(req, entry);
+  if (adminKeys.length === 0) return verifyBootstrapToken(req, entry);
+  const key = await signedKey(req, entry);
   return !!key && (key.role === 'admin' || key.role === 'owner');
+}
+
+function bootstrapTokenHash(token) {
+  return crypto.createHash('sha256').update(String(token || '')).digest('hex');
+}
+
+function verifyBootstrapToken(req, entry) {
+  const expected = String(process.env.BGIT_OWNER_BOOTSTRAP_HASH || '').trim();
+  if (!expected || entry.data.bootstrap_used_at) return false;
+  const token = String(req.get('x-bgit-bootstrap-token') || '').trim();
+  return !!token && bootstrapTokenHash(token) === expected;
 }
 
 function roleAllows(role, operation) {
@@ -645,6 +764,7 @@ function roleCapabilities(role) {
     reopen_pr: ['owner', 'admin', 'maintainer'].includes(role),
     owner_transfer: role === 'owner',
     broker_upgrade: role === 'owner' || role === 'admin',
+    ci_run: roleAllows(role, 'write'),
   };
 }
 
@@ -771,8 +891,27 @@ async function boardAssignableUsers(entry) {
 
 function cleanObjectPath(value) {
   const path = String(value || '').replace(/^\/+/, '');
-  if (path.includes('\0') || path.includes('..')) throw new Error('invalid object path');
+  if (path.includes('\0') || path.includes('\\') || path.split('/').some((part) => part === '.' || part === '..' || (part === '' && path !== ''))) throw new Error('invalid object path');
   return path;
+}
+
+function isGitObjectDatabasePath(path) {
+  return path === 'objects' || path.startsWith('objects/');
+}
+
+function validateCapabilityPath(operation, objectPath) {
+  const path = cleanObjectPath(objectPath);
+  if (!path) throw Object.assign(new Error('invalid object path'), {status: 400});
+  if (operation === 'delete') throw Object.assign(new Error('delete capabilities are not supported'), {status: 400});
+  if (operation === 'write') {
+    if (!isGitObjectDatabasePath(path)) throw Object.assign(new Error('write capabilities are restricted to git object paths'), {status: 403});
+    return path;
+  }
+  if (operation === 'read') {
+    if (path === 'HEAD' || path === 'packed-refs' || path.startsWith('refs/') || isGitObjectDatabasePath(path)) return path;
+    throw Object.assign(new Error('read capabilities are restricted to git repository paths'), {status: 403});
+  }
+  throw Object.assign(new Error('unsupported object capability operation'), {status: 400});
 }
 
 function objectName(repo, objectPath) {
@@ -806,6 +945,10 @@ async function readObject(repo, objectPath) {
 
 async function writeTextObject(repo, objectPath, value) {
   await storage.bucket(repo.bucket).file(objectName(repo, objectPath)).save(value);
+}
+
+async function readTextObject(repo, objectPath) {
+  return Buffer.from(await readObject(repo, objectPath), 'base64').toString('utf8');
 }
 
 async function deleteObject(repo, objectPath) {
@@ -879,10 +1022,12 @@ function assertRefAllowed(data, ref, key, opts) {
 async function updateRefCAS(repo, ref, oldHash, newHash, key, opts = {}) {
   const id = docID(repo);
   const refDoc = repos.doc(id);
+  let physicalRepo = null;
   await db.runTransaction(async (tx) => {
     const snap = await tx.get(refDoc);
     const data = snap.exists ? (snap.data() || {}) : {repo, keys: [], refs: {}, audit: []};
     data.repo = data.repo || repo;
+    physicalRepo = data.repo;
     data.keys = data.keys || [];
     data.refs = data.refs || {};
     data.protections = data.protections || [];
@@ -898,6 +1043,10 @@ async function updateRefCAS(repo, ref, oldHash, newHash, key, opts = {}) {
     data.audit = (data.audit || []).concat([{type: 'ref_update', ref, old: oldHash, new: newHash, at: new Date().toISOString()}]).slice(-500);
     tx.set(refDoc, data, {merge: true});
   });
+  if (physicalRepo && physicalRepo.bucket) {
+    if (newHash === zero) await deleteObject(physicalRepo, ref);
+    else await writeTextObject(physicalRepo, ref, newHash + '\n');
+  }
 }
 
 function nextPRID(data) {
@@ -929,6 +1078,209 @@ async function listIssues(entry) {
   return snap.docs.map((doc) => doc.data() || {});
 }
 
+function nextCIID(data) {
+  data.next_ci_id = Number(data.next_ci_id || 1);
+  return data.next_ci_id++;
+}
+
+function listCIRuns(data) {
+  const runs = Array.isArray(data.ci_runs) ? data.ci_runs : [];
+  return [...runs].sort((a, b) => Number(b.id || 0) - Number(a.id || 0));
+}
+
+function findCIRun(data, id) {
+  return (data.ci_runs || []).find((run) => Number(run.id) === Number(id));
+}
+
+function ciTerminal(status) {
+  return ['passed', 'failed', 'cancelled', 'timed_out'].includes(String(status || '').toLowerCase());
+}
+
+function mapGCPBuildStatus(status) {
+  switch (String(status || '').toUpperCase()) {
+    case 'SUCCESS': return 'passed';
+    case 'FAILURE':
+    case 'INTERNAL_ERROR': return 'failed';
+    case 'TIMEOUT':
+    case 'EXPIRED': return 'timed_out';
+    case 'CANCELLED': return 'cancelled';
+    case 'WORKING': return 'building';
+    case 'QUEUED':
+    case 'PENDING': return 'queued';
+    default: return 'queued';
+  }
+}
+
+async function googleAPI(method, url, body) {
+  const client = await auth.getClient();
+  const accessToken = await client.getAccessToken();
+  const token = typeof accessToken === 'string' ? accessToken : accessToken && accessToken.token;
+  const resp = await fetch(url, {
+    method,
+    headers: {authorization: 'Bearer ' + token, 'content-type': 'application/json'},
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const text = await resp.text();
+  if (!resp.ok) throw Object.assign(new Error(text || ('Google API returned HTTP ' + resp.status)), {status: 502});
+  try { return text ? JSON.parse(text) : {}; } catch (_) { return {}; }
+}
+
+function gcpProjectID() {
+  return String(process.env.BGIT_GCP_PROJECT || process.env.GOOGLE_CLOUD_PROJECT || process.env.GCP_PROJECT || '').trim();
+}
+
+async function refreshCIRun(run) {
+  if (!run || run.provider !== 'gcp' || ciTerminal(run.status)) return false;
+  const project = gcpProjectID();
+  const buildID = String(run.provider_build_id || '').trim();
+  if (!project || !buildID) return false;
+  const before = JSON.stringify(run);
+  const buildName = String(run.provider_build_name || '').trim() || 'projects/' + project + '/builds/' + buildID;
+  const build = await googleAPI('GET', 'https://cloudbuild.googleapis.com/v1/' + buildName);
+  run.status = mapGCPBuildStatus(build.status);
+  run.result = run.status;
+  run.url = build.logUrl || run.url || '';
+  run.provider_build_id = build.id || run.provider_build_id || '';
+  run.provider_build_name = build.name || run.provider_build_name || '';
+  run.started_at = build.startTime || run.started_at || '';
+  run.finished_at = build.finishTime || run.finished_at || '';
+  run.message = build.statusDetail || build.failureInfo && build.failureInfo.detail || run.message || '';
+  run.updated_at = new Date().toISOString();
+  return JSON.stringify(run) !== before;
+}
+
+async function refreshCIRuns(entry) {
+  let changed = false;
+  for (const run of entry.data.ci_runs || []) {
+    if (await refreshCIRun(run)) changed = true;
+  }
+  if (changed) await saveRepo(entry);
+  return changed;
+}
+
+function logEntryText(entry) {
+  if (!entry) return '';
+  if (entry.textPayload) return String(entry.textPayload);
+  if (entry.jsonPayload) {
+    if (entry.jsonPayload.message) return String(entry.jsonPayload.message);
+    return JSON.stringify(entry.jsonPayload);
+  }
+  if (entry.protoPayload && entry.protoPayload.status && entry.protoPayload.status.message) return String(entry.protoPayload.status.message);
+  return '';
+}
+
+async function ciRunLogs(run) {
+  const project = gcpProjectID();
+  const buildID = String(run.provider_build_id || '').trim();
+  if (!project || !buildID) return '';
+  const filter = 'resource.type="build" AND resource.labels.build_id="' + buildID + '"';
+  let data = await googleAPI('POST', 'https://logging.googleapis.com/v2/entries:list', {
+    resourceNames: ['projects/' + project],
+    filter,
+    orderBy: 'timestamp asc',
+    pageSize: 1000,
+  });
+  if (!Array.isArray(data.entries) || data.entries.length === 0) {
+    data = await googleAPI('POST', 'https://logging.googleapis.com/v2/entries:list', {
+      resourceNames: ['projects/' + project],
+      filter: 'resource.type="build"',
+      orderBy: 'timestamp desc',
+      pageSize: 1000,
+    });
+    data.entries = (data.entries || []).filter((entry) => entry && entry.resource && entry.resource.labels && entry.resource.labels.build_id === buildID).reverse();
+  }
+  return (data.entries || []).map(logEntryText).filter(Boolean).join('\n');
+}
+
+function normalizeCIProvider(value, repo) {
+  const raw = String(value || '').trim().toLowerCase();
+  if (raw === 'aws' || raw === 'codebuild' || (raw === '' && repo.provider === 's3')) return 'aws';
+  return 'gcp';
+}
+
+function normalizeCIRef(value) {
+  const ref = String(value || '').trim();
+  if (!ref) throw new Error('CI ref is required');
+  if (ref.startsWith('refs/')) return ref;
+  return 'refs/heads/' + ref.replace(/^heads\//, '');
+}
+
+function cleanCIConfig(value, provider) {
+  const config = String(value || '').trim();
+  const defaults = provider === 'aws' ? ['buildspec.yml', 'buildspec.yaml'] : ['cloudbuild.yaml', 'cloudbuild.yml'];
+  const out = config || defaults[0];
+  if (out.startsWith('/') || out.includes('\\') || out.includes('\0') || out.split('/').includes('..')) {
+    throw Object.assign(new Error('invalid CI config path'), {status: 400});
+  }
+  if (!/\.(ya?ml)$/i.test(out)) throw Object.assign(new Error('CI config must be a YAML file'), {status: 400});
+  return out;
+}
+
+async function triggerCIRun(entry, run) {
+  const url = String(process.env.BGIT_CI_MATERIALIZER_URL || '').trim();
+  if (!url) {
+    run.status = 'queued';
+    run.message = 'CI materializer is not configured for this broker yet.';
+    return run;
+  }
+  const payload = {
+    repo: entry.data.repo,
+    run: {id: run.id, provider: run.provider, ref: run.ref, commit: run.commit, config: run.config},
+    broker_version: brokerVersion,
+  };
+  const headers = {'content-type': 'application/json'};
+  const token = await ciMaterializerToken();
+  if (token) headers['x-bgit-ci-token'] = token;
+  const client = await auth.getIdTokenClient(url);
+  const resp = await client.request({url, method: 'POST', headers, data: payload});
+  const data = resp.data && typeof resp.data === 'object' ? resp.data : {};
+  run.status = data.status || 'queued';
+  run.url = data.url || run.url || '';
+  run.message = data.message || run.message || '';
+  run.provider_build_id = data.provider_build_id || run.provider_build_id || '';
+  run.provider_build_name = data.provider_build_name || run.provider_build_name || '';
+  return run;
+}
+
+function randomCIToken() {
+  return crypto.randomBytes(32).toString('base64url');
+}
+
+async function secretManagerRequest(path, opts = {}) {
+  const client = await auth.getClient();
+  const accessToken = await client.getAccessToken();
+  const token = typeof accessToken === 'string' ? accessToken : accessToken && accessToken.token;
+  const resp = await fetch('https://secretmanager.googleapis.com/v1/' + path, {
+    method: opts.method || 'GET',
+    headers: {
+      authorization: 'Bearer ' + token,
+      'content-type': 'application/json',
+    },
+    body: opts.body ? JSON.stringify(opts.body) : undefined,
+  });
+  const text = await resp.text();
+  if (!resp.ok) throw Object.assign(new Error(text || ('Secret Manager returned HTTP ' + resp.status)), {status: 502});
+  try { return text ? JSON.parse(text) : {}; } catch (_) { return {}; }
+}
+
+async function ciMaterializerToken() {
+  const secret = String(process.env.BGIT_CI_MATERIALIZER_SECRET || '').trim();
+  if (!secret) return '';
+  const data = await secretManagerRequest(secret + '/versions/latest:access');
+  return Buffer.from(data.payload && data.payload.data || '', 'base64').toString('utf8').trim();
+}
+
+async function rotateCIMaterializerToken() {
+  const secret = String(process.env.BGIT_CI_MATERIALIZER_SECRET || '').trim();
+  if (!secret) throw Object.assign(new Error('CI materializer secret is not configured'), {status: 500});
+  const token = randomCIToken();
+  await secretManagerRequest(secret + ':addVersion', {
+    method: 'POST',
+    body: {payload: {data: Buffer.from(token).toString('base64')}},
+  });
+  return {rotated: true};
+}
+
 async function deleteRepoMetadata(entry) {
   const prSnap = await entry.ref.collection('prs').get();
   const issueSnap = await entry.ref.collection('issues').get();
@@ -937,9 +1289,18 @@ async function deleteRepoMetadata(entry) {
   issueSnap.forEach((doc) => deletes.push(doc.ref.delete()));
   const repo = entry.data.repo || {};
   const oldRepoDocID = docID(repo);
+  const users = await loadBrokerUsers();
   for (const key of entry.data.keys || []) {
     if (!key.public_key) continue;
     deletes.push(members.doc(memberDocID(keyFingerprint(key.public_key))).collection('repos').doc(oldRepoDocID).delete());
+  }
+  for (const grant of entry.data.user_grants || []) {
+    const user = (users.data.users || []).find((item) => item.id === grant.user_id || String(item.username || '').trim().toLowerCase() === String(grant.user || grant.username || '').trim().toLowerCase());
+    for (const key of user && user.keys || []) {
+      const publicKey = key.public_key || key;
+      if (!publicKey) continue;
+      deletes.push(members.doc(memberDocID(keyFingerprint(publicKey))).collection('repos').doc(oldRepoDocID).delete());
+    }
   }
   deletes.push(entry.ref.delete());
   await Promise.all(deletes);
@@ -959,9 +1320,18 @@ async function moveRepoSubcollections(oldEntry, newRef) {
 async function deleteMembershipIndex(entry) {
   const repoDocID = docID(entry.data.repo || {});
   const deletes = [];
+  const users = await loadBrokerUsers();
   for (const key of entry.data.keys || []) {
     if (!key.public_key) continue;
     deletes.push(members.doc(memberDocID(keyFingerprint(key.public_key))).collection('repos').doc(repoDocID).delete());
+  }
+  for (const grant of entry.data.user_grants || []) {
+    const user = (users.data.users || []).find((item) => item.id === grant.user_id || String(item.username || '').trim().toLowerCase() === String(grant.user || grant.username || '').trim().toLowerCase());
+    for (const key of user && user.keys || []) {
+      const publicKey = key.public_key || key;
+      if (!publicKey) continue;
+      deletes.push(members.doc(memberDocID(keyFingerprint(publicKey))).collection('repos').doc(repoDocID).delete());
+    }
   }
   await Promise.all(deletes);
 }
@@ -1088,12 +1458,17 @@ exports.broker = async (req, res) => {
     const body = req.body || {};
     if (req.path === '/owners/upsert' && req.method === 'POST') {
       const entry = await loadOwners();
-      if (!verifySignature(req, entry)) throw Object.assign(new Error('owner SSH signature required'), {status: 403});
+      const bootstrapping = !(entry.data.keys || []).some((k) => (k.role === 'admin' || k.role === 'owner') && !k.suspended);
+      if (!await verifySignature(req, entry)) throw Object.assign(new Error('owner SSH signature required'), {status: 403});
       const user = body.user || 'owner';
       const role = normalizeRole(body.role || 'owner');
       if (role !== 'owner') throw new Error('owner bootstrap only accepts owner role');
       for (const publicKey of body.public_keys || []) {
         if (!assertUniqueRepoKey(entry, publicKey, user)) entry.data.keys.push({user, role, public_key: publicKey, source: body.source || '', suspended: false});
+      }
+      if (bootstrapping) {
+        entry.data.bootstrap_used_at = new Date().toISOString();
+        audit(entry, {type: 'owner_bootstrap', user, source_ip: req.get('x-forwarded-for') || req.ip || '', user_agent: req.get('user-agent') || ''});
       }
       await saveRepo(entry);
       await ensureCoreTeam(user);
@@ -1216,7 +1591,7 @@ exports.broker = async (req, res) => {
     }
     if (req.path === '/broker/users/invite/accept' && req.method === 'POST') {
       const users = await loadBrokerUsers();
-      const signed = submittedSignedKey(req);
+      const signed = await submittedSignedKey(req);
       if (!signed) throw Object.assign(new Error('SSH signature required'), {status: 403});
       const tokenHash = ownershipTransferTokenHash(body.token);
       const invites = users.data.invites || [];
@@ -1426,6 +1801,51 @@ exports.broker = async (req, res) => {
       res.status(200).send(JSON.stringify({ok: true, teams: entry.data.teams}));
       return;
     }
+    if (req.path === '/repo/users/list' && req.method === 'POST') {
+      const entry = await loadExistingRepo(body.repo);
+      if (!entry) throw Object.assign(new Error('repository not found'), {status: 404});
+      await requireAdmin(req, entry);
+      res.status(200).send(JSON.stringify({users: entry.data.user_grants || []}));
+      return;
+    }
+    if (req.path === '/repo/users/upsert' && req.method === 'POST') {
+      const entry = await loadExistingRepo(body.repo);
+      if (!entry) throw Object.assign(new Error('repository not found'), {status: 404});
+      await requireBrokerAdmin(req);
+      await requireAdmin(req, entry);
+      const users = await loadBrokerUsers();
+      const wantID = String(body.user_id || '').trim();
+      const wantUser = String(body.user || body.username || '').trim().toLowerCase();
+      const user = (users.data.users || []).find((item) => (wantID && item.id === wantID) || (wantUser && String(item.username || '').trim().toLowerCase() === wantUser));
+      if (!user) throw Object.assign(new Error('broker user not found'), {status: 404});
+      const role = normalizeRole(body.role || 'read');
+      if (!validRole(role) || role === 'owner') throw new Error('invalid role');
+      entry.data.user_grants = (entry.data.user_grants || []).filter((grant) => grant.user_id !== user.id && String(grant.user || grant.username || '').trim().toLowerCase() !== String(user.username || '').trim().toLowerCase());
+      entry.data.user_grants.push({user_id: user.id, user: user.username || user.id, role});
+      audit(entry, {type: 'repo_user_grant', user: user.username || user.id, role});
+      await saveRepo(entry);
+      res.status(200).send(JSON.stringify({ok: true, users: entry.data.user_grants}));
+      return;
+    }
+    if (req.path === '/repo/users/remove' && req.method === 'POST') {
+      const entry = await loadExistingRepo(body.repo);
+      if (!entry) throw Object.assign(new Error('repository not found'), {status: 404});
+      await requireBrokerAdmin(req);
+      await requireAdmin(req, entry);
+      const wantID = String(body.user_id || '').trim();
+      const wantUser = String(body.user || body.username || '').trim().toLowerCase();
+      const before = (entry.data.user_grants || []).length;
+      entry.data.user_grants = (entry.data.user_grants || []).filter((grant) => {
+        if (wantID && grant.user_id === wantID) return false;
+        if (wantUser && String(grant.user || grant.username || '').trim().toLowerCase() === wantUser) return false;
+        return true;
+      });
+      if (entry.data.user_grants.length === before) throw Object.assign(new Error('repo user grant not found'), {status: 404});
+      audit(entry, {type: 'repo_user_remove', user: body.user || body.user_id || ''});
+      await saveRepo(entry);
+      res.status(200).send(JSON.stringify({ok: true, users: entry.data.user_grants || []}));
+      return;
+    }
     if (req.path === '/repos/list' && req.method === 'POST') {
       await requireBrokerAdmin(req);
       const snap = await repos.get();
@@ -1568,7 +1988,7 @@ exports.broker = async (req, res) => {
     }
     if (req.path === '/keys/invite/accept' && req.method === 'POST') {
       const entry = await ensureRepo(body.repo);
-      const signed = submittedSignedKey(req);
+      const signed = await submittedSignedKey(req);
       if (!signed) throw Object.assign(new Error('SSH signature required'), {status: 403});
       const tokenHash = ownershipTransferTokenHash(body.token);
       const invites = entry.data.invites || [];
@@ -1686,7 +2106,7 @@ exports.broker = async (req, res) => {
       const transfer = entry.data.owner_transfer;
       if (!transfer || ownershipTransferExpired(transfer)) throw Object.assign(new Error('ownership transfer is not pending or has expired'), {status: 404});
       if (ownershipTransferTokenHash(body.token) !== transfer.token_hash) throw Object.assign(new Error('ownership transfer code is invalid'), {status: 403});
-      const accepted = submittedSignedKey(req);
+      const accepted = await submittedSignedKey(req);
       if (!accepted) throw Object.assign(new Error('SSH signature required'), {status: 403});
       const user = String(body.user || 'owner').trim() || 'owner';
       const ownerFingerprint = transfer.requested_by_fingerprint || '';
@@ -1820,6 +2240,72 @@ exports.broker = async (req, res) => {
       issue.updated_at = new Date().toISOString();
       await saveIssue(entry, issue);
       res.status(200).send(JSON.stringify({ok: true, issue}));
+      return;
+    }
+    if (req.path === '/ci/list' && req.method === 'POST') {
+      const entry = await ensureRepo(body.repo);
+      await requireRead(req, entry);
+      await refreshCIRuns(entry);
+      res.status(200).send(JSON.stringify({runs: listCIRuns(entry.data)}));
+      return;
+    }
+    if (req.path === '/ci/view' && req.method === 'POST') {
+      const entry = await ensureRepo(body.repo);
+      await requireRead(req, entry);
+      const run = findCIRun(entry.data, body.id);
+      if (!run) throw Object.assign(new Error('CI run not found'), {status: 404});
+      if (await refreshCIRun(run)) await saveRepo(entry);
+      res.status(200).send(JSON.stringify({run}));
+      return;
+    }
+    if (req.path === '/ci/logs' && req.method === 'POST') {
+      const entry = await ensureRepo(body.repo);
+      await requireRead(req, entry);
+      const run = findCIRun(entry.data, body.id);
+      if (!run) throw Object.assign(new Error('CI run not found'), {status: 404});
+      if (await refreshCIRun(run)) await saveRepo(entry);
+      const logs = await ciRunLogs(run);
+      res.status(200).send(JSON.stringify({run, logs}));
+      return;
+    }
+    if (req.path === '/ci/run' && req.method === 'POST') {
+      const entry = await ensureRepo(body.repo);
+      const key = await requireWrite(req, entry);
+      const repo = entry.data.repo || {};
+      const provider = normalizeCIProvider(body.provider, repo);
+      const ref = normalizeCIRef(body.ref || repo.default_branch || 'refs/heads/main');
+      const refs = entry.data.refs || {};
+      const commit = String(body.commit || refs[ref] || '').trim();
+      if (!commit || !/^[0-9a-f]{40}$/i.test(commit)) throw Object.assign(new Error('CI commit is required'), {status: 400});
+      if (!refs[ref]) throw Object.assign(new Error('CI ref not found'), {status: 404});
+      if (refs[ref] !== commit && repo.bucket && repo.prefix) {
+        try {
+          const physicalRef = (await readTextObject(repo, ref)).trim();
+          if (physicalRef === commit) {
+            refs[ref] = commit;
+            entry.data.refs = refs;
+          }
+        } catch (_) {}
+      }
+      if (refs[ref] !== commit) throw Object.assign(new Error('CI commit does not match broker ref'), {status: 409});
+      const config = cleanCIConfig(body.config, provider);
+      const now = new Date().toISOString();
+      const run = {id: nextCIID(entry.data), provider, ref, commit, config, status: 'queued', url: '', message: '', author: key.user || '', created_at: now, updated_at: now};
+      await triggerCIRun(entry, run);
+      run.updated_at = new Date().toISOString();
+      entry.data.ci_runs = [run, ...(entry.data.ci_runs || [])].slice(0, 100);
+      audit(entry, {type: 'ci_run', id: run.id, provider, ref, commit, config, user: key.user});
+      await saveRepo(entry);
+      res.status(200).send(JSON.stringify({ok: true, run}));
+      return;
+    }
+    if (req.path === '/ci/secret/rotate' && req.method === 'POST') {
+      const entry = await ensureRepo(body.repo);
+      const key = await requireAdmin(req, entry);
+      await rotateCIMaterializerToken();
+      audit(entry, {type: 'ci_secret_rotate', user: key.user});
+      await saveRepo(entry);
+      res.status(200).send(JSON.stringify({ok: true}));
       return;
     }
     if (req.path === '/prs/create' && req.method === 'POST') {
@@ -2024,6 +2510,8 @@ exports.broker = async (req, res) => {
     if (req.path === '/repos/mine' && req.method === 'POST') {
       const fingerprint = req.get('x-bgit-key-fingerprint') || '';
       if (!fingerprint) throw Object.assign(new Error('SSH signature required'), {status: 403});
+      const signed = await submittedSignedKey(req);
+      if (!signed || signed.fingerprint !== fingerprint) throw Object.assign(new Error('SSH signature required'), {status: 403});
       const snap = await members.doc(memberDocID(fingerprint)).collection('repos').get();
       const out = [];
       snap.forEach((doc) => {
@@ -2043,7 +2531,7 @@ exports.broker = async (req, res) => {
         return;
       }
       const owners = await loadOwners();
-      if (!verifySignature(req, owners)) throw Object.assign(new Error('owner SSH signature required'), {status: 403});
+      if (!await verifySignature(req, owners)) throw Object.assign(new Error('owner SSH signature required'), {status: 403});
       const count = await syncAllMembershipIndexes();
       res.status(200).send(JSON.stringify({ok: true, repositories: count}));
       return;
@@ -2053,10 +2541,11 @@ exports.broker = async (req, res) => {
       const operation = body.operation || 'read';
       const key = operation === 'read' ? await requireRead(req, entry) : await requireWrite(req, entry);
       const repo = await ensurePhysicalRepo(entry);
-      const capability = body.resumable ? await resumableUpload(repo, body.path) : await signedURL(repo, body.path, operation);
-      audit(entry, {type: 'capability_issued', operation, path: body.path, user: key.user, role: key.role});
+      const capabilityPath = validateCapabilityPath(operation, body.path);
+      const capability = body.resumable ? await resumableUpload(repo, capabilityPath) : await signedURL(repo, capabilityPath, operation);
+      audit(entry, {type: 'capability_issued', operation, path: capabilityPath, user: key.user, role: key.role});
       await saveRepo(entry);
-      res.status(200).send(JSON.stringify({...capability, bucket: repo.bucket, prefix: repo.prefix, object: objectName(repo, body.path)}));
+      res.status(200).send(JSON.stringify({...capability, bucket: repo.bucket, prefix: repo.prefix, object: objectName(repo, capabilityPath)}));
       return;
     }
     if (req.path === '/objects/read' && req.method === 'POST') {

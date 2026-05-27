@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -37,6 +38,11 @@ type sshSetupOptions struct {
 	firestoreLocation string
 	keys              []string
 	noAgent           bool
+}
+
+type provisionedBroker struct {
+	URL            string
+	BootstrapToken string
 }
 
 func sshCommand(base config, args []string, stdout, stderr io.Writer) error {
@@ -766,12 +772,16 @@ func brokerPost(brokerURL, path string, req any, resp any) error {
 }
 
 func brokerPostContext(ctx context.Context, brokerURL, path string, req any, resp any) error {
+	return brokerPostJSONContextWithHeaders(ctx, brokerURL, path, req, resp, nil)
+}
+
+func brokerPostJSONContextWithHeaders(ctx context.Context, brokerURL, path string, req any, resp any, extraHeaders map[string]string) error {
 	endpoint := strings.TrimRight(brokerURL, "/") + path
 	data, err := json.Marshal(req)
 	if err != nil {
 		return err
 	}
-	headerSets := brokerSignatureHeaderSetsForBroker(brokerURL, data)
+	headerSets := brokerSignatureHeaderSetsForBroker(brokerURL, path, data)
 	if len(headerSets) == 0 {
 		headerSets = []map[string]string{{}}
 	} else {
@@ -785,6 +795,9 @@ func brokerPostContext(ctx context.Context, brokerURL, path string, req any, res
 		}
 		httpReq.Header.Set("content-type", "application/json")
 		for key, value := range headers {
+			httpReq.Header.Set(key, value)
+		}
+		for key, value := range extraHeaders {
 			httpReq.Header.Set(key, value)
 		}
 		httpResp, err := http.DefaultClient.Do(httpReq)
@@ -811,12 +824,32 @@ func brokerPostContext(ctx context.Context, brokerURL, path string, req any, res
 		if msg == "" {
 			msg = httpResp.Status
 		}
-		lastErr = fmt.Errorf("broker %s: %s", path, msg)
+		lastErr = brokerHTTPError(path, msg)
 		if httpResp.StatusCode != http.StatusForbidden || i == len(headerSets)-1 || !brokerForbiddenAllowsSignatureRetry(msg) {
 			return lastErr
 		}
 	}
 	return lastErr
+}
+
+func brokerHTTPError(path, msg string) error {
+	if brokerLooksIncompatibleWithV2Signatures(msg) {
+		return fmt.Errorf("broker %s: %s\nbroker is incompatible with this bgit version and must be upgraded for v2 request signatures; run `bgit admin broker upgrade` with a bgit version that can administer this broker", path, msg)
+	}
+	return fmt.Errorf("broker %s: %s", path, msg)
+}
+
+func brokerLooksIncompatibleWithV2Signatures(msg string) bool {
+	msg = strings.ToLower(strings.TrimSpace(msg))
+	if !strings.Contains(msg, "ssh signature required") {
+		return false
+	}
+	for _, scoped := range []string{"read ssh signature required", "write ssh signature required", "admin ssh signature required", "owner ssh signature required", "merge ssh signature required", "broker admin ssh signature required"} {
+		if strings.Contains(msg, scoped) {
+			return false
+		}
+	}
+	return true
 }
 
 func brokerForbiddenAllowsSignatureRetry(msg string) bool {
@@ -828,7 +861,7 @@ func brokerForbiddenAllowsSignatureRetry(msg string) bool {
 }
 
 func brokerSignatureHeaders(payload []byte) map[string]string {
-	sets := brokerSignatureHeaderSetsForBroker("", payload)
+	sets := brokerSignatureHeaderSetsForBroker("", "/", payload)
 	if len(sets) == 0 {
 		return map[string]string{}
 	}
@@ -836,10 +869,10 @@ func brokerSignatureHeaders(payload []byte) map[string]string {
 }
 
 func brokerSignatureHeaderSets(payload []byte) []map[string]string {
-	return brokerSignatureHeaderSetsForBroker("", payload)
+	return brokerSignatureHeaderSetsForBroker("", "/", payload)
 }
 
-func brokerSignatureHeaderSetsForBroker(brokerURL string, payload []byte) []map[string]string {
+func brokerSignatureHeaderSetsForBroker(brokerURL, requestPath string, payload []byte) []map[string]string {
 	signers := explicitBrokerSigners()
 	agentSigners, cleanup, err := sshAgentSigners()
 	if err == nil && len(agentSigners) > 0 {
@@ -851,7 +884,7 @@ func brokerSignatureHeaderSetsForBroker(brokerURL string, payload []byte) []map[
 	if cleanup != nil {
 		defer cleanup()
 	}
-	message := brokerSignatureMessage(payload)
+	host := brokerSignatureHost(brokerURL)
 	preferred := preferredBrokerKeyFingerprints(brokerURL, payload)
 	type signedHeaders struct {
 		fingerprint string
@@ -859,14 +892,24 @@ func brokerSignatureHeaderSetsForBroker(brokerURL string, payload []byte) []map[
 	}
 	var signed []signedHeaders
 	for _, signer := range signers {
-		sig, err := signer.Sign(rand.Reader, message)
+		timestamp := fmt.Sprintf("%d", time.Now().Unix())
+		nonce, err := randomBrokerSignatureNonce()
+		if err != nil {
+			continue
+		}
+		message := brokerSignatureMessage(http.MethodPost, requestPath, host, timestamp, nonce, payload)
+		sig, err := signBrokerMessage(signer, message)
 		if err != nil {
 			continue
 		}
 		fingerprint := ssh.FingerprintSHA256(signer.PublicKey())
 		signed = append(signed, signedHeaders{fingerprint: fingerprint, headers: map[string]string{
+			"X-Bgit-Signature-Version": "2",
 			"X-Bgit-Key":               strings.TrimSpace(string(ssh.MarshalAuthorizedKey(signer.PublicKey()))),
 			"X-Bgit-Key-Fingerprint":   fingerprint,
+			"X-Bgit-Timestamp":         timestamp,
+			"X-Bgit-Nonce":             nonce,
+			"X-Bgit-Signed-Host":       host,
 			"X-Bgit-Signature":         base64.StdEncoding.EncodeToString(ssh.Marshal(sig)),
 			"X-Bgit-Signature-Message": base64.StdEncoding.EncodeToString(message),
 		}})
@@ -879,6 +922,33 @@ func brokerSignatureHeaderSetsForBroker(brokerURL string, payload []byte) []map[
 		sets = append(sets, item.headers)
 	}
 	return sets
+}
+
+func brokerSignatureHost(brokerURL string) string {
+	u, err := url.Parse(strings.TrimSpace(brokerURL))
+	if err != nil || u.Host == "" {
+		return ""
+	}
+	return strings.ToLower(u.Host)
+}
+
+func randomBrokerSignatureNonce() (string, error) {
+	var nonce [16]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
+		return "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(nonce[:]), nil
+}
+
+func signBrokerMessage(signer ssh.Signer, message []byte) (*ssh.Signature, error) {
+	if signer.PublicKey().Type() == ssh.KeyAlgoRSA {
+		if algorithmSigner, ok := signer.(ssh.AlgorithmSigner); ok {
+			if sig, err := algorithmSigner.SignWithAlgorithm(rand.Reader, message, ssh.KeyAlgoRSASHA256); err == nil {
+				return sig, nil
+			}
+		}
+	}
+	return signer.Sign(rand.Reader, message)
 }
 
 func explicitBrokerSigners() []ssh.Signer {
@@ -923,9 +993,17 @@ func preferredBrokerKeyRank(fingerprint string, preferred []string) int {
 	return len(preferred) + 1
 }
 
-func brokerSignatureMessage(payload []byte) []byte {
+func brokerSignatureMessage(method, requestPath, host, timestamp, nonce string, payload []byte) []byte {
 	sum := sha256.Sum256(payload)
-	return []byte("bgit-broker-v1\n" + base64.StdEncoding.EncodeToString(sum[:]))
+	return []byte(strings.Join([]string{
+		"bgit-broker-v2",
+		strings.ToUpper(strings.TrimSpace(method)),
+		firstNonEmpty(requestPath, "/"),
+		strings.ToLower(strings.TrimSpace(host)),
+		strings.TrimSpace(timestamp),
+		strings.TrimSpace(nonce),
+		fmt.Sprintf("%x", sum[:]),
+	}, "\n"))
 }
 
 func discoverBrokerURL(cfg config, opts sshSetupOptions) (string, error) {
@@ -992,17 +1070,36 @@ func discoverAWSBrokerURL(cfg config, opts sshSetupOptions) (string, error) {
 }
 
 func provisionBrokerURL(cfg config, opts sshSetupOptions, stdout io.Writer) (string, error) {
+	broker, err := provisionBroker(cfg, opts, stdout)
+	if err != nil {
+		return "", err
+	}
+	return broker.URL, nil
+}
+
+func provisionBroker(cfg config, opts sshSetupOptions, stdout io.Writer) (provisionedBroker, error) {
+	token, err := randomBrokerSecret()
+	if err != nil {
+		return provisionedBroker{}, err
+	}
+	hash := brokerSecretHash(token)
 	switch firstNonEmpty(cfg.provider, "gcs") {
 	case "gcs":
-		return provisionGCPBrokerURL(cfg, opts, stdout)
+		url, err := provisionGCPBrokerURLWithBootstrap(cfg, opts, stdout, hash)
+		return provisionedBroker{URL: url, BootstrapToken: token}, err
 	case "s3":
-		return provisionAWSBrokerURL(cfg, opts, stdout)
+		url, err := provisionAWSBrokerURLWithBootstrap(cfg, opts, stdout, hash)
+		return provisionedBroker{URL: url, BootstrapToken: token}, err
 	default:
-		return "", fmt.Errorf("unsupported storage provider %q", cfg.provider)
+		return provisionedBroker{}, fmt.Errorf("unsupported storage provider %q", cfg.provider)
 	}
 }
 
 func provisionGCPBrokerURL(cfg config, opts sshSetupOptions, stdout io.Writer) (string, error) {
+	return provisionGCPBrokerURLWithBootstrap(cfg, opts, stdout, "")
+}
+
+func provisionGCPBrokerURLWithBootstrap(cfg config, opts sshSetupOptions, stdout io.Writer, bootstrapHash string) (string, error) {
 	region := firstNonEmpty(strings.TrimSpace(opts.region), defaultGCPRegion(cfg))
 	if err := ensureGCPBrokerServices(cfg, stdout); err != nil {
 		return "", err
@@ -1018,6 +1115,14 @@ func provisionGCPBrokerURL(cfg config, opts sshSetupOptions, stdout io.Writer) (
 		return "", err
 	}
 	if err := ensureGCPBrokerDeployerPermission(cfg, serviceAccount, stdout); err != nil {
+		return "", err
+	}
+	ciSecret, err := ensureGCPMaterializerSecret(cfg, serviceAccount, stdout)
+	if err != nil {
+		return "", err
+	}
+	ciMaterializerURL, err := provisionGCPMaterializerURL(cfg, region, serviceAccount, ciSecret, stdout)
+	if err != nil {
 		return "", err
 	}
 	sourceDir, err := os.MkdirTemp("", "bgit-gcp-broker-*")
@@ -1039,7 +1144,7 @@ func provisionGCPBrokerURL(cfg config, opts sshSetupOptions, stdout io.Writer) (
 		"--trigger-http",
 		"--allow-unauthenticated",
 		"--service-account", serviceAccount,
-		"--set-env-vars", "FIRESTORE_DATABASE="+gcpBrokerFirestoreDatabase(opts)+",BROKER_VERSION="+brokerVersion+",BGIT_SIGNING_SERVICE_ACCOUNT="+serviceAccount,
+		"--set-env-vars", gcpBrokerEnvVars(cfg, opts, serviceAccount, ciSecret, ciMaterializerURL, bootstrapHash),
 		"--quiet",
 	)
 	out, err := cmd.CombinedOutput()
@@ -1050,6 +1155,40 @@ func provisionGCPBrokerURL(cfg config, opts sshSetupOptions, stdout io.Writer) (
 		return "", err
 	}
 	return discoverGCPBrokerURL(cfg, opts)
+}
+
+func provisionGCPMaterializerURL(cfg config, region, serviceAccount, ciSecret string, stdout io.Writer) (string, error) {
+	sourceDir, err := os.MkdirTemp("", "bgit-gcp-materializer-*")
+	if err != nil {
+		return "", err
+	}
+	defer os.RemoveAll(sourceDir)
+	if err := writeGCPMaterializerSource(sourceDir); err != nil {
+		return "", err
+	}
+	fmt.Fprintf(stdout, "deploying GCP Cloud Run function bgit-ci-materializer in %s\n", region)
+	cmd := gcloudCommand(cfg.gcloudConfiguration,
+		"functions", "deploy", "bgit-ci-materializer",
+		"--gen2",
+		"--runtime", "nodejs22",
+		"--region", region,
+		"--source", sourceDir,
+		"--entry-point", "materializer",
+		"--trigger-http",
+		"--no-allow-unauthenticated",
+		"--service-account", serviceAccount,
+		"--set-env-vars", gcpMaterializerEnvVars(cfg, serviceAccount, ciSecret),
+		"--quiet",
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("deploy GCP bgit CI materializer: %w\n%s", err, strings.TrimSpace(string(out)))
+	}
+	url := discoverGCPMaterializerURL(cfg, region)
+	if strings.TrimSpace(url) == "" {
+		return "", errors.New("discover GCP bgit CI materializer URL")
+	}
+	return url, nil
 }
 
 func ensureGCPBrokerServices(cfg config, stdout io.Writer) error {
@@ -1066,6 +1205,7 @@ func ensureGCPBrokerServices(cfg config, stdout io.Writer) error {
 		"artifactregistry.googleapis.com",
 		"firestore.googleapis.com",
 		"iamcredentials.googleapis.com",
+		"secretmanager.googleapis.com",
 	}
 	fmt.Fprintf(stdout, "ensuring GCP broker APIs are enabled\n")
 	args := append([]string{"services", "enable"}, services...)
@@ -1191,7 +1331,7 @@ func ensureGCPBrokerRuntimePermissions(cfg config, serviceAccount string, stdout
 	if project == "" {
 		return errors.New("GCP project is not configured")
 	}
-	for _, role := range []string{"roles/datastore.user", "roles/storage.admin"} {
+	for _, role := range []string{"roles/datastore.user", "roles/storage.admin", "roles/cloudbuild.builds.editor", "roles/run.invoker", "roles/iam.serviceAccountUser", "roles/logging.logWriter", "roles/logging.viewer"} {
 		fmt.Fprintf(stdout, "granting GCP broker %s to %s\n", role, serviceAccount)
 		cmd := gcloudCommand(cfg.gcloudConfiguration,
 			"projects", "add-iam-policy-binding", project,
@@ -1375,7 +1515,117 @@ func gcpBrokerFirestoreDatabase(opts sshSetupOptions) string {
 	return firstNonEmpty(strings.TrimSpace(opts.firestoreDatabase), os.Getenv("BGIT_FIRESTORE_DATABASE"), "bgit")
 }
 
+func gcpBrokerEnvVars(cfg config, opts sshSetupOptions, serviceAccount, ciSecret, ciMaterializerURL, bootstrapHash string) string {
+	values := []string{
+		"FIRESTORE_DATABASE=" + gcpBrokerFirestoreDatabase(opts),
+		"BROKER_VERSION=" + brokerVersion(),
+		"BGIT_GCP_PROJECT=" + gcloudProject(cfg),
+		"BGIT_SIGNING_SERVICE_ACCOUNT=" + serviceAccount,
+		"BGIT_CI_MATERIALIZER_SECRET=" + ciSecret,
+		"BGIT_OWNER_BOOTSTRAP_HASH=" + bootstrapHash,
+	}
+	if strings.TrimSpace(ciMaterializerURL) != "" {
+		values = append(values, "BGIT_CI_MATERIALIZER_URL="+strings.TrimSpace(ciMaterializerURL))
+	}
+	return strings.Join(values, ",")
+}
+
+func gcpMaterializerEnvVars(cfg config, serviceAccount, ciSecret string) string {
+	return strings.Join([]string{
+		"BROKER_VERSION=" + brokerVersion(),
+		"BGIT_GCP_PROJECT=" + gcloudProject(cfg),
+		"BGIT_CI_MATERIALIZER_SECRET=" + ciSecret,
+		"BGIT_CI_BUILD_SERVICE_ACCOUNT=" + serviceAccount,
+	}, ",")
+}
+
+func ensureGCPMaterializerSecret(cfg config, serviceAccount string, stdout io.Writer) (string, error) {
+	project := gcloudProject(cfg)
+	if project == "" {
+		return "", errors.New("GCP project is not configured")
+	}
+	secret := "bgit-ci-materializer-token"
+	fullName := "projects/" + project + "/secrets/" + secret
+	describe := gcloudCommand(cfg.gcloudConfiguration, "secrets", "describe", secret, "--project="+project, "--format=value(name)")
+	if out, err := describe.Output(); err != nil || strings.TrimSpace(string(out)) == "" {
+		fmt.Fprintf(stdout, "creating GCP CI materializer secret %s\n", secret)
+		create := gcloudCommand(cfg.gcloudConfiguration,
+			"secrets", "create", secret,
+			"--replication-policy=automatic",
+			"--project="+project,
+			"--quiet",
+		)
+		if createOut, createErr := create.CombinedOutput(); createErr != nil {
+			return "", fmt.Errorf("create GCP CI materializer secret: %w\n%s", createErr, strings.TrimSpace(string(createOut)))
+		}
+		token, err := randomBrokerSecret()
+		if err != nil {
+			return "", err
+		}
+		add := gcloudCommand(cfg.gcloudConfiguration,
+			"secrets", "versions", "add", secret,
+			"--data-file=-",
+			"--project="+project,
+			"--quiet",
+		)
+		add.Stdin = strings.NewReader(token)
+		if addOut, addErr := add.CombinedOutput(); addErr != nil {
+			return "", fmt.Errorf("seed GCP CI materializer secret: %w\n%s", addErr, strings.TrimSpace(string(addOut)))
+		}
+	}
+	for _, role := range []string{"roles/secretmanager.secretAccessor", "roles/secretmanager.admin"} {
+		fmt.Fprintf(stdout, "granting GCP broker %s on %s\n", role, secret)
+		cmd := gcloudCommand(cfg.gcloudConfiguration,
+			"secrets", "add-iam-policy-binding", secret,
+			"--member=serviceAccount:"+serviceAccount,
+			"--role="+role,
+			"--project="+project,
+			"--quiet",
+		)
+		out, err := runGcloudIAMBindingWithRetry(cmd)
+		if err != nil {
+			return "", fmt.Errorf("grant GCP broker %s on CI materializer secret: %w\n%s", role, err, strings.TrimSpace(string(out)))
+		}
+	}
+	return fullName, nil
+}
+
+func randomBrokerSecret() (string, error) {
+	var data [32]byte
+	if _, err := rand.Read(data[:]); err != nil {
+		return "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(data[:]), nil
+}
+
+func brokerSecretHash(token string) string {
+	sum := sha256.Sum256([]byte(token))
+	return fmt.Sprintf("%x", sum[:])
+}
+
+func discoverGCPMaterializerURL(cfg config, region string) string {
+	project := gcloudProject(cfg)
+	if project == "" {
+		return ""
+	}
+	cmd := gcloudCommand(cfg.gcloudConfiguration,
+		"run", "services", "describe", "bgit-ci-materializer",
+		"--region", region,
+		"--project", project,
+		"--format=value(status.url)",
+	)
+	out, err := cmd.Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
 func provisionAWSBrokerURL(cfg config, opts sshSetupOptions, stdout io.Writer) (string, error) {
+	return provisionAWSBrokerURLWithBootstrap(cfg, opts, stdout, "")
+}
+
+func provisionAWSBrokerURLWithBootstrap(cfg config, opts sshSetupOptions, stdout io.Writer, bootstrapHash string) (string, error) {
 	region := firstNonEmpty(strings.TrimSpace(opts.region), defaultAWSRegion())
 	template, err := os.CreateTemp("", "bgit-aws-broker-*.yaml")
 	if err != nil {
@@ -1399,6 +1649,7 @@ func provisionAWSBrokerURL(cfg config, opts sshSetupOptions, stdout io.Writer) (
 	if err != nil {
 		return "", err
 	}
+	parameterOverrides := []string{"OwnerBootstrapHash=" + bootstrapHash}
 	args := []string{
 		"cloudformation", "deploy",
 		"--stack-name", "bgit-broker",
@@ -1406,7 +1657,9 @@ func provisionAWSBrokerURL(cfg config, opts sshSetupOptions, stdout io.Writer) (
 		"--s3-bucket", s3Bucket,
 		"--capabilities", "CAPABILITY_NAMED_IAM",
 		"--region", region,
+		"--parameter-overrides",
 	}
+	args = append(args, parameterOverrides...)
 	out, err := awsCommand(context.Background(), strings.TrimSpace(cfg.gcloudConfiguration), args...).CombinedOutput()
 	if err != nil {
 		return "", fmt.Errorf("deploy AWS bgit broker: %w\n%s", err, strings.TrimSpace(string(out)))

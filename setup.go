@@ -577,12 +577,13 @@ func setupProvisionSelectedProfile(base config, path, now string, profile setupP
 	cfg.provider = profile.Provider
 	cfg.gcloudConfiguration = profile.Name
 	cfg.gcloudConfigurationExplicit = profile.Name != ""
-	brokerURL, err := provisionBrokerURL(cfg, sshSetupOptions{region: firstNonEmpty(opts.region, profile.Region)}, stdout)
+	broker, err := provisionBroker(cfg, sshSetupOptions{region: firstNonEmpty(opts.region, profile.Region)}, stdout)
 	if err != nil {
 		return err
 	}
+	brokerURL := broker.URL
 	if len(publicKeys) > 0 {
-		if err := brokerUpsertOwners(brokerURL, publicKeys); err != nil {
+		if err := brokerUpsertOwners(brokerURL, broker.BootstrapToken, publicKeys); err != nil {
 			return err
 		}
 		fmt.Fprintf(stdout, "imported %d owner key(s) into broker %s\n", len(publicKeys), brokerURL)
@@ -603,7 +604,7 @@ func setupProvisionSelectedProfile(base config, path, now string, profile setupP
 			Regions: []globalProfileRegion{{
 				Name:          profile.Region,
 				BrokerURL:     brokerURL,
-				BrokerVersion: brokerVersion,
+				BrokerVersion: brokerVersion(),
 				LastSetupAt:   now,
 			}},
 		})
@@ -615,7 +616,7 @@ func setupProvisionSelectedProfile(base config, path, now string, profile setupP
 			Regions: []globalProfileRegion{{
 				Name:          profile.Region,
 				BrokerURL:     brokerURL,
-				BrokerVersion: brokerVersion,
+				BrokerVersion: brokerVersion(),
 				LastSetupAt:   now,
 			}},
 		})
@@ -3707,6 +3708,8 @@ func runSetupManagedTeamRepositoryAction(cfg config, teamID, teamName, repo, act
 	var out bytes.Buffer
 	repoName := logicalRepoDisplayName(repo)
 	switch action {
+	case "assign-users":
+		return runSetupRepoUserAssignmentWithRaw(cfg, teamID, teamName, repo, reader, rawInput, stdout)
 	case "access-manage":
 		msg, err := runSetupManagedTeamRepositoryAccessWithRaw(cfg, teamID, teamName, repo, reader, rawInput, stdout)
 		if errors.Is(err, errSetupBack) {
@@ -3803,7 +3806,7 @@ func runSetupManagedTeamRepositoryAccessWithRaw(cfg config, teamID, teamName, re
 		if !ok || action == "back" {
 			return "", errSetupBack
 		}
-		if action == "invite-user" || action == "cancel-invite" || action == "grant-team" {
+		if action == "assign-users" || action == "invite-user" || action == "cancel-invite" || action == "grant-team" {
 			msg, err := runSetupManagedTeamRepositoryAction(cfg, teamID, teamName, repo, action, reader, rawInput, stdout)
 			if err != nil {
 				return "", err
@@ -3827,11 +3830,16 @@ func runSetupManagedTeamRepositoryAccessWithRaw(cfg config, teamID, teamName, re
 }
 
 func setupRepoAccessManagementChoices(cfg config, repo, teamID string) ([]setupChoice, error) {
-	choices := []setupChoice{
-		{Label: "invite user", Value: "invite-user", Help: "create an invite for this repository"},
-		{Label: "cancel invite", Value: "cancel-invite", Help: "cancel a pending invite by username"},
-		{Label: "grant team access", Value: "grant-team", Help: "share this repository with another team"},
+	choices := []setupChoice{}
+	if _, err := setupBrokerUsers(cfg); err == nil {
+		choices = append(choices, setupChoice{Label: "assign users", Value: "assign-users", Help: "grant broker users repository access"})
+	} else {
+		choices = append(choices,
+			setupChoice{Label: "invite user", Value: "invite-user", Help: "create an invite for this repository"},
+			setupChoice{Label: "cancel invite", Value: "cancel-invite", Help: "cancel a pending invite by username"},
+		)
 	}
+	choices = append(choices, setupChoice{Label: "grant team access", Value: "grant-team", Help: "share this repository with another team"})
 	users, err := setupRepoUsers(cfg, repo, teamID)
 	if err != nil {
 		return nil, err
@@ -3840,8 +3848,20 @@ func setupRepoAccessManagementChoices(cfg config, repo, teamID string) ([]setupC
 		for _, user := range users {
 			label := user.User
 			help := "role " + user.Role
+			details := []string{}
+			if user.Grant {
+				details = append(details, "broker user")
+			}
+			if user.Pending {
+				details = append(details, "pending")
+			}
 			if user.KeyCount > 1 {
-				help = fmt.Sprintf("role %s, %d keys", user.Role, user.KeyCount)
+				details = append(details, fmt.Sprintf("%d keys", user.KeyCount))
+			} else if user.KeyCount == 1 {
+				details = append(details, "1 key")
+			}
+			if len(details) > 0 {
+				help += ", " + strings.Join(details, ", ")
 			}
 			choices = append(choices, setupChoice{Label: label, Value: "user:" + user.User, Help: help, Group: "users:"})
 		}
@@ -3849,6 +3869,74 @@ func setupRepoAccessManagementChoices(cfg config, repo, teamID string) ([]setupC
 		choices = append(choices, setupChoice{Label: "no repository users", Value: "noop", Help: "", Group: "users:"})
 	}
 	choices = append(choices, setupChoice{Label: "back", Value: "back", Help: "return to repository"})
+	return choices, nil
+}
+
+func runSetupRepoUserAssignmentWithRaw(cfg config, teamID, teamName, repo string, reader *bufio.Reader, rawInput io.Reader, stdout io.Writer) (string, error) {
+	repoName := logicalRepoDisplayName(repo)
+	choices, err := setupAssignableRepoUserChoices(cfg, repo, teamID)
+	if err != nil {
+		return "", err
+	}
+	if len(choices) == 0 {
+		if _, err := runSetupBrokerOutputWithRaw(reader, rawInput, stdout, setupBreadcrumb("Manage team", teamName, "Repositories", repoName, "Assign users"), "No broker users are available to assign."); err != nil {
+			return "", err
+		}
+		return "No changes made.", nil
+	}
+	selected, ok, err := runSetupMultiSelectWithRaw(reader, rawInput, stdout, setupBreadcrumb("Manage team", teamName, "Repositories", repoName, "Assign users"), choices)
+	if err != nil || !ok {
+		return "No changes made.", err
+	}
+	role, ok, err := runSetupSelectWithRaw(reader, rawInput, stdout, setupBreadcrumb("Manage team", teamName, "Repositories", repoName, "Role"), setupRepoRoleChoices(), "developer")
+	if err != nil || !ok {
+		return "No changes made.", err
+	}
+	brokerURL, err := brokerURLFromConfigOrDiscovery(cfg)
+	if err != nil {
+		return "", err
+	}
+	brokerRepo, err := setupBrokerTeamRepoForAction(cfg, repo, teamID)
+	if err != nil {
+		return "", err
+	}
+	for _, userID := range selected {
+		if err := brokerPost(brokerURL, "/repo/users/upsert", brokerRepoAdminRequest{Repo: brokerRepo, UserID: userID, Role: role}, nil); err != nil {
+			return "", err
+		}
+	}
+	return fmt.Sprintf("assigned %d user(s) to %s as %s", len(selected), repoName, role), nil
+}
+
+func setupAssignableRepoUserChoices(cfg config, repo, teamID string) ([]setupChoice, error) {
+	users, err := setupBrokerUsers(cfg)
+	if err != nil {
+		return nil, err
+	}
+	assigned, err := setupRepoUsers(cfg, repo, teamID)
+	if err != nil {
+		return nil, err
+	}
+	assignedNames := map[string]struct{}{}
+	for _, user := range assigned {
+		assignedNames[strings.ToLower(user.User)] = struct{}{}
+	}
+	var choices []setupChoice
+	for _, user := range users {
+		username := firstNonEmpty(user.Username, user.ID)
+		if username == "" || user.ID == "" {
+			continue
+		}
+		if _, ok := assignedNames[strings.ToLower(username)]; ok {
+			continue
+		}
+		help := setupBrokerUserStatus(user)
+		if user.Pending || len(user.Keys) == 0 {
+			help += " · access activates after key setup"
+		}
+		choices = append(choices, setupChoice{Label: username, Value: user.ID, Help: help})
+	}
+	sort.Slice(choices, func(i, j int) bool { return choices[i].Label < choices[j].Label })
 	return choices, nil
 }
 
@@ -3954,6 +4042,8 @@ type setupRepoUser struct {
 	Role      string
 	KeyCount  int
 	PublicKey []string
+	Grant     bool
+	Pending   bool
 }
 
 func setupRepoUsers(cfg config, repo, teamID string) ([]setupRepoUser, error) {
@@ -3977,6 +4067,41 @@ func setupRepoUsers(cfg config, repo, teamID string) ([]setupRepoUser, error) {
 		entry.PublicKey = append(entry.PublicKey, key.PublicKey)
 		entry.Role = strongerSetupRepoRole(entry.Role, firstNonEmpty(key.Role, "read"))
 	}
+	grants, grantErr := setupRepoUserGrants(cfg, repo, teamID)
+	if grantErr == nil {
+		brokerUsers, _ := setupBrokerUsers(cfg)
+		byID := map[string]brokerUserInfo{}
+		byName := map[string]brokerUserInfo{}
+		for _, user := range brokerUsers {
+			if user.ID != "" {
+				byID[user.ID] = user
+			}
+			if user.Username != "" {
+				byName[strings.ToLower(user.Username)] = user
+			}
+		}
+		for _, grant := range grants {
+			userName := firstNonEmpty(grant.User, grant.Username, grant.UserID)
+			if user, ok := byID[grant.UserID]; ok {
+				userName = firstNonEmpty(user.Username, userName)
+			}
+			if userName == "" {
+				continue
+			}
+			mapKey := strings.ToLower(userName)
+			entry := byUser[mapKey]
+			if entry == nil {
+				entry = &setupRepoUser{User: userName, Role: firstNonEmpty(grant.Role, "read")}
+				byUser[mapKey] = entry
+			}
+			entry.Grant = true
+			entry.Role = strongerSetupRepoRole(entry.Role, firstNonEmpty(grant.Role, "read"))
+			if user, ok := byName[mapKey]; ok {
+				entry.KeyCount = maxSetupDialogInt(entry.KeyCount, len(user.Keys))
+				entry.Pending = user.Pending || len(user.Keys) == 0
+			}
+		}
+	}
 	users := make([]setupRepoUser, 0, len(byUser))
 	for _, user := range byUser {
 		users = append(users, *user)
@@ -3997,6 +4122,22 @@ func setupRepoKeys(cfg config, repo, teamID string) ([]brokerKey, error) {
 	actionCfg.provider = firstNonEmpty(actionCfg.provider, cfg.provider, "gcs")
 	actionCfg.teamID = strings.TrimSpace(teamID)
 	return brokerListKeys(brokerURL, actionCfg)
+}
+
+func setupRepoUserGrants(cfg config, repo, teamID string) ([]brokerRepoUserGrant, error) {
+	brokerURL, err := brokerURLFromConfigOrDiscovery(cfg)
+	if err != nil {
+		return nil, err
+	}
+	brokerRepo, err := setupBrokerTeamRepoForAction(cfg, repo, teamID)
+	if err != nil {
+		return nil, err
+	}
+	var resp brokerRepoUsersResponse
+	if err := brokerPost(brokerURL, "/repo/users/list", brokerRepoAdminRequest{Repo: brokerRepo}, &resp); err != nil {
+		return nil, err
+	}
+	return resp.Users, nil
 }
 
 func strongerSetupRepoRole(a, b string) string {
@@ -4058,7 +4199,11 @@ func runSetupManagedTeamRepositoryUserAction(cfg config, teamID, teamName, repo,
 	if err != nil {
 		return "", err
 	}
-	if len(keys) == 0 {
+	grant, hasGrant, err := setupRepoUserGrantForUser(cfg, repo, teamID, user)
+	if err != nil {
+		return "", err
+	}
+	if len(keys) == 0 && !hasGrant {
 		return "No repository access found for " + user + ".", nil
 	}
 	brokerURL, err := brokerURLFromConfigOrDiscovery(cfg)
@@ -4076,6 +4221,11 @@ func runSetupManagedTeamRepositoryUserAction(cfg config, teamID, teamName, repo,
 		role, ok, err := runSetupSelectWithRaw(reader, rawInput, stdout, setupBreadcrumb("Manage team", teamName, "Repositories", repoName, user, "Role"), setupRepoRoleChoices(), "developer")
 		if err != nil || !ok {
 			return "No changes made.", err
+		}
+		if hasGrant {
+			if err := brokerPost(brokerURL, "/repo/users/upsert", brokerRepoAdminRequest{Repo: repoForBroker(actionCfg), UserID: grant.UserID, User: firstNonEmpty(grant.User, grant.Username, user), Role: role}, nil); err != nil {
+				return "", err
+			}
 		}
 		for _, key := range keys {
 			if err := brokerPost(brokerURL, "/keys/remove", brokerKeyRequest{Repo: repoForBroker(actionCfg), Key: key.PublicKey}, nil); err != nil {
@@ -4096,6 +4246,11 @@ func runSetupManagedTeamRepositoryUserAction(cfg config, teamID, teamName, repo,
 		if action == "user-remove" {
 			path = "/keys/remove"
 			verb = "removed"
+		}
+		if action == "user-remove" && hasGrant {
+			if err := brokerPost(brokerURL, "/repo/users/remove", brokerRepoAdminRequest{Repo: repoForBroker(actionCfg), UserID: grant.UserID, User: firstNonEmpty(grant.User, grant.Username, user)}, nil); err != nil {
+				return "", err
+			}
 		}
 		for _, key := range keys {
 			if err := brokerPost(brokerURL, path, brokerKeyRequest{Repo: repoForBroker(actionCfg), Key: key.PublicKey}, nil); err != nil {
@@ -4120,6 +4275,20 @@ func setupRepoKeysForUser(cfg config, repo, teamID, user string) ([]brokerKey, e
 		}
 	}
 	return out, nil
+}
+
+func setupRepoUserGrantForUser(cfg config, repo, teamID, user string) (brokerRepoUserGrant, bool, error) {
+	grants, err := setupRepoUserGrants(cfg, repo, teamID)
+	if err != nil {
+		return brokerRepoUserGrant{}, false, err
+	}
+	needle := strings.ToLower(strings.TrimSpace(user))
+	for _, grant := range grants {
+		if strings.ToLower(firstNonEmpty(grant.User, grant.Username, grant.UserID)) == needle {
+			return grant, true, nil
+		}
+	}
+	return brokerRepoUserGrant{}, false, nil
 }
 
 func runSetupPendingRepoInviteSelect(cfg config, repo brokerRepo, reader *bufio.Reader, rawInput io.Reader, stdout io.Writer, title string) (string, bool, error) {
@@ -4622,9 +4791,6 @@ func runSetupSelectWithRaw(reader *bufio.Reader, rawInput io.Reader, stdout io.W
 }
 
 func setupReadEscapeSequence(reader *bufio.Reader) (byte, bool, error) {
-	if reader.Buffered() == 0 {
-		return 0, false, nil
-	}
 	next, err := reader.ReadByte()
 	if err != nil {
 		if errors.Is(err, io.EOF) {
@@ -4634,9 +4800,6 @@ func setupReadEscapeSequence(reader *bufio.Reader) (byte, bool, error) {
 	}
 	if next != '[' {
 		return next, true, nil
-	}
-	if reader.Buffered() == 0 {
-		return 0, false, nil
 	}
 	last, err := reader.ReadByte()
 	if err != nil {
@@ -6335,8 +6498,12 @@ func shortSetupKey(key string) string {
 	return fields[0] + " " + part
 }
 
-func brokerUpsertOwners(brokerURL string, publicKeys []string) error {
-	return brokerPost(brokerURL, "/owners/upsert", brokerOwnerRequest{User: "owner", Role: "owner", PublicKeys: publicKeys}, nil)
+func brokerUpsertOwners(brokerURL, bootstrapToken string, publicKeys []string) error {
+	headers := map[string]string{}
+	if strings.TrimSpace(bootstrapToken) != "" {
+		headers["X-Bgit-Bootstrap-Token"] = strings.TrimSpace(bootstrapToken)
+	}
+	return brokerPostJSONContextWithHeaders(context.Background(), brokerURL, "/owners/upsert", brokerOwnerRequest{User: "owner", Role: "owner", PublicKeys: publicKeys}, nil, headers)
 }
 
 func brokerEnsureCoreTeam(brokerURL string) error {

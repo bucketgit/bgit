@@ -43,6 +43,12 @@ tmp_root="${TMPDIR:-${TMP:-/tmp}}"
 test_root="${BGIT_TEST_LOCAL_BROKER_ROOT:-${tmp_root%/}/bgit-local-broker-${runtime}-${run_id}}"
 broker_url="http://127.0.0.1:${port}"
 config_path="${test_root}/home/.bgit/config.yaml"
+bootstrap_token="local-broker-bootstrap-${runtime}-${run_id}"
+if command -v sha256sum >/dev/null 2>&1; then
+  bootstrap_hash="$(printf '%s' "$bootstrap_token" | sha256sum | awk '{print $1}')"
+else
+  bootstrap_hash="$(printf '%s' "$bootstrap_token" | shasum -a 256 | awk '{print $1}')"
+fi
 remove_test_artifacts_best_effort "$test_root"
 remove_test_artifacts_best_effort "$ROOT/testsuite/local/repo"
 remove_test_artifacts_best_effort "$ROOT/testsuite/${provider}/repo"
@@ -71,7 +77,7 @@ aws:
           broker_url: ${broker_url}
 EOF
 
-PORT="$port" BROKER_TEST_ROOT="$test_root" node broker/testserver.js "$runtime" > "${test_root}/broker.log" 2>&1 &
+PORT="$port" BROKER_TEST_ROOT="$test_root" BGIT_OWNER_BOOTSTRAP_HASH="$bootstrap_hash" node broker/testserver.js "$runtime" > "${test_root}/broker.log" 2>&1 &
 broker_pid=$!
 status=0
 cleanup() {
@@ -100,6 +106,7 @@ export BGIT_SSH_KEY="$(native_path "$ROOT/testsuite/sshkeys/owner")"
 owner_key="$(cat "$ROOT/testsuite/sshkeys/owner.pub")"
 curl -sS -X POST "${broker_url}/owners/upsert" \
   -H 'content-type: application/json' \
+  -H "x-bgit-bootstrap-token: ${bootstrap_token}" \
   --data "{\"user\":\"owner\",\"role\":\"owner\",\"public_keys\":[\"${owner_key}\"]}" >/dev/null
 
 export BGIT="${BGIT:-$ROOT/bgit}"

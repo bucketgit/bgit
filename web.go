@@ -4,6 +4,7 @@ import (
 	"archive/zip"
 	"bytes"
 	"context"
+	"crypto/rand"
 	"embed"
 	"encoding/base64"
 	"encoding/json"
@@ -57,6 +58,7 @@ type webServer struct {
 	title       string
 	events      *webEventHub
 	localGitDir string
+	csrfToken   string
 }
 
 type brokerGitStore struct {
@@ -379,7 +381,11 @@ func newWebHandlerWithAPI(repo, apiRepo *nativeGitRepo, cfg config) *webServer {
 			localGitDir = store.root
 		}
 	}
-	return &webServer{repo: repo, apiRepo: apiRepo, cfg: cfg, title: webRepoTitle(cfg), events: newWebEventHub(), localGitDir: localGitDir}
+	csrfToken, err := randomWebCSRFToken()
+	if err != nil {
+		csrfToken = fmt.Sprintf("%d", time.Now().UnixNano())
+	}
+	return &webServer{repo: repo, apiRepo: apiRepo, cfg: cfg, title: webRepoTitle(cfg), events: newWebEventHub(), localGitDir: localGitDir, csrfToken: csrfToken}
 }
 
 func webRepoTitle(cfg config) string {
@@ -400,6 +406,12 @@ func (s *webServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	route := strings.TrimPrefix(r.URL.Path, "/")
 	srv := s.serverForRequest(r, strings.HasPrefix(route, "api/"))
+	if s.isMutationRoute(route, r.Method) {
+		if err := s.validateWebMutation(r); err != nil {
+			http.Error(w, err.Error(), http.StatusForbidden)
+			return
+		}
+	}
 	switch {
 	case r.Method != http.MethodGet && r.Method != http.MethodHead && !strings.HasPrefix(route, "api/actions/") && route != "api/user/profile":
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -433,6 +445,8 @@ func (s *webServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.handleAPIActionIssue(ctx, w, r)
 	case route == "api/actions/board":
 		s.handleAPIActionBoard(ctx, w, r)
+	case route == "api/actions/ci":
+		s.handleAPIActionCI(ctx, w, r)
 	case route == "api/actions/settings":
 		s.handleAPIActionSettings(ctx, w, r)
 	case route == "api/user/profile":
@@ -475,6 +489,8 @@ func (s *webServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.handleBoard(ctx, w, r)
 	case strings.HasPrefix(route, "board/"):
 		s.handleStory(ctx, w, r, strings.TrimPrefix(route, "board/"))
+	case route == "ci":
+		s.handleCI(ctx, w, r)
 	case route == "settings":
 		s.handleSettings(ctx, w, r)
 	case route == "user/settings" || route == "user/settings/":
@@ -494,6 +510,44 @@ func (s *webServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.NotFound(w, r)
 	}
+}
+
+func randomWebCSRFToken() (string, error) {
+	var data [32]byte
+	if _, err := rand.Read(data[:]); err != nil {
+		return "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(data[:]), nil
+}
+
+func (s *webServer) isMutationRoute(route, method string) bool {
+	if method == http.MethodGet || method == http.MethodHead || method == http.MethodOptions {
+		return false
+	}
+	return strings.HasPrefix(route, "api/actions/") || route == "api/user/profile"
+}
+
+func (s *webServer) validateWebMutation(r *http.Request) error {
+	if r.Header.Get("X-Bgit-CSRF") != s.csrfToken {
+		return errors.New("invalid CSRF token")
+	}
+	origin := strings.TrimSpace(r.Header.Get("Origin"))
+	if origin == "" {
+		return nil
+	}
+	u, err := url.Parse(origin)
+	if err != nil {
+		return errors.New("invalid origin")
+	}
+	host, _, err := net.SplitHostPort(u.Host)
+	if err != nil {
+		host = u.Hostname()
+	}
+	host = strings.ToLower(strings.Trim(host, "[]"))
+	if u.Scheme != "http" || (host != "localhost" && host != "127.0.0.1" && host != "::1") {
+		return errors.New("foreign origin rejected")
+	}
+	return nil
 }
 
 func (s *webServer) handleWebAsset(w http.ResponseWriter, path string) {
@@ -759,6 +813,7 @@ type webSettingsInfo struct {
 	ReadOnly      bool                      `json:"read_only,omitempty"`
 	IssuesEnabled bool                      `json:"issues_enabled"`
 	Keys          []brokerKey               `json:"keys,omitempty"`
+	UserGrants    []brokerRepoUserGrant     `json:"user_grants,omitempty"`
 	Protections   []brokerProtectionRequest `json:"protections,omitempty"`
 	Errors        map[string]string         `json:"errors,omitempty"`
 }
@@ -784,6 +839,7 @@ type brokerRepoInfoRequest struct {
 	Logical       string     `json:"logical,omitempty"`
 	TeamID        string     `json:"team_id,omitempty"`
 	Name          string     `json:"name,omitempty"`
+	UserID        string     `json:"user_id,omitempty"`
 	User          string     `json:"user,omitempty"`
 	Role          string     `json:"role,omitempty"`
 	BrokerRole    string     `json:"broker_role,omitempty"`
@@ -921,6 +977,12 @@ func (s *webServer) settingsInfo(ctx context.Context) webSettingsInfo {
 		info.Errors["members"] = err.Error()
 	} else {
 		info.Keys = keys
+	}
+	var repoUsers brokerRepoUsersResponse
+	if err := brokerPostContext(ctx, s.cfg.brokerURL, "/repo/users/list", brokerRepoAdminRequest{Repo: repoForBroker(s.cfg)}, &repoUsers); err != nil {
+		info.Errors["repo users"] = err.Error()
+	} else {
+		info.UserGrants = repoUsers.Users
 	}
 	var protections struct {
 		Protections []brokerProtectionRequest `json:"protections"`
@@ -1551,6 +1613,7 @@ func (s *webServer) handleAPIActionSettings(ctx context.Context, w http.Response
 		ReadOnly       bool   `json:"read_only"`
 		IssuesEnabled  bool   `json:"issues_enabled"`
 		Logical        string `json:"logical"`
+		UserID         string `json:"user_id"`
 		User           string `json:"user"`
 		Role           string `json:"role"`
 		Key            string `json:"key"`
@@ -1591,6 +1654,15 @@ func (s *webServer) handleAPIActionSettings(ctx context.Context, w http.Response
 	case "remove-member":
 		endpoint = "/keys/remove"
 		payload = brokerKeyRequest{Repo: repoForBroker(s.cfg), Key: strings.TrimSpace(req.Key)}
+	case "remove-repo-user":
+		user := strings.TrimSpace(req.User)
+		userID := strings.TrimSpace(req.UserID)
+		if user == "" && userID == "" {
+			s.renderJSONError(w, http.StatusBadRequest, errors.New("user is required"))
+			return
+		}
+		endpoint = "/repo/users/remove"
+		payload = brokerRepoAdminRequest{Repo: repoForBroker(s.cfg), UserID: userID, User: user}
 	case "suspend-member":
 		endpoint = "/keys/suspend"
 		payload = brokerKeyRequest{Repo: repoForBroker(s.cfg), Key: strings.TrimSpace(req.Key)}
@@ -1784,6 +1856,75 @@ func (s *webServer) handleAPIActionBoard(ctx context.Context, w http.ResponseWri
 	s.renderJSON(w, map[string]any{"ok": true})
 }
 
+func (s *webServer) handleAPIActionCI(ctx context.Context, w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if strings.TrimSpace(s.cfg.brokerURL) == "" || strings.TrimSpace(s.cfg.logicalRepo) == "" {
+		s.renderJSONError(w, http.StatusBadRequest, errors.New("CI actions require a broker-backed repository"))
+		return
+	}
+	var req struct {
+		Action   string `json:"action"`
+		ID       int    `json:"id"`
+		Provider string `json:"provider"`
+		Ref      string `json:"ref"`
+		Config   string `json:"config"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		s.renderJSONError(w, http.StatusBadRequest, err)
+		return
+	}
+	switch strings.TrimSpace(req.Action) {
+	case "list":
+		runs, err := s.listCIRuns(ctx)
+		if err != nil {
+			s.renderJSONError(w, http.StatusBadRequest, err)
+			return
+		}
+		s.renderJSON(w, map[string]any{"ok": true, "runs": runs})
+		return
+	case "logs":
+		var resp struct {
+			Run  brokerCIRun `json:"run"`
+			Logs string      `json:"logs"`
+		}
+		if err := brokerPostContext(ctx, s.cfg.brokerURL, "/ci/logs", brokerCIRequest{Repo: repoForBroker(s.cfg), ID: req.ID}, &resp); err != nil {
+			s.renderJSONError(w, http.StatusBadRequest, err)
+			return
+		}
+		s.renderJSON(w, map[string]any{"ok": true, "run": resp.Run, "logs": resp.Logs})
+		return
+	case "run":
+	default:
+		s.renderJSONError(w, http.StatusBadRequest, fmt.Errorf("unsupported CI action %q", req.Action))
+		return
+	}
+	ref := normalizeDestinationRef(firstNonEmpty(strings.TrimSpace(req.Ref), s.cfg.branch, defaultBranch))
+	commit := ""
+	if head, err := runGit(".", "rev-parse", shortRefName(ref)); err == nil {
+		commit = strings.TrimSpace(string(head))
+	} else if head, err := runGit(".", "rev-parse", "HEAD"); err == nil {
+		commit = strings.TrimSpace(string(head))
+	}
+	config := strings.TrimSpace(req.Config)
+	if config == "" {
+		if detected, err := detectCIConfig(req.Provider, commit); err == nil {
+			config = detected
+		}
+	}
+	var resp struct {
+		Run brokerCIRun `json:"run"`
+	}
+	if err := brokerPostContext(ctx, s.cfg.brokerURL, "/ci/run", brokerCIRequest{Repo: repoForBroker(s.cfg), Provider: normalizeCIProvider(req.Provider), Ref: ref, Commit: commit, Config: config}, &resp); err != nil {
+		s.renderJSONError(w, http.StatusBadRequest, err)
+		return
+	}
+	runs, _ := s.listCIRuns(ctx)
+	s.renderJSON(w, map[string]any{"ok": true, "run": resp.Run, "runs": runs})
+}
+
 func (s *webServer) webRepositoryState(ctx context.Context, refreshRemote bool, selectedRef string) (webAPIState, error) {
 	localRepo, err := openLocalRepository(".")
 	if err != nil {
@@ -1868,7 +2009,7 @@ func (s *webServer) fetchWebRemoteTracking(ctx context.Context, branch string) e
 	}
 	defer closeStore()
 	repo := openNativeGitRepo(store, cfg)
-	return repo.fetchIntoWorktree(ctx, worktree, true, io.Discard)
+	return repo.fetchRefsIntoWorktree(ctx, worktree, true, io.Discard)
 }
 
 type webWorkingTreeStatus struct {
@@ -2428,6 +2569,39 @@ func (s *webServer) handleBoard(ctx context.Context, w http.ResponseWriter, r *h
 	s.renderPage(w, webPageTitle(s.title, "board"), body.String())
 }
 
+func (s *webServer) handleCI(ctx context.Context, w http.ResponseWriter, r *http.Request) {
+	runs, err := s.listCIRuns(ctx)
+	ref := branchRef(firstNonEmpty(s.cfg.branch, defaultBranch))
+	var body strings.Builder
+	body.WriteString(`<main class="layout" data-bgit-source="seed">`)
+	body.WriteString(s.headerHTML(ref, "ci"))
+	body.WriteString(`<div class="repo-content repo-content-single"><div class="repo-primary"><section class="panel ci-panel"><div class="panel-title">CI/CD</div>`)
+	if strings.TrimSpace(s.cfg.brokerURL) == "" {
+		body.WriteString(`<div class="empty">CI is available for broker-backed repositories.</div>`)
+	} else {
+		body.WriteString(ciRunFormHTML(s.cfg))
+		body.WriteString(ciRunListHTML(runs))
+	}
+	if err != nil {
+		body.WriteString(`<div class="settings-error">` + html.EscapeString(err.Error()) + `</div>`)
+	}
+	body.WriteString(`</section></div></div></main>`)
+	s.renderPage(w, webPageTitle(s.title, "ci"), body.String())
+}
+
+func (s *webServer) listCIRuns(ctx context.Context) ([]brokerCIRun, error) {
+	if strings.TrimSpace(s.cfg.brokerURL) == "" || strings.TrimSpace(s.cfg.logicalRepo) == "" {
+		return nil, errors.New("CI requires a broker-backed repository")
+	}
+	var resp struct {
+		Runs []brokerCIRun `json:"runs"`
+	}
+	if err := brokerPostContext(ctx, s.cfg.brokerURL, "/ci/list", brokerCIRequest{Repo: repoForBroker(s.cfg)}, &resp); err != nil {
+		return nil, err
+	}
+	return resp.Runs, nil
+}
+
 func (s *webServer) handleIssue(ctx context.Context, w http.ResponseWriter, r *http.Request, idPart string) {
 	id, err := strconv.Atoi(strings.Trim(idPart, "/"))
 	if err != nil || id <= 0 {
@@ -2669,9 +2843,21 @@ func (s *webServer) settingsAccessHTML(info webSettingsInfo) string {
 	var b strings.Builder
 	b.WriteString(`<section class="settings-section"><h2>Access</h2>`)
 	b.WriteString(`<div class="settings-table" data-settings-members>`)
-	if len(info.Keys) == 0 {
+	if len(info.Keys) == 0 && len(info.UserGrants) == 0 {
 		b.WriteString(`<div class="empty">No members found.</div>`)
 	} else {
+		for _, grant := range info.UserGrants {
+			user := firstNonEmpty(grant.User, grant.Username, grant.UserID, "unknown")
+			role := firstNonEmpty(grant.Role, "read")
+			b.WriteString(`<div class="settings-row" data-repo-user="` + html.EscapeString(user) + `" data-repo-user-id="` + html.EscapeString(grant.UserID) + `">`)
+			b.WriteString(`<div><strong>` + html.EscapeString(user) + `</strong><span>` + html.EscapeString(role) + ` · broker user grant</span>`)
+			if grant.UserID != "" {
+				b.WriteString(`<small>` + html.EscapeString(grant.UserID) + `</small>`)
+			}
+			b.WriteString(`</div><div class="settings-row-actions" data-capability="admin_keys">`)
+			b.WriteString(`<button class="button-link" type="button" data-settings-action="remove-repo-user">Remove</button>`)
+			b.WriteString(`</div></div>`)
+		}
 		for _, key := range info.Keys {
 			fingerprint := publicKeyFingerprint(key.PublicKey)
 			if fingerprint == "" {
@@ -3352,6 +3538,7 @@ func (s *webServer) headerHTML(ref, repoPath string) string {
 	commitsActive := ""
 	prsActive := ""
 	boardActive := ""
+	ciActive := ""
 	issuesActive := ""
 	settingsActive := ""
 	if repoPath == "commits" {
@@ -3366,6 +3553,9 @@ func (s *webServer) headerHTML(ref, repoPath string) string {
 	} else if repoPath == "board" {
 		codeActive = ""
 		boardActive = ` class="active"`
+	} else if repoPath == "ci" {
+		codeActive = ""
+		ciActive = ` class="active"`
 	} else if repoPath == "issues" {
 		codeActive = ""
 		issuesActive = ` class="active"`
@@ -3382,6 +3572,7 @@ func (s *webServer) headerHTML(ref, repoPath string) string {
 		b.WriteString(`<a` + prsActive + ` href="/prs" data-pr-tab` + hidden + `>Pull requests (<span data-pr-tab-count>` + strconv.Itoa(count) + `</span>)</a>`)
 	}
 	b.WriteString(`<a` + boardActive + ` href="/board">Board</a>`)
+	b.WriteString(`<a` + ciActive + ` href="/ci">CI</a>`)
 	b.WriteString(`<a` + issuesActive + ` href="/issues">Issues</a>`)
 	b.WriteString(`<a` + settingsActive + ` href="/settings" data-capability="read">Settings</a>`)
 	b.WriteString(`</nav>`)
@@ -3767,6 +3958,7 @@ func (s *webServer) renderPage(w http.ResponseWriter, title, body string) {
 	page = strings.ReplaceAll(page, "{{TITLE}}", html.EscapeString(title))
 	page = strings.ReplaceAll(page, "{{CSS}}", webAssetString(webCSSPath))
 	page = strings.ReplaceAll(page, "{{SOURCE}}", source)
+	page = strings.ReplaceAll(page, "{{CSRF}}", html.EscapeString(s.csrfToken))
 	page = strings.ReplaceAll(page, "{{BODY}}", body)
 	page = strings.ReplaceAll(page, "{{WHOAMI}}", s.cachedWhoamiJSON())
 	page = strings.ReplaceAll(page, "{{JS}}", webAssetString(webJSPath))
@@ -4032,6 +4224,54 @@ func issueListHTML(issues []brokerIssue) string {
 	}
 	if count == 0 {
 		return `<div class="empty">No issues found.</div>`
+	}
+	b.WriteString(`</div>`)
+	return b.String()
+}
+
+func ciRunFormHTML(cfg config) string {
+	provider := defaultCIProvider(cfg)
+	ref := shortRefName(firstNonEmpty(cfg.branch, defaultBranch))
+	config := ""
+	if detected, err := detectCIConfig(provider, "HEAD"); err == nil {
+		config = detected
+	}
+	var b strings.Builder
+	b.WriteString(`<form class="ci-run-form settings-form" data-ci-form data-capability="push">`)
+	b.WriteString(`<h3>Run CI</h3><div class="settings-form-grid">`)
+	b.WriteString(`<label>Provider<select name="provider"><option value="gcp"`)
+	if provider == "gcp" {
+		b.WriteString(` selected`)
+	}
+	b.WriteString(`>GCP Cloud Build</option><option value="aws"`)
+	if provider == "aws" {
+		b.WriteString(` selected`)
+	}
+	b.WriteString(`>AWS CodeBuild</option></select></label>`)
+	b.WriteString(`<label>Branch or ref<input name="ref" value="` + html.EscapeString(ref) + `" autocomplete="off" required></label>`)
+	b.WriteString(`<label>Config<input name="config" value="` + html.EscapeString(config) + `" placeholder="cloudbuild.yaml or buildspec.yml" autocomplete="off"></label>`)
+	b.WriteString(`</div><div class="settings-actions"><button class="button-link primary" type="submit">Run CI</button></div></form>`)
+	return b.String()
+}
+
+func ciRunListHTML(runs []brokerCIRun) string {
+	if len(runs) == 0 {
+		return `<div class="empty">No CI runs yet.</div>`
+	}
+	var b strings.Builder
+	b.WriteString(`<div class="ci-run-list" data-ci-runs>`)
+	for _, run := range runs {
+		status := firstNonEmpty(run.Status, "queued")
+		b.WriteString(`<div class="ci-run-row" data-ci-run-id="` + strconv.Itoa(run.ID) + `" data-ci-status="` + html.EscapeString(status) + `"><div><strong>#` + strconv.Itoa(run.ID) + ` ` + html.EscapeString(status) + `</strong><span>` + html.EscapeString(strings.ToUpper(firstNonEmpty(run.Provider, "ci"))) + ` · ` + html.EscapeString(shortRefName(run.Ref)) + ` · ` + html.EscapeString(shortHash(run.Commit)) + ` · ` + html.EscapeString(run.Config) + `</span>`)
+		if run.Message != "" {
+			b.WriteString(`<small>` + html.EscapeString(run.Message) + `</small>`)
+		}
+		b.WriteString(`<pre class="ci-run-log" data-ci-log hidden></pre>`)
+		b.WriteString(`</div>`)
+		if run.URL != "" {
+			b.WriteString(`<a class="button-link" href="` + html.EscapeString(run.URL) + `" target="_blank" rel="noreferrer">Open</a>`)
+		}
+		b.WriteString(`</div>`)
 	}
 	b.WriteString(`</div>`)
 	return b.String()
@@ -5633,12 +5873,12 @@ func webPathFingerprint(root string) string {
 		}
 		name := entry.Name()
 		if entry.IsDir() {
-			if name == "objects" || name == "tmp" || name == "bucketgit" {
+			if name == "objects" || name == "tmp" || name == "bucketgit" || name == "bgit" {
 				return filepath.SkipDir
 			}
 			return nil
 		}
-		if strings.HasSuffix(name, ".lock") {
+		if strings.HasSuffix(name, ".lock") || name == "index" || name == "FETCH_HEAD" {
 			return nil
 		}
 		info, err := entry.Info()

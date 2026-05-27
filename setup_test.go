@@ -476,7 +476,7 @@ func TestSetupDialogCreatesAWSProfileInApp(t *testing.T) {
 	writeFakeCLI(t, bin, "aws", []fakeCLIAction{})
 	t.Setenv("PATH", bin)
 	var stdout bytes.Buffer
-	input := " demo\n\x1b[B\nAKIA1234567890ABCDEF\n\x1b[B\nsecretkeyvalue1234567890\n\x1b[B\nus-east-1\n\x04"
+	input := " demo\n\x1b[B\nA3T00123456789ABCDEF\n\x1b[B\ntest-secret-key-value-1234567890\n\x1b[B\nus-east-1\n\x04"
 	selected, err := runSetupDialog(strings.NewReader(input), &stdout, setupSelection{})
 	if err != nil {
 		t.Fatalf("%v\n%s", err, stdout.String())
@@ -484,7 +484,7 @@ func TestSetupDialogCreatesAWSProfileInApp(t *testing.T) {
 	if selected.Action != "create-profile" || selected.CreateProvider != "s3" {
 		t.Fatalf("selection = %#v", selected)
 	}
-	if selected.CreateName != "demo" || selected.CreateAccessKey != "AKIA1234567890ABCDEF" || selected.CreateSecretKey != "secretkeyvalue1234567890" || selected.CreateRegion != "us-east-1" {
+	if selected.CreateName != "demo" || selected.CreateAccessKey != "A3T00123456789ABCDEF" || selected.CreateSecretKey != "test-secret-key-value-1234567890" || selected.CreateRegion != "us-east-1" {
 		t.Fatalf("selection = %#v", selected)
 	}
 	if !strings.Contains(stdout.String(), "Create AWS profile") || strings.Contains(stdout.String(), "AWS Access Key ID [None]") {
@@ -503,7 +503,7 @@ func TestSetupCreateProfileDefaultsAvoidExistingDefault(t *testing.T) {
 }
 
 func TestSetupCreateProfileValidationAndSingleLinePaste(t *testing.T) {
-	state := setupDialogState{createProvider: "s3", createName: "default", createAccessKey: "bad", createSecretKey: "secretkeyvalue1234567890"}
+	state := setupDialogState{createProvider: "s3", createName: "default", createAccessKey: "bad", createSecretKey: "test-secret-key-value-1234567890"}
 	if _, ok := state.deployCreateProfile(); ok || !strings.Contains(state.message, "access key") {
 		t.Fatalf("message = %q ok=%v", state.message, ok)
 	}
@@ -519,13 +519,13 @@ func TestSetupCreateProfileValidationAndSingleLinePaste(t *testing.T) {
 func TestCreateAWSProfileConfiguredUsesAWSConfigureSet(t *testing.T) {
 	bin := t.TempDir()
 	writeFakeCLI(t, bin, "aws", []fakeCLIAction{
-		{match: "configure set aws_access_key_id AKIA1234567890ABCDEF --profile demo"},
-		{match: "configure set aws_secret_access_key secretkeyvalue1234567890 --profile demo"},
+		{match: "configure set aws_access_key_id A3T00123456789ABCDEF --profile demo"},
+		{match: "configure set aws_secret_access_key test-secret-key-value-1234567890 --profile demo"},
 		{match: "configure set region eu-west-1 --profile demo"},
 	})
 	t.Setenv("PATH", bin)
 	var stdout bytes.Buffer
-	if err := createAWSProfileConfigured("demo", "AKIA1234567890ABCDEF", "secretkeyvalue1234567890", "eu-west-1", &stdout); err != nil {
+	if err := createAWSProfileConfigured("demo", "A3T00123456789ABCDEF", "test-secret-key-value-1234567890", "eu-west-1", &stdout); err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(stdout.String(), "created AWS profile demo") {
@@ -636,9 +636,11 @@ func TestSetupCommandProvisionsGCPAndWritesGlobalConfig(t *testing.T) {
 		t.Fatal(err)
 	}
 	var ownerReq brokerOwnerRequest
+	var bootstrapToken string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/owners/upsert":
+			bootstrapToken = r.Header.Get("X-Bgit-Bootstrap-Token")
 			if err := json.NewDecoder(r.Body).Decode(&ownerReq); err != nil {
 				t.Fatal(err)
 			}
@@ -660,12 +662,17 @@ func TestSetupCommandProvisionsGCPAndWritesGlobalConfig(t *testing.T) {
 		{match: "projects describe example-test-123456", stdout: "example-test-123456"},
 		{match: "functions describe bgit-broker --gen2 --region europe-west1 --format=value(serviceConfig.uri)", stdout: server.URL, requireFile: marker, exitCode: 1},
 		{match: "services enable"},
-		{match: "services list --enabled", stdout: "serviceusage.googleapis.com cloudresourcemanager.googleapis.com cloudfunctions.googleapis.com run.googleapis.com cloudbuild.googleapis.com artifactregistry.googleapis.com firestore.googleapis.com iamcredentials.googleapis.com"},
+		{match: "services list --enabled", stdout: "serviceusage.googleapis.com cloudresourcemanager.googleapis.com cloudfunctions.googleapis.com run.googleapis.com cloudbuild.googleapis.com artifactregistry.googleapis.com firestore.googleapis.com iamcredentials.googleapis.com secretmanager.googleapis.com"},
 		{match: "firestore databases describe", exitCode: 1},
 		{match: "firestore databases create"},
 		{match: "iam service-accounts describe bgit-broker@example-test-123456.iam.gserviceaccount.com", exitCode: 1},
 		{match: "iam service-accounts create bgit-broker"},
 		{match: "projects add-iam-policy-binding example-test-123456 --member=serviceAccount:bgit-broker@example-test-123456.iam.gserviceaccount.com"},
+		{match: "secrets describe bgit-ci-materializer-token", exitCode: 1},
+		{match: "secrets create bgit-ci-materializer-token"},
+		{match: "secrets versions add bgit-ci-materializer-token"},
+		{match: "secrets add-iam-policy-binding bgit-ci-materializer-token"},
+		{match: "run services describe bgit-ci-materializer", stdout: "https://bgit-ci-materializer.example.test", requireFile: marker, exitCode: 1},
 		{match: "--service-account bgit-broker@example-test-123456.iam.gserviceaccount.com", touch: marker},
 		{match: "iam service-accounts add-iam-policy-binding bgit-broker@example-test-123456.iam.gserviceaccount.com"},
 	})
@@ -679,6 +686,9 @@ func TestSetupCommandProvisionsGCPAndWritesGlobalConfig(t *testing.T) {
 	if len(ownerReq.PublicKeys) != 1 || ownerReq.Role != "owner" {
 		t.Fatalf("owner request = %#v", ownerReq)
 	}
+	if bootstrapToken == "" {
+		t.Fatalf("missing bootstrap token header")
+	}
 	cfg, err := readGlobalConfig(configPath)
 	if err != nil {
 		t.Fatal(err)
@@ -689,7 +699,7 @@ func TestSetupCommandProvisionsGCPAndWritesGlobalConfig(t *testing.T) {
 	profile := cfg.GCPProfiles[0]
 	if profile.Name != "work" || profile.ProjectID != "example-test-123456" ||
 		len(profile.Regions) != 1 || profile.Regions[0].Name != "europe-west1" ||
-		profile.Regions[0].BrokerURL != server.URL || profile.Regions[0].BrokerVersion != brokerVersion {
+		profile.Regions[0].BrokerURL != server.URL || profile.Regions[0].BrokerVersion != brokerVersion() {
 		t.Fatalf("profile = %#v", profile)
 	}
 	if !strings.Contains(stdout.String(), "Next steps:") {
@@ -723,12 +733,17 @@ func TestSetupCommandOffersGCPProfileCreationWhenNoneExist(t *testing.T) {
 		{match: "projects describe example-test-123456", stdout: "example-test-123456"},
 		{match: "functions describe bgit-broker --gen2 --region europe-west1 --format=value(serviceConfig.uri)", stdout: server.URL, requireFile: deployMarker, exitCode: 1},
 		{match: "services enable"},
-		{match: "services list --enabled", stdout: "serviceusage.googleapis.com cloudresourcemanager.googleapis.com cloudfunctions.googleapis.com run.googleapis.com cloudbuild.googleapis.com artifactregistry.googleapis.com firestore.googleapis.com iamcredentials.googleapis.com"},
+		{match: "services list --enabled", stdout: "serviceusage.googleapis.com cloudresourcemanager.googleapis.com cloudfunctions.googleapis.com run.googleapis.com cloudbuild.googleapis.com artifactregistry.googleapis.com firestore.googleapis.com iamcredentials.googleapis.com secretmanager.googleapis.com"},
 		{match: "firestore databases describe", exitCode: 1},
 		{match: "firestore databases create"},
 		{match: "iam service-accounts describe bgit-broker@example-test-123456.iam.gserviceaccount.com", exitCode: 1},
 		{match: "iam service-accounts create bgit-broker"},
 		{match: "projects add-iam-policy-binding example-test-123456 --member=serviceAccount:bgit-broker@example-test-123456.iam.gserviceaccount.com"},
+		{match: "secrets describe bgit-ci-materializer-token", exitCode: 1},
+		{match: "secrets create bgit-ci-materializer-token"},
+		{match: "secrets versions add bgit-ci-materializer-token"},
+		{match: "secrets add-iam-policy-binding bgit-ci-materializer-token"},
+		{match: "run services describe bgit-ci-materializer", stdout: "https://bgit-ci-materializer.example.test", requireFile: deployMarker, exitCode: 1},
 		{match: "--service-account bgit-broker@example-test-123456.iam.gserviceaccount.com", touch: deployMarker},
 		{match: "iam service-accounts add-iam-policy-binding bgit-broker@example-test-123456.iam.gserviceaccount.com"},
 	})
@@ -1036,7 +1051,7 @@ func TestBrokerDeleteAWSDeletesStackAndClearsConfig(t *testing.T) {
 			Regions: []globalProfileRegion{{
 				Name:          "eu-west-1",
 				BrokerURL:     "https://broker.example.test",
-				BrokerVersion: brokerVersion,
+				BrokerVersion: brokerVersion(),
 			}},
 		}},
 	}); err != nil {
@@ -1130,6 +1145,8 @@ func TestSetupAvailableRepoInviteUsersExcludeMembersAndPendingInvites(t *testing
 			]}`))
 		case "/keys/list":
 			_, _ = w.Write([]byte(`{"keys":[{"user":"member","role":"developer","public_key":"ssh-ed25519 AAAA member"}]}`))
+		case "/repo/users/list":
+			_, _ = w.Write([]byte(`{"users":[]}`))
 		case "/keys/invite/list":
 			_, _ = w.Write([]byte(`{"invites":[{"user":"pending","role":"read"}]}`))
 		default:
@@ -1216,11 +1233,15 @@ func TestSetupBrokerRegularUserShowsDelete(t *testing.T) {
 func TestSetupRepoUserManagementChoicesListsDirectUsers(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
+		case "/broker/users/list":
+			http.Error(w, "forbidden", http.StatusForbidden)
 		case "/keys/list":
 			_, _ = w.Write([]byte(`{"keys":[
 				{"user":"ada","role":"read","public_key":"ssh-ed25519 AAAA ada1"},
 				{"user":"ada","role":"developer","public_key":"ssh-ed25519 AAAA ada2"}
 			]}`))
+		case "/repo/users/list":
+			_, _ = w.Write([]byte(`{"users":[]}`))
 		default:
 			t.Fatalf("unexpected path %s", r.URL.Path)
 		}

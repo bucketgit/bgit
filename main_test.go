@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -165,6 +166,44 @@ func TestVersionCommand(t *testing.T) {
 		if strings.TrimSpace(stdout.String()) != "bgit 9.8.7" {
 			t.Fatalf("%v output = %q", args, stdout.String())
 		}
+	}
+}
+
+func TestDefaultVersionComesFromChangelog(t *testing.T) {
+	oldVersion := version
+	version = ""
+	defer func() { version = oldVersion }()
+
+	got := appVersion()
+	wantPrefix := firstChangelogVersion(embeddedChangelog)
+	if wantPrefix == "" {
+		t.Fatal("test changelog has no semantic version")
+	}
+	if got != wantPrefix+"-dev" {
+		t.Fatalf("appVersion = %q, want %q", got, wantPrefix+"-dev")
+	}
+}
+
+func TestNoArgsUsagePrintsBannerWithVersion(t *testing.T) {
+	oldVersion := version
+	version = "9.8.7-dev"
+	defer func() { version = oldVersion }()
+
+	var stderr bytes.Buffer
+	if err := run(nil, strings.NewReader(""), ioDiscard{}, &stderr); err != nil {
+		t.Fatal(err)
+	}
+	out := stderr.String()
+	for _, want := range []string{
+		"bucketgit.com / github.com/bucketgit / bgit 9.8.7",
+		"usage: bgit <command> [args]",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("output missing %q:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "bgit 9.8.7-dev") {
+		t.Fatalf("banner should not include -dev suffix:\n%s", out)
 	}
 }
 
@@ -1014,7 +1053,7 @@ func TestProvisionGCPBrokerURLDeploysThenDiscoversFunction(t *testing.T) {
 	writeFakeCLI(t, bin, "gcloud", []fakeCLIAction{
 		{match: "functions describe bgit-broker --gen2 --region europe-west1 --format=value(serviceConfig.uri)", stdout: "https://bgit-broker-provisioned.example.test", requireFile: marker, exitCode: 1},
 		{match: "services enable"},
-		{match: "services list --enabled", stdout: "serviceusage.googleapis.com cloudresourcemanager.googleapis.com cloudfunctions.googleapis.com run.googleapis.com cloudbuild.googleapis.com artifactregistry.googleapis.com firestore.googleapis.com iamcredentials.googleapis.com"},
+		{match: "services list --enabled", stdout: "serviceusage.googleapis.com cloudresourcemanager.googleapis.com cloudfunctions.googleapis.com run.googleapis.com cloudbuild.googleapis.com artifactregistry.googleapis.com firestore.googleapis.com iamcredentials.googleapis.com secretmanager.googleapis.com"},
 		{match: "firestore databases describe", exitCode: 1},
 		{match: "firestore databases create"},
 		{match: "config get-value project", stdout: "project-id"},
@@ -1022,6 +1061,11 @@ func TestProvisionGCPBrokerURLDeploysThenDiscoversFunction(t *testing.T) {
 		{match: "iam service-accounts describe bgit-broker@project-id.iam.gserviceaccount.com", exitCode: 1},
 		{match: "iam service-accounts create bgit-broker"},
 		{match: "projects add-iam-policy-binding project-id --member=serviceAccount:bgit-broker@project-id.iam.gserviceaccount.com"},
+		{match: "secrets describe bgit-ci-materializer-token", exitCode: 1},
+		{match: "secrets create bgit-ci-materializer-token"},
+		{match: "secrets versions add bgit-ci-materializer-token"},
+		{match: "secrets add-iam-policy-binding bgit-ci-materializer-token"},
+		{match: "run services describe bgit-ci-materializer", stdout: "https://bgit-ci-materializer.example.test", requireFile: marker, exitCode: 1},
 		{match: "--service-account bgit-broker@project-id.iam.gserviceaccount.com", touch: marker},
 		{match: "iam service-accounts add-iam-policy-binding bgit-broker@project-id.iam.gserviceaccount.com"},
 	})
@@ -1243,6 +1287,10 @@ func TestAWSBrokerCloudFormationTemplateHasBrokerOutput(t *testing.T) {
 		"Type: AWS::DynamoDB::Table",
 		"Type: AWS::Lambda::Function",
 		"Type: AWS::Lambda::Url",
+		"Type: AWS::CodeBuild::Project",
+		"CiMaterializerFunction:",
+		"FunctionName: !Ref CiMaterializerFunctionName",
+		"BGIT_CI_CODEBUILD_PROJECT",
 		"dynamodb:GetItem",
 		"dynamodb:PutItem",
 		"BrokerUrl:",
@@ -1256,12 +1304,34 @@ func TestAWSBrokerCloudFormationTemplateHasBrokerOutput(t *testing.T) {
 		"normalizeLogicalRepo",
 		"logical repo names must be flat",
 		"ConditionalCheckFailedException",
-		"BROKER_VERSION: " + brokerVersion,
+		`BROKER_VERSION: "` + brokerVersion() + `"`,
 		`version: brokerVersion`,
 	} {
 		if !strings.Contains(template, want) {
 			t.Fatalf("template missing %q:\n%s", want, template)
 		}
+	}
+}
+
+func TestBrokerAssetsUseBgitVersion(t *testing.T) {
+	oldVersion := version
+	version = "9.8.7"
+	defer func() { version = oldVersion }()
+
+	template := awsBrokerCloudFormationTemplate()
+	if !strings.Contains(template, `BROKER_VERSION: "9.8.7"`) {
+		t.Fatalf("template did not use bgit version:\n%s", template)
+	}
+	dir := t.TempDir()
+	if err := writeGCPBrokerSource(dir); err != nil {
+		t.Fatal(err)
+	}
+	index, err := os.ReadFile(filepath.Join(dir, "index.js"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(index), "|| '9.8.7'") {
+		t.Fatalf("GCP broker source did not use bgit version:\n%s", string(index))
 	}
 }
 
@@ -1278,6 +1348,7 @@ func TestGCPBrokerSourceUsesFirestoreAndSignatureHeaders(t *testing.T) {
 		"@google-cloud/firestore",
 		"@google-cloud/storage",
 		"databaseId: process.env.FIRESTORE_DATABASE || 'bgit'",
+		"BGIT_CI_MATERIALIZER_URL",
 		"x-bgit-key",
 		"x-bgit-signature",
 		"admin SSH signature required",
@@ -1296,19 +1367,364 @@ func TestGCPBrokerSourceUsesFirestoreAndSignatureHeaders(t *testing.T) {
 			t.Fatalf("GCP broker source missing %q:\n%s", want, string(index))
 		}
 	}
+	materializerDir := t.TempDir()
+	if err := writeGCPMaterializerSource(materializerDir); err != nil {
+		t.Fatal(err)
+	}
+	materializer, err := os.ReadFile(filepath.Join(materializerDir, "index.js"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"exports.materializer",
+		"cloudbuild.googleapis.com",
+		"BGIT_CI_MATERIALIZER_SECRET",
+		"BGIT_CI_BUILD_SERVICE_ACCOUNT",
+		"collectTree",
+		"tarGz",
+	} {
+		if !strings.Contains(string(materializer), want) {
+			t.Fatalf("GCP materializer source missing %q:\n%s", want, string(materializer))
+		}
+	}
+}
+
+func TestBrokerObjectCapabilityPathPolicy(t *testing.T) {
+	if _, err := exec.LookPath("node"); err != nil {
+		t.Skip("node is required for broker JavaScript policy tests")
+	}
+	gcpSourceBytes, err := brokerAssets.ReadFile("broker/gcp/index.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sources := map[string]string{
+		"gcp": string(gcpSourceBytes),
+		"aws": awsBrokerCloudFormationTemplate(),
+	}
+	for name, source := range sources {
+		t.Run(name, func(t *testing.T) {
+			script, err := brokerCapabilityPolicyNodeScript(source)
+			if err != nil {
+				t.Fatal(err)
+			}
+			cmd := exec.Command("node", "-e", script)
+			out, err := cmd.CombinedOutput()
+			if err != nil {
+				t.Fatalf("policy test failed: %v\n%s", err, string(out))
+			}
+		})
+	}
+}
+
+func TestBrokerReplayStoresRejectDuplicateNonces(t *testing.T) {
+	if _, err := exec.LookPath("node"); err != nil {
+		t.Skip("node is required for broker JavaScript replay tests")
+	}
+	gcpSourceBytes, err := brokerAssets.ReadFile("broker/gcp/index.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tests := map[string]string{
+		"gcp": brokerReplayNodeScript(string(gcpSourceBytes), true),
+		"aws": brokerReplayNodeScript(awsBrokerCloudFormationTemplate(), false),
+	}
+	for name, script := range tests {
+		t.Run(name, func(t *testing.T) {
+			cmd := exec.Command("node", "-e", script)
+			out, err := cmd.CombinedOutput()
+			if err != nil {
+				t.Fatalf("replay test failed: %v\n%s", err, string(out))
+			}
+		})
+	}
+}
+
+func TestBrokerLocalMaterializerHarness(t *testing.T) {
+	if _, err := exec.LookPath("node"); err != nil {
+		t.Skip("node is required for broker JavaScript materializer tests")
+	}
+	gcpSourceBytes, err := brokerAssets.ReadFile("broker/gcp/index.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tests := map[string]string{
+		"gcp": brokerGCPMaterializerNodeScript(string(gcpSourceBytes)),
+		"aws": brokerAWSMaterializerNodeScript(awsBrokerCloudFormationTemplate()),
+	}
+	for name, script := range tests {
+		t.Run(name, func(t *testing.T) {
+			cmd := exec.Command("node", "-e", script)
+			out, err := cmd.CombinedOutput()
+			if err != nil {
+				t.Fatalf("materializer test failed: %v\n%s", err, string(out))
+			}
+		})
+	}
+}
+
+func brokerCapabilityPolicyNodeScript(source string) (string, error) {
+	var functions []string
+	for _, name := range []string{"cleanObjectPath", "isGitObjectDatabasePath", "validateCapabilityPath"} {
+		fn, err := extractJavaScriptFunction(source, name)
+		if err != nil {
+			return "", err
+		}
+		functions = append(functions, fn)
+	}
+	cases := []struct {
+		Operation string `json:"operation"`
+		Path      string `json:"path"`
+		Want      string `json:"want,omitempty"`
+		OK        bool   `json:"ok"`
+	}{
+		{Operation: "read", Path: "HEAD", Want: "HEAD", OK: true},
+		{Operation: "read", Path: "packed-refs", Want: "packed-refs", OK: true},
+		{Operation: "read", Path: "refs/heads/main", Want: "refs/heads/main", OK: true},
+		{Operation: "read", Path: "objects/aa/bb", Want: "objects/aa/bb", OK: true},
+		{Operation: "read", Path: "objects/pack/pack-demo.pack", Want: "objects/pack/pack-demo.pack", OK: true},
+		{Operation: "write", Path: "objects/aa/bb", Want: "objects/aa/bb", OK: true},
+		{Operation: "write", Path: "/objects/aa/bb", Want: "objects/aa/bb", OK: true},
+		{Operation: "write", Path: "refs/heads/main", OK: false},
+		{Operation: "write", Path: "HEAD", OK: false},
+		{Operation: "read", Path: "config", OK: false},
+		{Operation: "delete", Path: "objects/aa/bb", OK: false},
+		{Operation: "write", Path: "objects/../refs/heads/main", OK: false},
+		{Operation: "read", Path: "", OK: false},
+		{Operation: "read", Path: "objects//aa", OK: false},
+	}
+	data, err := json.Marshal(cases)
+	if err != nil {
+		return "", err
+	}
+	return strings.Join(functions, "\n") + `
+const cases = ` + string(data) + `;
+for (const tc of cases) {
+  let ok = true;
+  let got = "";
+  try {
+    got = validateCapabilityPath(tc.operation, tc.path);
+  } catch (err) {
+    ok = false;
+  }
+  if (ok !== tc.ok || (tc.ok && got !== tc.want)) {
+    console.error(JSON.stringify({case: tc, ok, got}));
+    process.exit(1);
+  }
+}
+`, nil
+}
+
+func brokerReplayNodeScript(source string, gcp bool) string {
+	fn, err := extractJavaScriptFunction(source, "consumeSignatureNonce")
+	if err != nil {
+		return "throw new Error(" + strconv.Quote(err.Error()) + ");"
+	}
+	if gcp {
+		return `
+const seen = new Map();
+const nonces = {doc(id) { return {id}; }};
+const db = {async runTransaction(fn) {
+  const tx = {
+    async get(ref) { return {exists: seen.has(ref.id), data() { return seen.get(ref.id); }}; },
+    set(ref, data) { seen.set(ref.id, data); },
+  };
+  await fn(tx);
+}};
+` + fn + `
+(async () => {
+  await consumeSignatureNonce("SHA256:test", "nonce", String(Math.floor(Date.now() / 1000)));
+  let replayed = false;
+  try {
+    await consumeSignatureNonce("SHA256:test", "nonce", String(Math.floor(Date.now() / 1000)));
+  } catch (err) {
+    replayed = /replay/.test(String(err.message || err));
+  }
+  if (!replayed) throw new Error("duplicate nonce was accepted");
+})();
+`
+	}
+	return `
+class PutItemCommand { constructor(input) { this.input = input; } }
+const seen = new Map();
+const db = {async send(cmd) {
+  const id = cmd.input.Item.id.S;
+  const exists = seen.has(id);
+  const now = Number(cmd.input.ExpressionAttributeValues[":now"].N);
+  const old = exists ? seen.get(id) : null;
+  if (exists && Number(old.expires_at.N) >= now) {
+    const err = new Error("conditional failed");
+    err.name = "ConditionalCheckFailedException";
+    throw err;
+  }
+  seen.set(id, cmd.input.Item);
+}};
+const table = "broker";
+` + fn + `
+(async () => {
+  await consumeSignatureNonce("SHA256:test", "nonce", String(Math.floor(Date.now() / 1000)));
+  let replayed = false;
+  try {
+    await consumeSignatureNonce("SHA256:test", "nonce", String(Math.floor(Date.now() / 1000)));
+  } catch (err) {
+    replayed = /replay/.test(String(err.message || err));
+  }
+  if (!replayed) throw new Error("duplicate nonce was accepted");
+})();
+`
+}
+
+func brokerGCPMaterializerNodeScript(source string) string {
+	trigger, err := extractJavaScriptFunction(source, "triggerCIRun")
+	if err != nil {
+		return "throw new Error(" + strconv.Quote(err.Error()) + ");"
+	}
+	rotate, err := extractJavaScriptFunction(source, "rotateCIMaterializerToken")
+	if err != nil {
+		return "throw new Error(" + strconv.Quote(err.Error()) + ");"
+	}
+	return `
+process.env.BGIT_CI_MATERIALIZER_URL = "https://materializer.example/run";
+process.env.BGIT_CI_MATERIALIZER_SECRET = "projects/p/secrets/s";
+const brokerVersion = "test";
+let currentSecret = "old-token";
+let idTokenRequest = null;
+const auth = {async getIdTokenClient(url) {
+  idTokenRequest = url;
+  return {async request(req) {
+    globalThis.materializerRequest = req;
+    return {data: {status: "queued", url: "https://build.example/1", message: "ok"}};
+  }};
+}};
+async function ciMaterializerToken() { return currentSecret; }
+function randomCIToken() { return "new-token"; }
+async function secretManagerRequest(path, opts = {}) {
+  globalThis.secretRequest = {path, opts};
+  currentSecret = Buffer.from(opts.body.payload.data, "base64").toString("utf8");
+  return {ok: true};
+}
+` + trigger + "\n" + rotate + `
+(async () => {
+  const entry = {data: {repo: {provider: "gcs", bucket: "bucket", prefix: "repo.git"}}};
+  const run = {id: 1, provider: "gcp", ref: "refs/heads/main", commit: "abc", config: "cloudbuild.yaml"};
+  await triggerCIRun(entry, run);
+  if (idTokenRequest !== process.env.BGIT_CI_MATERIALIZER_URL) throw new Error("ID-token client was not created for materializer URL");
+  if (globalThis.materializerRequest.headers["x-bgit-ci-token"] !== "old-token") throw new Error("materializer token header missing");
+  if (run.url !== "https://build.example/1") throw new Error("materializer response was not applied");
+  await rotateCIMaterializerToken();
+  if (currentSecret !== "new-token") throw new Error("rotation did not update secret");
+})();
+`
+}
+
+func brokerAWSMaterializerNodeScript(source string) string {
+	trigger, err := extractJavaScriptFunction(source, "triggerCIRun")
+	if err != nil {
+		return "throw new Error(" + strconv.Quote(err.Error()) + ");"
+	}
+	rotate, err := extractJavaScriptFunction(source, "rotateCIMaterializerToken")
+	if err != nil {
+		return "throw new Error(" + strconv.Quote(err.Error()) + ");"
+	}
+	return `
+class InvokeCommand { constructor(input) { this.input = input; } }
+class GetSecretValueCommand { constructor(input) { this.input = input; } }
+class PutSecretValueCommand { constructor(input) { this.input = input; } }
+const brokerVersion = "test";
+const ciMaterializerFunctionName = "bgit-ci-materializer";
+const ciMaterializerSecretArn = "arn:secret";
+let secret = "old-token";
+const secrets = {async send(cmd) {
+  if (cmd instanceof GetSecretValueCommand) return {SecretString: secret};
+  if (cmd instanceof PutSecretValueCommand) { secret = cmd.input.SecretString; return {}; }
+  throw new Error("unexpected secrets command");
+}};
+const lambda = {async send(cmd) {
+  globalThis.invokeInput = cmd.input;
+  const payload = JSON.parse(Buffer.from(cmd.input.Payload).toString("utf8"));
+  globalThis.materializerPayload = payload;
+  return {Payload: Buffer.from(JSON.stringify({status: "queued", url: "https://build.example/1", message: "ok"}))};
+}};
+function randomCIToken() { return "new-token"; }
+` + extractMust(source, "ciMaterializerToken") + "\n" + trigger + "\n" + rotate + `
+(async () => {
+  const entry = {data: {repo: {provider: "s3", bucket: "bucket", prefix: "repo.git"}}};
+  const run = {id: 1, provider: "aws", ref: "refs/heads/main", commit: "abc", config: "buildspec.yml"};
+  await triggerCIRun(entry, run);
+  if (globalThis.invokeInput.FunctionName !== ciMaterializerFunctionName) throw new Error("Lambda function name was not used");
+  if (globalThis.materializerPayload.headers["x-bgit-ci-token"] !== "old-token") throw new Error("materializer token header missing");
+  if (run.url !== "https://build.example/1") throw new Error("materializer response was not applied");
+  await rotateCIMaterializerToken();
+  if (secret !== "new-token") throw new Error("rotation did not update secret");
+})();
+`
+}
+
+func extractMust(source, name string) string {
+	fn, err := extractJavaScriptFunction(source, name)
+	if err != nil {
+		return "throw new Error(" + strconv.Quote(err.Error()) + ");"
+	}
+	return fn
+}
+
+func extractJavaScriptFunction(source, name string) (string, error) {
+	start := strings.Index(source, "function "+name+"(")
+	if asyncStart := strings.Index(source, "async function "+name+"("); asyncStart >= 0 && (start < 0 || asyncStart < start) {
+		start = asyncStart
+	}
+	if start < 0 {
+		return "", fmt.Errorf("missing JavaScript function %s", name)
+	}
+	open := strings.Index(source[start:], "{")
+	if open < 0 {
+		return "", fmt.Errorf("missing function body for %s", name)
+	}
+	open += start
+	depth := 0
+	inString := byte(0)
+	escape := false
+	for i := open; i < len(source); i++ {
+		ch := source[i]
+		if inString != 0 {
+			if escape {
+				escape = false
+				continue
+			}
+			if ch == '\\' {
+				escape = true
+				continue
+			}
+			if ch == inString {
+				inString = 0
+			}
+			continue
+		}
+		switch ch {
+		case '\'', '"', '`':
+			inString = ch
+		case '{':
+			depth++
+		case '}':
+			depth--
+			if depth == 0 {
+				return source[start : i+1], nil
+			}
+		}
+	}
+	return "", fmt.Errorf("unterminated JavaScript function %s", name)
 }
 
 func TestBrokerSignatureMessageIsStable(t *testing.T) {
-	a := brokerSignatureMessage([]byte(`{"repo":"demo"}`))
-	b := brokerSignatureMessage([]byte(`{"repo":"demo"}`))
-	c := brokerSignatureMessage([]byte(`{"repo":"other"}`))
+	a := brokerSignatureMessage(http.MethodPost, "/repos/mine", "broker.example.com", "1770000000", "nonce", []byte(`{"repo":"demo"}`))
+	b := brokerSignatureMessage(http.MethodPost, "/repos/mine", "broker.example.com", "1770000000", "nonce", []byte(`{"repo":"demo"}`))
+	c := brokerSignatureMessage(http.MethodPost, "/repos/mine", "broker.example.com", "1770000000", "nonce", []byte(`{"repo":"other"}`))
 	if !bytes.Equal(a, b) {
 		t.Fatalf("signature message is not stable")
 	}
 	if bytes.Equal(a, c) {
 		t.Fatalf("signature message should depend on payload")
 	}
-	if !strings.HasPrefix(string(a), "bgit-broker-v1\n") {
+	if !strings.HasPrefix(string(a), "bgit-broker-v2\nPOST\n/repos/mine\nbroker.example.com\n1770000000\nnonce\n") {
 		t.Fatalf("signature message = %q", string(a))
 	}
 }
@@ -1333,6 +1749,17 @@ func TestBrokerForbiddenAllowsSignatureRetryOnlyForAuthFailures(t *testing.T) {
 		if brokerForbiddenAllowsSignatureRetry(msg) {
 			t.Fatalf("did not expect auth retry for %q", msg)
 		}
+	}
+}
+
+func TestBrokerHTTPErrorHintsAtIncompatibleBrokerOnSignatureFailure(t *testing.T) {
+	err := brokerHTTPError("/auth/status", `{"error":"SSH signature required"}`)
+	if err == nil || !strings.Contains(err.Error(), "incompatible with this bgit version") || !strings.Contains(err.Error(), "bgit admin broker upgrade") {
+		t.Fatalf("error = %v", err)
+	}
+	err = brokerHTTPError("/refs/update", `{"error":"stale ref"}`)
+	if strings.Contains(err.Error(), "incompatible with this bgit version") {
+		t.Fatalf("unexpected compatibility hint: %v", err)
 	}
 }
 
@@ -2853,6 +3280,74 @@ func TestNativeGitRepoPushWritesObjectsAndRefsWithoutBareSync(t *testing.T) {
 	}
 }
 
+func TestNativeGitRepoBrokerPushDoesNotWriteRefThroughObjectStore(t *testing.T) {
+	root := t.TempDir()
+	remoteRoot := filepath.Join(root, "remote.git")
+	worktree := filepath.Join(root, "worktree")
+	if err := os.MkdirAll(remoteRoot, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runGit("", "init", "--initial-branch", "main", worktree); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runGit(worktree, "config", "user.name", "Ada"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runGit(worktree, "config", "user.email", "ada@example.com"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(worktree, "README.md"), []byte("# Demo\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runGit(worktree, "add", "README.md"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runGit(worktree, "commit", "-m", "Initial commit"); err != nil {
+		t.Fatal(err)
+	}
+
+	var gotUpdate brokerRefUpdateRequest
+	updateCalls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/refs/update" {
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+		updateCalls++
+		if err := json.NewDecoder(r.Body).Decode(&gotUpdate); err != nil {
+			t.Fatal(err)
+		}
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer server.Close()
+	if _, err := runGit(worktree, "config", "bucketgit.broker", server.URL); err != nil {
+		t.Fatal(err)
+	}
+
+	oldDir, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(oldDir)
+	if err := os.Chdir(worktree); err != nil {
+		t.Fatal(err)
+	}
+
+	repo := newNativeGitRepoForStore(config{branch: "main", origin: "gs://bucket/repo.git"}, &localGitStore{root: remoteRoot})
+	var stdout bytes.Buffer
+	if err := repo.push(context.Background(), nil, &stdout); err != nil {
+		t.Fatal(err)
+	}
+	if updateCalls != 1 {
+		t.Fatalf("updateCalls = %d, want 1", updateCalls)
+	}
+	if gotUpdate.Ref != "refs/heads/main" || gotUpdate.Old != zeroObjectID() || !isHexHash(gotUpdate.New) {
+		t.Fatalf("broker update = %#v", gotUpdate)
+	}
+	if _, err := os.Stat(filepath.Join(remoteRoot, "refs", "heads", "main")); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("broker-backed push wrote ref through object store, stat err = %v", err)
+	}
+}
+
 func TestNativeGitRepoPushTagsDoesNotMoveConfiguredBranch(t *testing.T) {
 	root := t.TempDir()
 	remoteRoot := filepath.Join(root, "remote.git")
@@ -3427,6 +3922,36 @@ func TestWebHandlerCanRenderSeedThenRemote(t *testing.T) {
 	handler.ServeHTTP(rec, req)
 	if !strings.Contains(rec.Body.String(), `"subject":"Remote commit"`) {
 		t.Fatalf("api body = %s", rec.Body.String())
+	}
+}
+
+func TestWebMutationCSRFAndOriginValidation(t *testing.T) {
+	handler := &webServer{csrfToken: "token"}
+	req := httptest.NewRequest(http.MethodPost, "/api/actions/settings", strings.NewReader(`{}`))
+	if err := handler.validateWebMutation(req); err == nil {
+		t.Fatalf("missing CSRF token should fail")
+	}
+	req = httptest.NewRequest(http.MethodPost, "/api/actions/settings", strings.NewReader(`{}`))
+	req.Header.Set("X-Bgit-CSRF", "wrong")
+	if err := handler.validateWebMutation(req); err == nil {
+		t.Fatalf("wrong CSRF token should fail")
+	}
+	req = httptest.NewRequest(http.MethodPost, "/api/actions/settings", strings.NewReader(`{}`))
+	req.Header.Set("X-Bgit-CSRF", "token")
+	req.Header.Set("Origin", "https://evil.example")
+	if err := handler.validateWebMutation(req); err == nil {
+		t.Fatalf("foreign origin should fail")
+	}
+	req = httptest.NewRequest(http.MethodPost, "/api/actions/settings", strings.NewReader(`{}`))
+	req.Header.Set("X-Bgit-CSRF", "token")
+	req.Header.Set("Origin", "http://localhost:8080")
+	if err := handler.validateWebMutation(req); err != nil {
+		t.Fatalf("local origin should pass: %v", err)
+	}
+	req = httptest.NewRequest(http.MethodPost, "/api/actions/settings", strings.NewReader(`{}`))
+	req.Header.Set("X-Bgit-CSRF", "token")
+	if err := handler.validateWebMutation(req); err != nil {
+		t.Fatalf("absent origin with valid CSRF should pass: %v", err)
 	}
 }
 

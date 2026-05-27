@@ -790,6 +790,74 @@ func TestBrokerInitInteractiveIdentityOnlyUpdatesRepoConfig(t *testing.T) {
 	}
 }
 
+func TestBrokerInitInteractiveSelectsTeamThenRepository(t *testing.T) {
+	root := t.TempDir()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/teams/list":
+			_, _ = w.Write([]byte(`{"teams":[{"id":"t_core","name":"core","members":[{"user_id":"u_owner","username":"owner","role":"admin"}]}]}`))
+		case "/repos/list":
+			_, _ = w.Write([]byte(`{"repos":[
+				{"repo":{"provider":"gcs","logical":"app.git","team_id":"t_core"},"logical":"app.git","teams":[{"id":"t_core","role":"developer"}]},
+				{"repo":{"provider":"gcs","logical":"other.git","team_id":"t_other"},"logical":"other.git","teams":[{"id":"t_other","role":"developer"}]}
+			]}`))
+		case "/repos/get":
+			var req brokerRepoAdminRequest
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Fatal(err)
+			}
+			if req.Repo.Logical != "app.git" || req.Repo.TeamID != coreTeamID {
+				t.Fatalf("repo get = %#v", req.Repo)
+			}
+			_, _ = w.Write([]byte(`{"ok":true}`))
+		default:
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+	configPath := filepath.Join(root, ".bgit", "config")
+	if err := writeGlobalConfig(configPath, globalConfig{
+		Version: globalConfigVersion,
+		GCPProfiles: []globalGCPProfile{{
+			Name: "work",
+			Regions: []globalProfileRegion{{
+				Name:      "europe-west1",
+				BrokerURL: server.URL,
+			}},
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(root, "worktree")
+	if err := os.MkdirAll(target, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	oldDir, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(oldDir)
+	if err := os.Chdir(target); err != nil {
+		t.Fatal(err)
+	}
+	var stdout bytes.Buffer
+	err = brokerInitCommand([]string{"--config", configPath}, strings.NewReader("\n\x1b[B\n"), &stdout)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := readLocalConfig(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.logicalRepo != "app.git" || cfg.teamID != coreTeamID || cfg.brokerURL != server.URL {
+		t.Fatalf("cfg = %#v", cfg)
+	}
+	rendered := stdout.String()
+	if !strings.Contains(rendered, "Select team") || !strings.Contains(rendered, "-- SELECT REPOSITORY --") || !strings.Contains(rendered, "app") || strings.Contains(rendered, "other") {
+		t.Fatalf("stdout = %q", rendered)
+	}
+}
+
 func TestInitDialogRendersRepoInputAndProfiles(t *testing.T) {
 	rendered := renderInitDialogWithStyle(initDialogState{
 		repoName: "app.git",

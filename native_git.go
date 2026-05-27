@@ -331,6 +331,14 @@ func (r *nativeGitRepo) fetchIntoWorktree(ctx context.Context, worktree string, 
 	if err := r.copyRemoteObjectsToLocal(ctx, gitDir); err != nil {
 		return err
 	}
+	return r.fetchRefsIntoWorktree(ctx, worktree, tags, stdout)
+}
+
+func (r *nativeGitRepo) fetchRefsIntoWorktree(ctx context.Context, worktree string, tags bool, stdout io.Writer) error {
+	gitDir, err := localGitDir(worktree)
+	if err != nil {
+		return err
+	}
 	refs, err := r.refs(ctx)
 	if err != nil {
 		return err
@@ -494,6 +502,7 @@ func (r *nativeGitRepo) pushWorktree(ctx context.Context, worktree string, opts 
 			if err := brokerUpdateRefWithOverride(brokerURL, r.cfg, ref, oldHash, newHash, opts.force); err != nil {
 				return brokerPushError(err)
 			}
+			return nil
 		}
 		if newHash == zeroObjectID() {
 			return store.delete(ctx, ref)

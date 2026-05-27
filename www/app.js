@@ -370,6 +370,12 @@ document.addEventListener('submit', function (event) {
     handleBoardForm(boardForm);
     return;
   }
+  const ciForm = event.target.closest('[data-ci-form]');
+  if (ciForm) {
+    event.preventDefault();
+    handleCIForm(ciForm);
+    return;
+  }
   const prCreateForm = event.target.closest('[data-pr-create-form]');
   if (prCreateForm) {
     event.preventDefault();
@@ -410,6 +416,7 @@ document.addEventListener('DOMContentLoaded', function () {
   refreshWhoamiState();
   hydrateRefs();
   refreshSettingsSections();
+  refreshCIRuns();
   refreshRemoteState({refreshPullRequests: false});
   window.setInterval(function () { refreshRemoteState({refreshPullRequests: true}); }, 30000);
 });
@@ -951,9 +958,10 @@ async function fetchJSON(path) {
 }
 
 async function postJSON(path, body) {
+  const csrf = document.querySelector('meta[name="bgit-csrf-token"]')?.getAttribute('content') || '';
   const response = await fetch(path, {
     method: 'POST',
-    headers: {'accept': 'application/json', 'content-type': 'application/json'},
+    headers: {'accept': 'application/json', 'content-type': 'application/json', 'x-bgit-csrf': csrf},
     body: JSON.stringify(body || {})
   });
   if (!response.ok) throw new Error(await response.text());
@@ -1044,6 +1052,7 @@ async function handleSettingsAction(button) {
     return;
   }
   const member = button.closest('[data-member-key]');
+  const repoUser = button.closest('[data-repo-user]');
   const protection = button.closest('[data-protection-ref]');
   const payload = {action};
   let subject = '';
@@ -1065,6 +1074,19 @@ async function handleSettingsAction(button) {
     } else if (action === 'unsuspend-member') {
       title = 'Unsuspend member?';
       body = 'Restore access for ' + subject + ' on this repository.';
+    }
+  }
+  if (repoUser) {
+    payload.user = repoUser.getAttribute('data-repo-user') || '';
+    payload.user_id = repoUser.getAttribute('data-repo-user-id') || '';
+    subject = repoUser.querySelector('strong')?.textContent || payload.user || 'user';
+    if (!payload.user && !payload.user_id) {
+      setSyncStatus('Repository user is missing from the selected row.', 'is-stale');
+      return;
+    }
+    if (action === 'remove-repo-user') {
+      title = 'Remove repository user?';
+      body = 'Remove ' + subject + ' from this repository.';
     }
   }
   if (protection) {
@@ -1155,6 +1177,71 @@ async function handleBoardForm(form) {
     window.location.reload();
   } catch (err) {
     setSyncStatus(compactError(err), 'is-stale');
+  }
+}
+
+async function handleCIForm(form) {
+  if (!hasCapability(form.getAttribute('data-capability') || '')) {
+    setSyncStatus('Your current broker role does not allow this action.', 'is-stale');
+    return;
+  }
+  const payload = formDataObject(form);
+  payload.action = 'run';
+  const submit = form.querySelector('button[type="submit"]');
+  if (submit) submit.disabled = true;
+  try {
+    await postJSON('/api/actions/ci', payload);
+    window.location.reload();
+  } catch (err) {
+    setSyncStatus(err.message || String(err), 'is-stale');
+  } finally {
+    if (submit) submit.disabled = false;
+  }
+}
+
+function ciStatusTerminal(status) {
+  return ['passed', 'failed', 'cancelled', 'timed_out'].includes(String(status || '').toLowerCase());
+}
+
+function ciRunRow(run) {
+  const status = run.status || 'queued';
+  const ref = String(run.ref || '').replace(/^refs\/heads\//, '');
+  const commit = String(run.commit || '').slice(0, 12);
+  const provider = String(run.provider || 'ci').toUpperCase();
+  const message = run.message ? '<small>' + escapeHTML(run.message) + '</small>' : '';
+  const open = run.url ? '<a class="button-link" href="' + escapeHTML(run.url) + '" target="_blank" rel="noreferrer">Open</a>' : '';
+  return '<div class="ci-run-row" data-ci-run-id="' + Number(run.id || 0) + '" data-ci-status="' + escapeHTML(status) + '"><div><strong>#' + Number(run.id || 0) + ' ' + escapeHTML(status) + '</strong><span>' + escapeHTML(provider + ' · ' + ref + ' · ' + commit + ' · ' + (run.config || '')) + '</span>' + message + '<pre class="ci-run-log" data-ci-log hidden></pre></div>' + open + '</div>';
+}
+
+async function refreshCIRuns() {
+  const list = document.querySelector('[data-ci-runs]');
+  if (!list) return;
+  try {
+    const data = await postJSON('/api/actions/ci', {action: 'list'});
+    if (Array.isArray(data.runs)) {
+      list.innerHTML = data.runs.map(ciRunRow).join('');
+      streamVisibleCILogs();
+      if (data.runs.some((run) => !ciStatusTerminal(run.status || 'queued'))) {
+        window.setTimeout(refreshCIRuns, 3000);
+      }
+    }
+  } catch (_) {}
+}
+
+async function streamVisibleCILogs() {
+  for (const row of document.querySelectorAll('[data-ci-run-id]')) {
+    const id = Number(row.getAttribute('data-ci-run-id') || 0);
+    if (!id) continue;
+    try {
+      const data = await postJSON('/api/actions/ci', {action: 'logs', id});
+      const log = row.querySelector('[data-ci-log]');
+      if (log && data.logs) {
+        log.hidden = false;
+        log.textContent = data.logs;
+        log.scrollTop = log.scrollHeight;
+      }
+      if (data.run && data.run.status) row.setAttribute('data-ci-status', data.run.status);
+    } catch (_) {}
   }
 }
 
@@ -1353,6 +1440,7 @@ function settingsSuccessMessage(action, payload, form) {
   if (action === 'suspend-member') return 'Suspended ' + subject + '.';
   if (action === 'unsuspend-member') return 'Unsuspended ' + subject + '.';
   if (action === 'remove-member') return 'Removed ' + subject + '.';
+  if (action === 'remove-repo-user') return 'Removed ' + subject + '.';
   if (action === 'protect-upsert') return 'Protected ' + subject + '.';
   if (action === 'protect-remove') return 'Removed protection for ' + subject + '.';
   return 'Settings updated.';

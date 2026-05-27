@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	_ "embed"
 	"errors"
 	"flag"
 	"fmt"
@@ -21,9 +22,25 @@ import (
 
 const defaultBranch = "main"
 const defaultAuthMode = "gcloud"
-const brokerVersion = "1.1.0"
 
-var version = "dev"
+//go:embed CHANGELOG.md
+var embeddedChangelog string
+
+var version = ""
+
+func appVersion() string {
+	if strings.TrimSpace(version) != "" {
+		return strings.TrimSpace(version)
+	}
+	if changelogVersion := firstChangelogVersion(embeddedChangelog); changelogVersion != "" {
+		return changelogVersion + "-dev"
+	}
+	return "0.0.0-dev"
+}
+
+func brokerVersion() string {
+	return appVersion()
+}
 
 type config struct {
 	provider                    string
@@ -60,7 +77,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 		if cfg.versionRequested {
 			return versionCommand(stdout)
 		}
-		return usage(stderr)
+		return usageWithBanner(stderr)
 	}
 	setBrokerIdentityPreference(cfg.identity)
 	if cfg.versionRequested {
@@ -146,6 +163,13 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 			setBrokerIdentityPreference(cfg.identity)
 		}
 		return prCommand(cmdArgs, stdin, stdout)
+	}
+	if cmd == "ci" {
+		if localCfg, err := readLocalConfig("."); err == nil {
+			cfg = mergeConfig(cfg, localCfg)
+			setBrokerIdentityPreference(cfg.identity)
+		}
+		return ciCommand(cmdArgs, stdin, stdout)
 	}
 	if cmd == "board" || cmd == "kanban" {
 		if localCfg, err := readLocalConfig("."); err == nil {
@@ -879,14 +903,15 @@ func gcloudCommand(configuration string, args ...string) *exec.Cmd {
 }
 
 func usage(w io.Writer) error {
-	_, err := fmt.Fprint(w, `usage: bgit <command> [args]
-
-These are common BucketGit commands:
+	_, err := fmt.Fprint(w, `usage: bgit <command> [args]. These are common BucketGit commands:
 
 start a repository
    setup      Connect a cloud account and deploy or update BucketGit
    init       Create a local Git repository backed by BucketGit
    clone      Clone a BucketGit repository into a new directory
+
+local web UI
+   web        Browse and manage a repository locally
 
 work on the current change
    add        Add file contents to the index
@@ -915,6 +940,7 @@ collaborate
    push       Update remote refs and upload objects
    ls-remote  List remote refs
    pr         Create, review, merge, and close pull requests
+   ci         Run and inspect broker CI builds
    board      Manage the repository task board
    issue      Create, comment on, close, and reopen issues
 
@@ -924,17 +950,28 @@ administer
    admin      Manage broker-backed users, keys, owners, and protection
    janitor    Run broker maintenance and repair tasks
    broker     Delete or decommission deployed broker infrastructure
-   web        Browse a repository locally
+   direct     Run direct bucket recovery and administration commands
 
-global options:
-  --profile NAME
-  --identity KEY_OR_FINGERPRINT
-  --version
-
-Legacy direct bucket operations are under "bgit direct".
 Run "bgit help <command>" or "bgit direct help" for details.
 `)
 	return err
+}
+
+func usageWithBanner(w io.Writer) error {
+	if _, err := fmt.Fprintf(w,
+		"         _____________________________________________________________\n"+
+			"        | ▄▄▄▄▄▄▄                                   ▄▄▄▄▄▄▄           |\n"+
+			"        | ███▀▀███▄             ▄▄            ██   ███▀▀▀▀▀  ▀▀  ██   |\n"+
+			"________| ███▄▄███▀ ██ ██ ▄████ ██ ▄█▀ ▄█▀█▄ ▀██▀▀ ███       ██ ▀██▀▀ |________\n"+
+			"\\       | ███  ███▄ ██ ██ ██    ████   ██▄█▀  ██   ███  ███▀ ██  ██   |       /\n"+
+			" \\      | ████████▀ ▀██▀█ ▀████ ██ ▀█▄ ▀█▄▄▄  ██   ▀██████▀  ██▄ ██   |      /\n"+
+			" /      |_____________________________________________________________|      \\\n"+
+			"/________)   [ bucketgit.com / github.com/bucketgit / bgit %s ]   (________\\\n"+
+			"\n",
+		bannerVersion()); err != nil {
+		return err
+	}
+	return usage(w)
 }
 
 func helpCommand(args []string, stdout io.Writer) error {
@@ -956,8 +993,48 @@ func commandWantsVersion(args []string) bool {
 }
 
 func versionCommand(stdout io.Writer) error {
-	_, err := fmt.Fprintf(stdout, "bgit %s\n", version)
+	_, err := fmt.Fprintf(stdout, "bgit %s\n", appVersion())
 	return err
+}
+
+func bannerVersion() string {
+	return strings.TrimSuffix(appVersion(), "-dev")
+}
+
+func firstChangelogVersion(changelog string) string {
+	for _, line := range strings.Split(changelog, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "## ") {
+			continue
+		}
+		field := strings.Fields(strings.TrimSpace(strings.TrimPrefix(line, "## ")))
+		if len(field) == 0 {
+			continue
+		}
+		candidate := strings.TrimPrefix(field[0], "v")
+		if isSemanticVersion(candidate) {
+			return candidate
+		}
+	}
+	return ""
+}
+
+func isSemanticVersion(value string) bool {
+	parts := strings.Split(value, ".")
+	if len(parts) != 3 {
+		return false
+	}
+	for _, part := range parts {
+		if part == "" {
+			return false
+		}
+		for _, ch := range part {
+			if ch < '0' || ch > '9' {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 func commandHelp(cmd string, stdout io.Writer) error {
@@ -1059,6 +1136,7 @@ Configure a direct bucketgit origin using Git remote syntax.
 		"admin": `usage:
   bgit admin keys list|add|remove|suspend|import-github [args]
   bgit admin broker upgrade
+  bgit admin broker owner-bootstrap reset
   bgit admin broker-users list|upsert USER [--role admin|user] [--key PATH_OR_PUBLIC_KEY]|delete USER
   bgit admin teams list|create NAME|delete TEAM|member add TEAM USER [--role ROLE]|member remove TEAM USER
   bgit admin teams repo list|repo add TEAM ROLE|repo remove TEAM
@@ -1083,6 +1161,7 @@ administration moved to bgit direct admin.
 
 examples:
   bgit admin broker upgrade
+  bgit admin broker owner-bootstrap reset
   bgit admin keys list
   bgit admin keys add --user ada --role developer --key ~/.ssh/ada.pub
   bgit admin keys import-github octocat --role read
@@ -1097,6 +1176,7 @@ examples:
   bgit admin repo create --team platform app
   bgit admin invite-user --broker https://broker.example.com --user ada --role developer app
   bgit admin protect add main
+  bgit admin ci rotate-secret
   bgit admin repo visibility public
   bgit direct admin grant-read user:dev@example.com
 `,
@@ -1121,6 +1201,17 @@ creation; private repositories require membership.
 Broker-backed repository task board. The board is available immediately for
 broker-backed repositories and stores stories in repository metadata. Viewers
 can read the board; developers and higher can create, take, move, and comment.
+`,
+		"ci": `usage:
+  bgit ci list
+  bgit ci run [--ref REF] [--config FILE] [--provider gcp|aws]
+  bgit ci view ID
+  bgit ci logs ID
+  bgit ci watch ID
+
+Broker-backed CI records and provider build handoff. CI runs are requested for
+a broker ref and commit; the broker verifies repository state before queuing the
+trusted provider/materializer path.
 `,
 		"pr": `usage:
   bgit pr create [--title TITLE] [--body BODY] [--source BRANCH] [--target BRANCH]

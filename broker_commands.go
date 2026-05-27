@@ -35,7 +35,7 @@ func brokerAdminCommand(cfg config, args []string, stdout io.Writer) error {
 
 func brokerAdminCommandWithInput(cfg config, args []string, stdin io.Reader, stdout io.Writer) error {
 	if len(args) == 0 {
-		return errors.New("usage: bgit admin keys|broker|broker-users|teams|repo create|repo|owner|protect|members|confirm-ownership-transfer|accept-ownership-transfer|cancel-ownership-transfer|invite-user|accept-invite|cancel-invite|invite-broker-user|accept-broker-invite|cancel-broker-invite [args]\n\nCloud IAM administration moved to bgit direct admin.")
+		return errors.New("usage: bgit admin keys|broker|broker-users|teams|repo create|repo|owner|protect|ci|members|confirm-ownership-transfer|accept-ownership-transfer|cancel-ownership-transfer|invite-user|accept-invite|cancel-invite|invite-broker-user|accept-broker-invite|cancel-broker-invite [args]\n\nCloud IAM administration moved to bgit direct admin.")
 	}
 	switch args[0] {
 	case "broker":
@@ -52,6 +52,8 @@ func brokerAdminCommandWithInput(cfg config, args []string, stdin io.Reader, std
 		return brokerOwnerCommand(cfg, args[1:], stdout)
 	case "protect":
 		return brokerProtectionCommand(cfg, args[1:], stdout)
+	case "ci":
+		return brokerAdminCICommand(cfg, args[1:], stdout)
 	case "members":
 		return brokerMembersCommand(cfg, args[1:], stdout)
 	case "confirm-ownership-transfer", "accept-ownership-transfer", "cancel-ownership-transfer":
@@ -78,14 +80,53 @@ func brokerAdminCommandWithInput(cfg config, args []string, stdin io.Reader, std
 func brokerAdminBrokerCommand(cfg config, args []string, stdin io.Reader, stdout io.Writer) error {
 	_ = stdin
 	if len(args) == 0 {
-		return errors.New("usage: bgit admin broker upgrade [--config PATH]")
+		return errors.New("usage: bgit admin broker upgrade [--config PATH] | owner-bootstrap reset [--config PATH]")
 	}
 	switch args[0] {
 	case "upgrade":
 		return brokerAdminBrokerUpgradeCommand(cfg, args[1:], stdin, stdout)
+	case "owner-bootstrap":
+		return brokerAdminBrokerOwnerBootstrapCommand(cfg, args[1:], stdout)
 	default:
 		return fmt.Errorf("unknown admin broker command %q", args[0])
 	}
+}
+
+func brokerAdminBrokerOwnerBootstrapCommand(cfg config, args []string, stdout io.Writer) error {
+	if len(args) == 0 || args[0] != "reset" {
+		return errors.New("usage: bgit admin broker owner-bootstrap reset [--config PATH]")
+	}
+	configPath := ""
+	for i := 1; i < len(args); i++ {
+		arg := args[i]
+		name, value, hasValue := strings.Cut(arg, "=")
+		switch name {
+		case "--config":
+			var err error
+			value, i, err = optionValue(args, i, hasValue, value, name)
+			if err != nil {
+				return err
+			}
+			configPath = expandHome(value)
+		default:
+			return fmt.Errorf("unsupported owner-bootstrap reset option %s", arg)
+		}
+	}
+	global, path, err := loadGlobalConfigForInit(configPath)
+	if err != nil {
+		return err
+	}
+	target, err := brokerUpgradeTargetForCurrentRepo(cfg, global)
+	if err != nil {
+		return err
+	}
+	provisioned, err := brokerProvisionResolvedTarget(path, target, &global, stdout)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(stdout, "reset owner bootstrap token for broker %s\n", provisioned.URL)
+	fmt.Fprintf(stdout, "bootstrap token: %s\n", provisioned.BootstrapToken)
+	return nil
 }
 
 func brokerAdminBrokerUpgradeCommand(cfg config, args []string, stdin io.Reader, stdout io.Writer) error {
@@ -115,22 +156,23 @@ func brokerAdminBrokerUpgradeCommand(cfg config, args []string, stdin io.Reader,
 		return err
 	}
 	fmt.Fprintf(stdout, "Upgrading broker %s for %s:%s/%s\n", target.BrokerURL, setupProviderLabel(target.Provider), target.Name, target.Region)
-	return brokerUpgradeResolvedTarget(path, target, &global, stdout)
+	_, err = brokerProvisionResolvedTarget(path, target, &global, stdout)
+	return err
 }
 
-func brokerUpgradeResolvedTarget(path string, target brokerProfile, global *globalConfig, stdout io.Writer) error {
+func brokerProvisionResolvedTarget(path string, target brokerProfile, global *globalConfig, stdout io.Writer) (provisionedBroker, error) {
 	cfg := config{
 		provider:                    target.Provider,
 		gcloudConfiguration:         target.Name,
 		gcloudConfigurationExplicit: target.Name != "",
 		region:                      target.Region,
 	}
-	brokerURL, err := provisionBrokerURL(cfg, sshSetupOptions{region: target.Region}, stdout)
+	provisioned, err := provisionBroker(cfg, sshSetupOptions{region: target.Region}, stdout)
 	if err != nil {
-		return err
+		return provisionedBroker{}, err
 	}
-	if err := brokerEnsureCoreTeam(brokerURL); err != nil {
-		return err
+	if err := brokerEnsureCoreTeam(provisioned.URL); err != nil {
+		return provisionedBroker{}, err
 	}
 	now := time.Now().UTC().Format(time.RFC3339)
 	switch target.Provider {
@@ -147,8 +189,8 @@ func brokerUpgradeResolvedTarget(path string, target brokerProfile, global *glob
 			ServiceAccount: serviceAccount,
 			Regions: []globalProfileRegion{{
 				Name:          target.Region,
-				BrokerURL:     brokerURL,
-				BrokerVersion: brokerVersion,
+				BrokerURL:     provisioned.URL,
+				BrokerVersion: brokerVersion(),
 				LastSetupAt:   now,
 			}},
 		})
@@ -160,19 +202,19 @@ func brokerUpgradeResolvedTarget(path string, target brokerProfile, global *glob
 			ARN:       existing.ARN,
 			Regions: []globalProfileRegion{{
 				Name:          target.Region,
-				BrokerURL:     brokerURL,
-				BrokerVersion: brokerVersion,
+				BrokerURL:     provisioned.URL,
+				BrokerVersion: brokerVersion(),
 				LastSetupAt:   now,
 			}},
 		})
 	default:
-		return fmt.Errorf("unsupported broker provider %q", target.Provider)
+		return provisionedBroker{}, fmt.Errorf("unsupported broker provider %q", target.Provider)
 	}
 	if err := writeGlobalConfig(path, *global); err != nil {
-		return err
+		return provisionedBroker{}, err
 	}
-	fmt.Fprintf(stdout, "upgraded broker %s\n", brokerURL)
-	return nil
+	fmt.Fprintf(stdout, "upgraded broker %s\n", provisioned.URL)
+	return provisioned, nil
 }
 
 func findGlobalGCPProfile(cfg globalConfig, name string) globalGCPProfile {
@@ -264,6 +306,17 @@ type brokerAdminRepoInfoResponse struct {
 
 type brokerRepoTeamsResponse struct {
 	Teams []brokerRepoTeamGrant `json:"teams"`
+}
+
+type brokerRepoUsersResponse struct {
+	Users []brokerRepoUserGrant `json:"users"`
+}
+
+type brokerRepoUserGrant struct {
+	UserID   string `json:"user_id,omitempty"`
+	User     string `json:"user,omitempty"`
+	Username string `json:"username,omitempty"`
+	Role     string `json:"role,omitempty"`
 }
 
 type brokerUsersResponse struct {
@@ -771,6 +824,14 @@ func brokerInitCommand(args []string, stdin io.Reader, stdout io.Writer) error {
 	if !opts.noninteractive {
 		opts.interactive = true
 	}
+	var interactiveReader *bufio.Reader
+	if opts.interactive {
+		if reader, ok := stdin.(*bufio.Reader); ok {
+			interactiveReader = reader
+		} else {
+			interactiveReader = bufio.NewReader(stdin)
+		}
+	}
 	if opts.noninteractive {
 		if strings.TrimSpace(opts.profile) == "" {
 			return errors.New("init --noninteractive requires --profile PROFILE")
@@ -789,7 +850,7 @@ func brokerInitCommand(args []string, stdin io.Reader, stdout io.Writer) error {
 	profiles := brokerProfilesFromGlobalConfig(global)
 	if len(profiles) == 0 && opts.interactive {
 		fmt.Fprint(stdout, "No broker profiles found. Run bgit setup now? [y/N] ")
-		answer, _ := bufio.NewReader(stdin).ReadString('\n')
+		answer, _ := interactiveReader.ReadString('\n')
 		if strings.EqualFold(strings.TrimSpace(answer), "y") || strings.EqualFold(strings.TrimSpace(answer), "yes") {
 			cmd := exec.Command(os.Args[0], "setup", "--config", path)
 			cmd.Stdin = stdin
@@ -812,38 +873,48 @@ func brokerInitCommand(args []string, stdin io.Reader, stdout io.Writer) error {
 	if opts.directory != "" {
 		target = opts.directory
 	}
+	repoProvided := strings.TrimSpace(repoName) != ""
 	identityName := ""
 	identityEmail := ""
 	if opts.interactive {
 		initial := initDialogInitialState(target, global, repoName, opts.profile)
 		identityName = initial.IdentityName
 		identityEmail = initial.IdentityEmail
-		result, err := brokerInitPrompt(stdin, stdout, initial, profiles)
-		if err != nil {
-			return err
-		}
-		if !result.Changed {
-			fmt.Fprintln(stdout, "No changes made to the repository configuration.")
-			return nil
-		}
-		if result.IdentityChanged && !result.RepoChanged && !result.ProfileChanged {
-			if err := writeLocalIdentityConfig(target, result.IdentityName, result.IdentityEmail); err != nil {
+		if repoProvided {
+			result, err := runInitDialogWithRaw(interactiveReader, stdin, stdout, initial, profiles)
+			if err != nil {
 				return err
 			}
-			fmt.Fprintln(stdout, "Updated repository identity.")
-			return nil
+			if !result.Changed {
+				fmt.Fprintln(stdout, "No changes made to the repository configuration.")
+				return nil
+			}
+			if result.IdentityChanged && !result.RepoChanged && !result.ProfileChanged {
+				if err := writeLocalIdentityConfig(target, result.IdentityName, result.IdentityEmail); err != nil {
+					return err
+				}
+				fmt.Fprintln(stdout, "Updated repository identity.")
+				return nil
+			}
+			repoName = result.RepoName
+			opts.profile = result.ProfileName
+			identityName = result.IdentityName
+			identityEmail = result.IdentityEmail
 		}
-		repoName = result.RepoName
-		opts.profile = result.ProfileName
-		identityName = result.IdentityName
-		identityEmail = result.IdentityEmail
 	}
-	if strings.TrimSpace(repoName) == "" {
+	if strings.TrimSpace(repoName) == "" && !opts.interactive {
 		wd, err := os.Getwd()
 		if err != nil {
 			return err
 		}
 		repoName = filepath.Base(wd) + ".git"
+	}
+	if opts.interactive && strings.TrimSpace(opts.profile) == "" {
+		selected, err := brokerInitSelectProfile(interactiveReader, stdin, stdout, profiles)
+		if err != nil {
+			return err
+		}
+		opts.profile = selected
 	}
 	profile, err := selectBrokerProfileForCommand(profiles, opts.profile, opts.region, "bgit init")
 	if err != nil {
@@ -851,7 +922,7 @@ func brokerInitCommand(args []string, stdin io.Reader, stdout io.Writer) error {
 	}
 	teamID := strings.TrimSpace(opts.team)
 	if opts.interactive && teamID == "" {
-		teamID, err = brokerInitSelectTeam(stdin, stdout, profile)
+		teamID, err = brokerInitSelectTeam(interactiveReader, stdin, stdout, profile)
 		if err != nil {
 			return err
 		}
@@ -864,6 +935,18 @@ func brokerInitCommand(args []string, stdin io.Reader, stdout io.Writer) error {
 		return err
 	}
 	profile.TeamID = teamID
+	if opts.interactive && !repoProvided {
+		repoName, err = brokerInitSelectRepository(interactiveReader, stdin, stdout, profile, teamID)
+		if err != nil {
+			return err
+		}
+	} else if strings.TrimSpace(repoName) == "" {
+		wd, err := os.Getwd()
+		if err != nil {
+			return err
+		}
+		repoName = filepath.Base(wd) + ".git"
+	}
 	if identityName == "" && identityEmail == "" {
 		identity := initDialogInitialState(target, global, repoName, opts.profile)
 		identityName = identity.IdentityName
@@ -1727,6 +1810,266 @@ type brokerPullRequestRequest struct {
 	Comments        []brokerPullRequestComment `json:"comments,omitempty"`
 	TargetNoteID    int                        `json:"target_note_id,omitempty"`
 	TargetCommentID int                        `json:"target_comment_id,omitempty"`
+}
+
+type brokerCIRun struct {
+	ID                int    `json:"id,omitempty"`
+	Provider          string `json:"provider,omitempty"`
+	Ref               string `json:"ref,omitempty"`
+	Commit            string `json:"commit,omitempty"`
+	Config            string `json:"config,omitempty"`
+	Status            string `json:"status,omitempty"`
+	Result            string `json:"result,omitempty"`
+	URL               string `json:"url,omitempty"`
+	Message           string `json:"message,omitempty"`
+	ProviderBuildID   string `json:"provider_build_id,omitempty"`
+	ProviderBuildName string `json:"provider_build_name,omitempty"`
+	LogGroup          string `json:"log_group,omitempty"`
+	LogStream         string `json:"log_stream,omitempty"`
+	Author            string `json:"author,omitempty"`
+	StartedAt         string `json:"started_at,omitempty"`
+	FinishedAt        string `json:"finished_at,omitempty"`
+	CreatedAt         string `json:"created_at,omitempty"`
+	UpdatedAt         string `json:"updated_at,omitempty"`
+}
+
+type brokerCIRequest struct {
+	Repo     brokerRepo `json:"repo"`
+	ID       int        `json:"id,omitempty"`
+	Provider string     `json:"provider,omitempty"`
+	Ref      string     `json:"ref,omitempty"`
+	Commit   string     `json:"commit,omitempty"`
+	Config   string     `json:"config,omitempty"`
+}
+
+func brokerAdminCICommand(cfg config, args []string, stdout io.Writer) error {
+	if len(args) == 0 {
+		return errors.New("usage: bgit admin ci rotate-secret")
+	}
+	cfg, err := configForBrokerCommand(cfg)
+	if err != nil {
+		return err
+	}
+	switch args[0] {
+	case "rotate-secret":
+		if len(args) != 1 {
+			return errors.New("usage: bgit admin ci rotate-secret")
+		}
+		if err := brokerPost(cfg.brokerURL, "/ci/secret/rotate", brokerCIRequest{Repo: repoForBroker(cfg)}, nil); err != nil {
+			return err
+		}
+		fmt.Fprintln(stdout, "rotated CI materializer secret")
+		return nil
+	default:
+		return fmt.Errorf("unknown admin ci command %q", args[0])
+	}
+}
+
+func ciCommand(args []string, stdin io.Reader, stdout io.Writer) error {
+	_ = stdin
+	if len(args) == 0 {
+		return errors.New("usage: bgit ci list|run|view|logs|watch [args]")
+	}
+	cfg, err := configForBrokerCommand(config{})
+	if err != nil {
+		return err
+	}
+	switch args[0] {
+	case "list":
+		var resp struct {
+			Runs []brokerCIRun `json:"runs"`
+		}
+		if err := brokerPost(cfg.brokerURL, "/ci/list", brokerCIRequest{Repo: repoForBroker(cfg)}, &resp); err != nil {
+			return err
+		}
+		for _, run := range resp.Runs {
+			fmt.Fprintf(stdout, "#%d\t%s\t%s\t%s\t%s\n", run.ID, firstNonEmpty(run.Status, "queued"), shortRefName(run.Ref), shortHash(run.Commit), run.Config)
+		}
+		return nil
+	case "view":
+		if len(args) != 2 {
+			return errors.New("usage: bgit ci view ID")
+		}
+		id := parsePositiveInt(strings.TrimPrefix(args[1], "#"))
+		if id <= 0 {
+			return errors.New("CI run id is required")
+		}
+		var resp struct {
+			Run brokerCIRun `json:"run"`
+		}
+		if err := brokerPost(cfg.brokerURL, "/ci/view", brokerCIRequest{Repo: repoForBroker(cfg), ID: id}, &resp); err != nil {
+			return err
+		}
+		fmt.Fprintf(stdout, "#%d %s\nprovider: %s\nref: %s\ncommit: %s\nconfig: %s\n", resp.Run.ID, firstNonEmpty(resp.Run.Status, "queued"), resp.Run.Provider, resp.Run.Ref, resp.Run.Commit, resp.Run.Config)
+		if resp.Run.URL != "" {
+			fmt.Fprintf(stdout, "url: %s\n", resp.Run.URL)
+		}
+		if resp.Run.Message != "" {
+			fmt.Fprintf(stdout, "\n%s\n", resp.Run.Message)
+		}
+		return nil
+	case "logs":
+		if len(args) != 2 {
+			return errors.New("usage: bgit ci logs ID")
+		}
+		id := parsePositiveInt(strings.TrimPrefix(args[1], "#"))
+		if id <= 0 {
+			return errors.New("CI run id is required")
+		}
+		var resp struct {
+			Run  brokerCIRun `json:"run"`
+			Logs string      `json:"logs"`
+		}
+		if err := brokerPost(cfg.brokerURL, "/ci/logs", brokerCIRequest{Repo: repoForBroker(cfg), ID: id}, &resp); err != nil {
+			return err
+		}
+		if resp.Logs != "" {
+			fmt.Fprint(stdout, resp.Logs)
+			if !strings.HasSuffix(resp.Logs, "\n") {
+				fmt.Fprintln(stdout)
+			}
+		}
+		return nil
+	case "watch":
+		if len(args) != 2 {
+			return errors.New("usage: bgit ci watch ID")
+		}
+		id := parsePositiveInt(strings.TrimPrefix(args[1], "#"))
+		if id <= 0 {
+			return errors.New("CI run id is required")
+		}
+		return watchCIRun(cfg, id, stdout)
+	case "run":
+		req := brokerCIRequest{Repo: repoForBroker(cfg), Provider: defaultCIProvider(cfg)}
+		for i := 1; i < len(args); i++ {
+			arg := args[i]
+			name, value, hasValue := strings.Cut(arg, "=")
+			switch name {
+			case "--ref":
+				value, i, err = optionValue(args, i, hasValue, value, name)
+				if err != nil {
+					return err
+				}
+				req.Ref = normalizeDestinationRef(value)
+			case "--config":
+				value, i, err = optionValue(args, i, hasValue, value, name)
+				if err != nil {
+					return err
+				}
+				req.Config = value
+			case "--provider":
+				value, i, err = optionValue(args, i, hasValue, value, name)
+				if err != nil {
+					return err
+				}
+				req.Provider = normalizeCIProvider(value)
+			default:
+				return fmt.Errorf("unsupported ci run option %s", arg)
+			}
+		}
+		if req.Ref == "" {
+			out, err := runGit(".", "branch", "--show-current")
+			if err != nil {
+				return err
+			}
+			req.Ref = branchRef(strings.TrimSpace(string(out)))
+		}
+		head, err := runGit(".", "rev-parse", "HEAD")
+		if err == nil {
+			req.Commit = strings.TrimSpace(string(head))
+		}
+		if req.Config == "" {
+			req.Config, err = detectCIConfig(req.Provider, req.Commit)
+			if err != nil {
+				return err
+			}
+		}
+		var resp struct {
+			Run brokerCIRun `json:"run"`
+		}
+		if err := brokerPost(cfg.brokerURL, "/ci/run", req, &resp); err != nil {
+			return err
+		}
+		fmt.Fprintf(stdout, "queued CI run #%d for %s at %s\n", resp.Run.ID, shortRefName(resp.Run.Ref), shortHash(resp.Run.Commit))
+		if resp.Run.Message != "" {
+			fmt.Fprintf(stdout, "%s\n", resp.Run.Message)
+		}
+		return nil
+	default:
+		return fmt.Errorf("unknown ci command %q", args[0])
+	}
+}
+
+func watchCIRun(cfg config, id int, stdout io.Writer) error {
+	printed := 0
+	lastStatus := ""
+	for {
+		var resp struct {
+			Run  brokerCIRun `json:"run"`
+			Logs string      `json:"logs"`
+		}
+		if err := brokerPost(cfg.brokerURL, "/ci/logs", brokerCIRequest{Repo: repoForBroker(cfg), ID: id}, &resp); err != nil {
+			return err
+		}
+		status := firstNonEmpty(resp.Run.Status, "queued")
+		if status != lastStatus {
+			fmt.Fprintf(stdout, "#%d %s\n", resp.Run.ID, status)
+			lastStatus = status
+		}
+		if len(resp.Logs) > printed {
+			fmt.Fprint(stdout, resp.Logs[printed:])
+			printed = len(resp.Logs)
+		}
+		if ciStatusTerminal(status) {
+			if !strings.HasSuffix(resp.Logs, "\n") && resp.Logs != "" {
+				fmt.Fprintln(stdout)
+			}
+			return nil
+		}
+		time.Sleep(3 * time.Second)
+	}
+}
+
+func ciStatusTerminal(status string) bool {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "passed", "failed", "cancelled", "timed_out":
+		return true
+	default:
+		return false
+	}
+}
+
+func defaultCIProvider(cfg config) string {
+	if strings.EqualFold(cfg.provider, "s3") {
+		return "aws"
+	}
+	return "gcp"
+}
+
+func normalizeCIProvider(provider string) string {
+	switch strings.ToLower(strings.TrimSpace(provider)) {
+	case "aws", "codebuild", "s3":
+		return "aws"
+	default:
+		return "gcp"
+	}
+}
+
+func detectCIConfig(provider, commit string) (string, error) {
+	candidates := []string{"cloudbuild.yaml", "cloudbuild.yml"}
+	if normalizeCIProvider(provider) == "aws" {
+		candidates = []string{"buildspec.yml", "buildspec.yaml"}
+	}
+	revision := strings.TrimSpace(commit)
+	if revision == "" {
+		revision = "HEAD"
+	}
+	for _, candidate := range candidates {
+		if _, err := runGit(".", "cat-file", "-e", revision+":"+candidate); err == nil {
+			return candidate, nil
+		}
+	}
+	return "", fmt.Errorf("no CI config found in %s; expected %s", shortHash(revision), strings.Join(candidates, " or "))
 }
 
 func issueCommand(args []string, stdin io.Reader, stdout io.Writer) error {
@@ -2627,7 +2970,28 @@ func brokerInitPrompt(stdin io.Reader, stdout io.Writer, initial initDialogConfi
 	return runInitDialogWithRaw(reader, stdin, stdout, initial, profiles)
 }
 
-func brokerInitSelectTeam(stdin io.Reader, stdout io.Writer, profile brokerProfile) (string, error) {
+func brokerInitSelectProfile(reader *bufio.Reader, rawInput io.Reader, stdout io.Writer, profiles []brokerProfile) (string, error) {
+	if len(profiles) == 1 {
+		return profiles[0].QualifiedName, nil
+	}
+	choices := make([]setupChoice, 0, len(profiles))
+	for _, profile := range profiles {
+		label := profile.QualifiedName
+		help := strings.TrimSpace(profile.BrokerURL)
+		choices = append(choices, setupChoice{Label: label, Value: profile.QualifiedName, Help: help})
+	}
+	sort.Slice(choices, func(i, j int) bool { return choices[i].Label < choices[j].Label })
+	value, ok, err := runSetupSelectWithRaw(reader, rawInput, stdout, "Select broker", choices, "")
+	if err != nil {
+		return "", err
+	}
+	if !ok || strings.TrimSpace(value) == "" {
+		return "", errors.New("init canceled")
+	}
+	return value, nil
+}
+
+func brokerInitSelectTeam(reader *bufio.Reader, rawInput io.Reader, stdout io.Writer, profile brokerProfile) (string, error) {
 	teams, err := brokerInitTeamChoices(profile)
 	if err != nil {
 		return "", err
@@ -2635,11 +2999,7 @@ func brokerInitSelectTeam(stdin io.Reader, stdout io.Writer, profile brokerProfi
 	if len(teams) == 0 {
 		return "", errors.New("no teams available for selected broker")
 	}
-	reader, ok := stdin.(*bufio.Reader)
-	if !ok {
-		reader = bufio.NewReader(stdin)
-	}
-	value, ok, err := runSetupSelectWithRaw(reader, stdin, stdout, "Select team", teams, "")
+	value, ok, err := runSetupSelectWithRaw(reader, rawInput, stdout, "Select team", teams, "")
 	if err != nil {
 		return "", err
 	}
@@ -2680,6 +3040,57 @@ func brokerInitTeamChoices(profile brokerProfile) ([]setupChoice, error) {
 			continue
 		}
 		choices = append(choices, setupChoice{Label: label, Value: value})
+	}
+	sort.Slice(choices, func(i, j int) bool { return choices[i].Label < choices[j].Label })
+	return choices, nil
+}
+
+func brokerInitSelectRepository(reader *bufio.Reader, rawInput io.Reader, stdout io.Writer, profile brokerProfile, teamID string) (string, error) {
+	repos, err := brokerInitRepositoryChoices(profile, teamID)
+	if err != nil {
+		return "", err
+	}
+	if len(repos) == 0 {
+		return "", errors.New("no repositories available for selected team")
+	}
+	placeholder := setupChoice{Label: "-- SELECT REPOSITORY --", Value: "__select_repository__", Help: ""}
+	choices := append([]setupChoice{placeholder}, repos...)
+	for {
+		value, ok, err := runSetupSelectWithRaw(reader, rawInput, stdout, "Select repository", choices, placeholder.Value)
+		if err != nil {
+			return "", err
+		}
+		if !ok || strings.TrimSpace(value) == "" {
+			return "", errors.New("init canceled")
+		}
+		if value == placeholder.Value {
+			continue
+		}
+		return value, nil
+	}
+}
+
+func brokerInitRepositoryChoices(profile brokerProfile, teamID string) ([]setupChoice, error) {
+	cfg := config{provider: profile.Provider, brokerURL: profile.BrokerURL, region: profile.Region, gcloudConfiguration: profile.Name, gcloudConfigurationExplicit: profile.Name != ""}
+	choices, err := setupBrokerTeamRepoChoices(cfg, teamID)
+	if err == nil {
+		return choices, nil
+	}
+	repos, repoErr := brokerReposMineAllKeys(context.Background(), profile.BrokerURL)
+	if repoErr != nil {
+		return nil, err
+	}
+	seen := map[string]bool{}
+	for _, repo := range repos {
+		if firstNonEmpty(repo.Repo.TeamID, coreTeamID) != teamID {
+			continue
+		}
+		logical := firstNonEmpty(repo.Logical, repo.Repo.Logical, repo.RepoID)
+		if logical == "" || seen[logical] {
+			continue
+		}
+		seen[logical] = true
+		choices = append(choices, setupChoice{Label: logicalRepoDisplayName(logical), Value: logical, Help: "role " + firstNonEmpty(repo.Role, "read")})
 	}
 	sort.Slice(choices, func(i, j int) bool { return choices[i].Label < choices[j].Label })
 	return choices, nil

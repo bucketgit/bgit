@@ -160,9 +160,21 @@ bgit pr view 1
 bgit pr diff 1
 bgit pr merge 1
 
+bgit board list
+bgit board create "As a maintainer, I want clear setup docs so that new users can bootstrap quickly."
+bgit board take BG-1
+bgit board move BG-1 doing
+bgit board comment BG-1 "Opened PR #2."
+
 bgit issue create "Bug report" --body "Details"
 bgit issue list
 bgit issue view 1
+
+bgit ci run --ref feature/docs
+bgit ci list
+bgit ci view 1
+bgit ci logs 1
+bgit ci watch 1
 
 bgit whoami
 bgit repos mine
@@ -204,14 +216,27 @@ bgit setup profile create --provider gcp work
 bgit setup profile create --provider aws work
 ```
 
-GCP setup uses `gcloud` configurations. AWS setup reads AWS config/credentials
-files and can use the AWS CLI when profile creation is requested.
+GCP setup uses `gcloud` configurations and can deploy the broker and CI
+materializer into Cloud Run/Cloud Build backed infrastructure. AWS setup reads
+AWS config/credentials files and can use the AWS CLI when profile creation is
+requested; it deploys the broker stack, Lambda materializer handoff, CodeBuild
+integration, and broker-managed secrets.
 
 `bgit setup` also manages configured brokers. From the setup UI you can create,
 update, manage, or delete brokers, manage users and teams, and seed the default
 `core` team. Repositories are created explicitly with `bgit admin repo create`
 or through the setup broker-management UI; `bgit init` attaches a local checkout
 to an existing broker repository.
+
+Broker setup uses one-time owner bootstrap tokens. The deployed broker stores a
+token hash, not a readable token, and marks the bootstrap as used after the
+owner key is imported. If an old broker rejects newer signed requests, upgrade
+it from an attached repository:
+
+```bash
+bgit admin broker upgrade
+bgit admin broker owner-bootstrap reset
+```
 
 ## Identity
 
@@ -237,12 +262,20 @@ Owners cannot be deleted or suspended. Ownership transfer uses a two-step flow:
 the current owner creates a transfer command, and the new owner accepts it with
 an SSH signature.
 
+Broker users are stable broker identities with SSH keys. Repository access can
+come from direct repository grants, team membership plus team-to-repository
+grants, or invite flows when explicit acceptance is required. Broker admins can
+assign existing broker users directly through setup; repo admins can use the
+repo-scoped access flows available to their role.
+
 Useful admin commands:
 
 ```bash
 bgit admin repo list
 bgit admin repo info
 bgit admin repo create --team platform app
+bgit admin broker upgrade
+bgit admin broker owner-bootstrap reset
 
 bgit admin keys list
 bgit admin keys add --user ada --role developer --key ~/.ssh/ada.pub
@@ -265,6 +298,7 @@ bgit admin cancel-ownership-transfer --broker https://broker.example.com demo.gi
 bgit admin protect add main
 bgit admin protect list
 bgit admin protect remove main
+bgit admin ci rotate-secret
 
 bgit admin broker-users list
 bgit admin broker-users upsert ada --role user --key ~/.ssh/ada.pub
@@ -285,6 +319,10 @@ cancellation is repo-scoped. Broker logical repository names are flat, such as
 `demo.git`; path-shaped clone URLs route through teams. Flat broker clone URLs
 use the default `core` team, while `bgit init` prompts for a team or requires
 `--team` in noninteractive mode.
+
+Broker requests use replay-resistant v2 SSH signatures over method, path, host,
+timestamp, nonce, and payload hash. Older brokers that do not understand these
+signatures should be upgraded before using newer clients.
 
 ## Repository Settings
 
@@ -331,6 +369,57 @@ bgit issue reopen 1
 Branch protection is enforced by the broker. Protected branches can require the
 PR merge path, with optional owner/admin override.
 
+`bgit web` also has a pull-request creation flow with base/compare branch
+selection, diff preview, and mergeability/conflict status before creating the
+PR.
+
+## Task Board
+
+Broker-backed repositories have a task board immediately; no board creation is
+required. Stories are stored in repository metadata and move through
+`backlog`, `ready`, `doing`, `review`, and `done`. Viewers can read the board;
+developers and higher can create stories, take or reassign work, move cards, and
+comment.
+
+```bash
+bgit board list
+bgit board create "As a developer, I want CI logs on each run so that failures are easy to diagnose."
+bgit board take BG-1
+bgit board move BG-1 review
+bgit board comment BG-1 "PR #4 is ready for review."
+```
+
+Story IDs are prefixed with a repository monogram. The web board supports
+drag-and-drop lane moves, assignment controls, comments, optimistic committing
+state, and an "Only me" filter for assigned work.
+
+## CI/CD
+
+BucketGit stores CI run records in the broker and hands builds to the trusted
+cloud provider/materializer path for a broker ref and commit. The broker
+verifies repository state before queueing CI so clients cannot upsert arbitrary
+build payloads without corresponding Git state.
+
+```bash
+bgit ci list
+bgit ci run --ref feature/docs
+bgit ci run --ref feature/docs --config cloudbuild.yaml --provider gcp
+bgit ci run --ref feature/docs --config buildspec.yaml --provider aws
+bgit ci view 1
+bgit ci logs 1
+bgit ci watch 1
+```
+
+GCP builds use Cloud Build configuration such as `cloudbuild.yaml`. AWS builds
+use CodeBuild configuration such as `buildspec.yaml`. Provider-specific
+alternate YAML filenames can be passed with `--config`.
+
+CI materializer tokens are broker-managed secrets. Rotate them with:
+
+```bash
+bgit admin ci rotate-secret
+```
+
 ## Web UI
 
 `bgit web` serves a local browser UI on `127.0.0.1:8042`:
@@ -340,8 +429,9 @@ bgit web
 ```
 
 The web UI uses the configured repository and broker by default. It shows files,
-commits, pull requests, issues, repository settings, capability-aware controls,
-local dirty/staged/unpushed state, and remote sync status.
+commits, pull requests, issues, the task board, CI runs and logs, repository
+settings, user profile settings, capability-aware controls, local
+dirty/staged/unpushed state, and remote sync status.
 
 Use local-only mode to browse the local `.git` object store without broker
 refreshes:
@@ -350,6 +440,9 @@ refreshes:
 bgit web --local
 bgit web --port 9000
 ```
+
+User profile settings include bio, SSH-key display, avatar upload, drag-to-pan
+cropping, and zoom controls. Local web mutations are protected with CSRF tokens.
 
 The web assets are embedded into the `bgit` binary at build time.
 
@@ -432,13 +525,13 @@ go test ./...
 Run the local broker integration suite:
 
 ```bash
-./testsuite/run.sh
-BGIT_TEST_PROVIDER=gcp ./testsuite/run.sh
-BGIT_TEST_PROVIDER=aws ./testsuite/run.sh
+./testsuite/run-local-broker.sh gcp
+./testsuite/run-local-broker.sh aws
 ```
 
-The integration suite uses local SQLite-backed broker runtimes and does not
-require cloud credentials or deployed brokers.
+The integration suite uses local SQLite-backed broker runtimes, local object
+storage, and fake provider clients for GCP and AWS. It does not require cloud
+credentials or deployed brokers.
 
 ## Requirements
 

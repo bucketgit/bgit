@@ -3309,14 +3309,18 @@ func TestNativeGitRepoBrokerPushDoesNotWriteRefThroughObjectStore(t *testing.T) 
 	var gotUpdate brokerRefUpdateRequest
 	updateCalls := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/refs/update" {
+		switch r.URL.Path {
+		case "/auth/status":
+			_, _ = w.Write([]byte(`{"role":"developer","capabilities":{"push":true}}`))
+		case "/refs/update":
+			updateCalls++
+			if err := json.NewDecoder(r.Body).Decode(&gotUpdate); err != nil {
+				t.Fatal(err)
+			}
+			_, _ = w.Write([]byte(`{}`))
+		default:
 			t.Fatalf("unexpected path %s", r.URL.Path)
 		}
-		updateCalls++
-		if err := json.NewDecoder(r.Body).Decode(&gotUpdate); err != nil {
-			t.Fatal(err)
-		}
-		_, _ = w.Write([]byte(`{}`))
 	}))
 	defer server.Close()
 	if _, err := runGit(worktree, "config", "bucketgit.broker", server.URL); err != nil {

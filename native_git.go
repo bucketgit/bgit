@@ -487,16 +487,23 @@ func (r *nativeGitRepo) pushWorktree(ctx context.Context, worktree string, opts 
 	if err != nil {
 		return err
 	}
+	brokerURL := ""
+	if !opts.skipBroker {
+		brokerURL = optionalBrokerURLForPush()
+	}
+	if brokerURL != "" {
+		cfg := r.cfg
+		cfg.brokerURL = brokerURL
+		if err := brokerRequirePush(ctx, cfg); err != nil {
+			return brokerPushError(err)
+		}
+	}
 	if err := uploadLocalObjects(ctx, store, gitDir); err != nil {
 		return err
 	}
 	refs, err := r.refs(ctx)
 	if err != nil {
 		return err
-	}
-	brokerURL := ""
-	if !opts.skipBroker {
-		brokerURL = optionalBrokerURLForPush()
 	}
 	updateRef := func(ref, oldHash, newHash string) error {
 		if brokerURL != "" {

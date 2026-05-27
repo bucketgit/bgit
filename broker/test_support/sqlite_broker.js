@@ -314,6 +314,12 @@ function makeAWSModules(store, objectRoot) {
   class CreateBucketCommand { constructor(input) { this.input = input || {}; } }
   class DeleteBucketCommand { constructor(input) { this.input = input || {}; } }
   class AssumeRoleCommand { constructor(input) { this.input = input || {}; } }
+  class GetSecretValueCommand { constructor(input) { this.input = input || {}; } }
+  class PutSecretValueCommand { constructor(input) { this.input = input || {}; } }
+  class InvokeCommand { constructor(input) { this.input = input || {}; } }
+  class StartBuildCommand { constructor(input) { this.input = input || {}; } }
+  class BatchGetBuildsCommand { constructor(input) { this.input = input || {}; } }
+  class GetLogEventsCommand { constructor(input) { this.input = input || {}; } }
   class S3Client {
     async send(command) {
       const input = command.input || {};
@@ -365,6 +371,55 @@ function makeAWSModules(store, objectRoot) {
       return {Credentials: {AccessKeyId: 'test', SecretAccessKey: 'test', SessionToken: 'test'}};
     }
   }
+  let secretValue = process.env.BGIT_TEST_CI_MATERIALIZER_TOKEN || 'local-ci-materializer-token';
+  class SecretsManagerClient {
+    async send(command) {
+      const name = command.constructor.name;
+      if (name === 'GetSecretValueCommand') return {SecretString: secretValue};
+      if (name === 'PutSecretValueCommand') {
+        secretValue = String((command.input || {}).SecretString || '');
+        return {};
+      }
+      throw new Error('unsupported fake Secrets Manager command ' + name);
+    }
+  }
+  class LambdaClient {
+    async send(command) {
+      const name = command.constructor.name;
+      if (name === 'InvokeCommand') {
+        const id = 'local-codebuild-' + Date.now();
+        return {Payload: Buffer.from(JSON.stringify({statusCode: 200, body: JSON.stringify({
+          status: 'queued',
+          provider_build_id: id,
+          provider_build_name: id,
+          message: 'local AWS CI materializer queued',
+          log_group: '/aws/codebuild/bgit-local',
+          log_stream: id,
+        })}))};
+      }
+      throw new Error('unsupported fake Lambda command ' + name);
+    }
+  }
+  class CodeBuildClient {
+    async send(command) {
+      const name = command.constructor.name;
+      if (name === 'StartBuildCommand') {
+        const id = 'local-codebuild-' + Date.now();
+        return {build: {id, arn: id, buildStatus: 'IN_PROGRESS', currentPhase: 'SUBMITTED', logs: {groupName: '/aws/codebuild/bgit-local', streamName: id}}};
+      }
+      if (name === 'BatchGetBuildsCommand') {
+        return {builds: (command.input.ids || []).map((id) => ({id, arn: id, buildStatus: 'SUCCEEDED', currentPhase: 'COMPLETED', startTime: new Date(), endTime: new Date(), logs: {groupName: '/aws/codebuild/bgit-local', streamName: id}}))};
+      }
+      throw new Error('unsupported fake CodeBuild command ' + name);
+    }
+  }
+  class CloudWatchLogsClient {
+    async send(command) {
+      const name = command.constructor.name;
+      if (name === 'GetLogEventsCommand') return {events: [{message: 'local AWS CI log'}]};
+      throw new Error('unsupported fake CloudWatch Logs command ' + name);
+    }
+  }
   return {
     '@aws-sdk/client-dynamodb': {
       DynamoDBClient,
@@ -387,6 +442,24 @@ function makeAWSModules(store, objectRoot) {
     '@aws-sdk/client-sts': {
       STSClient,
       AssumeRoleCommand,
+    },
+    '@aws-sdk/client-secrets-manager': {
+      SecretsManagerClient,
+      GetSecretValueCommand,
+      PutSecretValueCommand,
+    },
+    '@aws-sdk/client-lambda': {
+      LambdaClient,
+      InvokeCommand,
+    },
+    '@aws-sdk/client-codebuild': {
+      CodeBuildClient,
+      StartBuildCommand,
+      BatchGetBuildsCommand,
+    },
+    '@aws-sdk/client-cloudwatch-logs': {
+      CloudWatchLogsClient,
+      GetLogEventsCommand,
     },
   };
 }

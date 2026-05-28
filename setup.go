@@ -109,10 +109,17 @@ func setupCommand(ctx context.Context, base config, args []string, stdin io.Read
 			return err
 		}
 	}
-	fmt.Fprintln(stdout, "discovering cloud profiles...")
+	fmt.Fprintln(stdout, "discovering broker profiles...")
 	profiles, err := discoverSetupProfiles(ctx)
 	if err != nil {
 		return err
+	}
+	if opts.provider == "local" {
+		name := "default"
+		if len(opts.profiles) > 0 && strings.TrimSpace(opts.profiles[0]) != "" {
+			name = strings.TrimSpace(opts.profiles[0])
+		}
+		profiles = append(profiles, setupProfile{Provider: "local", Name: name, Region: firstNonEmpty(opts.region, "default")})
 	}
 	global, err := readGlobalConfig(path)
 	if err != nil {
@@ -219,6 +226,8 @@ selectAgain:
 		if opts.action == "update" {
 			selection.Profiles = profiles
 			selection.Keys = nil
+		} else if opts.yes {
+			selection.Profiles = profiles
 		} else if !opts.yes {
 			selected, err := runSetupDialogWithRaw(interactiveReader, stdin, stdout, selection)
 			if err != nil {
@@ -330,6 +339,12 @@ selectAgain:
 					if err := setupProvisionSelectedProfile(base, path, now, profile, opts, publicKeys, &global, stdout); err != nil {
 						return err
 					}
+				}
+				continue
+			} else if profile.Provider == "local" {
+				profile.Region = firstNonEmpty(profile.Region, opts.region, "default")
+				if err := setupProvisionSelectedProfile(base, path, now, profile, opts, publicKeys, &global, stdout); err != nil {
+					return err
 				}
 				continue
 			}
@@ -615,6 +630,19 @@ func setupProvisionSelectedProfile(base config, path, now string, profile setupP
 			ARN:       profile.ARN,
 			Regions: []globalProfileRegion{{
 				Name:          profile.Region,
+				BrokerURL:     brokerURL,
+				BrokerVersion: brokerVersion(),
+				LastSetupAt:   now,
+			}},
+		})
+	case "local":
+		root := expandHome(firstNonEmpty(os.Getenv("BGIT_LOCAL_BROKER_ROOT"), "~/.bgit/local-broker"))
+		*global = upsertGlobalLocalProfile(*global, globalLocalProfile{
+			Name:      profile.Name,
+			Root:      root,
+			Autostart: true,
+			Regions: []globalProfileRegion{{
+				Name:          firstNonEmpty(profile.Region, "default"),
 				BrokerURL:     brokerURL,
 				BrokerVersion: brokerVersion(),
 				LastSetupAt:   now,
@@ -1261,6 +1289,8 @@ func normalizeSetupProvider(value string) string {
 		return "gcs"
 	case "aws", "s3":
 		return "s3"
+	case "local":
+		return "local"
 	default:
 		return ""
 	}
@@ -3636,10 +3666,15 @@ func runSetupTeamRepositoryCreateWithRaw(cfg config, teamID, teamName string, re
 	if err != nil || !ok {
 		return "No changes made.", err
 	}
-	logical, err := normalizeLogicalRepoName(fields[0])
+	repoInput, ok, err := runSetupLocalBrokerRepoStorageRegionWithRaw(cfg, fields[0], reader, rawInput, stdout)
+	if err != nil || !ok {
+		return "No changes made.", err
+	}
+	repo, err := setupRepoForTeamCreate(cfg, repoInput, teamID, teamName)
 	if err != nil {
 		return "", err
 	}
+	logical := repo.Logical
 	role, ok, err := runSetupSelectWithRaw(reader, rawInput, stdout, setupBreadcrumb("Manage team", teamName, "Repositories", logicalRepoDisplayName(logical), "Role cap"), setupRepoRoleCapChoices(), "developer")
 	if err != nil || !ok {
 		return "No changes made.", err
@@ -3648,18 +3683,42 @@ func runSetupTeamRepositoryCreateWithRaw(cfg config, teamID, teamName string, re
 	if err != nil {
 		return "", err
 	}
-	actionCfg, err := setupBrokerRepoConfig(cfg, logical)
-	if err != nil {
-		return "", err
-	}
-	actionCfg.provider = firstNonEmpty(actionCfg.provider, cfg.provider, "gcs")
-	actionCfg.brokerURL = brokerURL
-	actionCfg.teamID = teamID
-	req := brokerRepoAdminRequest{Repo: repoForBroker(actionCfg), Role: role}
+	repo.TeamID = teamID
+	repo.TeamName = teamName
+	req := brokerRepoAdminRequest{Repo: repo, Role: role}
 	if err := brokerPost(brokerURL, "/repos/create", req, nil); err != nil {
 		return "", err
 	}
 	return fmt.Sprintf("created repository %s and granted %s %s access", logicalRepoDisplayName(logical), firstNonEmpty(teamName, teamID), role), nil
+}
+
+func runSetupLocalBrokerRepoStorageRegionWithRaw(cfg config, repoName string, reader *bufio.Reader, rawInput io.Reader, stdout io.Writer) (string, bool, error) {
+	_, _, _, _ = reader, rawInput, stdout, cfg
+	if cfg.provider != "local" {
+		return repoName, true, nil
+	}
+	return repoName, true, nil
+}
+
+func setupRepoForTeamCreate(cfg config, value, teamID, teamName string) (brokerRepo, error) {
+	if repo, ok, err := brokerRepoForStorageTarget(cfg, value, teamID); ok || err != nil {
+		repo.TeamName = teamName
+		return repo, err
+	}
+	logical, err := normalizeLogicalRepoName(value)
+	if err != nil {
+		return brokerRepo{}, err
+	}
+	actionCfg, err := setupBrokerRepoConfig(cfg, logical)
+	if err != nil {
+		return brokerRepo{}, err
+	}
+	actionCfg.provider = firstNonEmpty(actionCfg.provider, cfg.provider, "gcs")
+	actionCfg.brokerURL = cfg.brokerURL
+	actionCfg.teamID = teamID
+	repo := repoForBroker(actionCfg)
+	repo.TeamName = teamName
+	return repo, nil
 }
 
 func setupBrokerTeamRepositoryMenuChoices(cfg config, teamID string) ([]setupChoice, error) {
@@ -5153,8 +5212,17 @@ func renderSetupMultiSelectWithStyle(state setupMultiSelectState, style bool) st
 
 func runSetupTextFormWithRaw(reader *bufio.Reader, rawInput io.Reader, stdout io.Writer, title string, fields []setupTextField) ([]string, bool, error) {
 	state := setupTextFormState{Title: title, Fields: fields, Button: -1}
+	rawMode, restore, err := setupDialogRawMode(rawInput)
+	if err != nil {
+		return nil, false, err
+	}
+	defer restore()
+	if len(fields) == 1 {
+		state.Editing = true
+		state.EditOriginal = fields[0].Value
+	}
 	for {
-		fmt.Fprint(stdout, renderSetupTextFormFrame(state, true))
+		fmt.Fprint(stdout, renderSetupTextFormFrame(state, rawMode))
 		b, err := reader.ReadByte()
 		if err != nil {
 			if errors.Is(err, io.EOF) {
@@ -6476,6 +6544,9 @@ func setupProviderLabel(provider string) string {
 	if provider == "s3" {
 		return "aws"
 	}
+	if provider == "local" {
+		return "local"
+	}
 	return "gcp"
 }
 
@@ -6535,6 +6606,22 @@ func upsertGlobalAWSProfile(cfg globalConfig, profile globalAWSProfile) globalCo
 		}
 	}
 	cfg.AWSProfiles = append(cfg.AWSProfiles, profile)
+	return cfg
+}
+
+func upsertGlobalLocalProfile(cfg globalConfig, profile globalLocalProfile) globalConfig {
+	for i, existing := range cfg.LocalProfiles {
+		if existing.Name == profile.Name {
+			if strings.TrimSpace(profile.Root) == "" {
+				profile.Root = existing.Root
+			}
+			profile.Autostart = profile.Autostart || existing.Autostart
+			profile.Regions = mergeGlobalProfileRegions(existing.Regions, profile.Regions)
+			cfg.LocalProfiles[i] = profile
+			return cfg
+		}
+	}
+	cfg.LocalProfiles = append(cfg.LocalProfiles, profile)
 	return cfg
 }
 

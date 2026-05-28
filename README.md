@@ -42,7 +42,8 @@ bgit --version
 BucketGit has two layers:
 
 - A normal local Git checkout on your machine.
-- A broker-backed repository stored directly in GCS or S3.
+- A broker-backed repository stored directly in GCS, S3, or a local broker
+  object backend.
 
 The broker handles repository mapping, roles, SSH-key authorization, pull
 requests, issues, branch protection, and short-lived object-transfer
@@ -66,6 +67,27 @@ bgit setup
 GCP and AWS profiles, lets you choose regions, creates or updates brokers,
 imports owner SSH keys, manages users and teams, and writes global configuration
 to `~/.bgit/config.yaml`.
+
+For local hosting, `bgit clone file://repo.git`, `bgit clone s3://repo.git`,
+and `bgit clone gs://repo.git` create or attach a broker-backed repository
+without deploying cloud broker infrastructure. The local broker is part of the
+`bgit` binary and stores broker metadata with the repository in the reserved
+`.bucketgit/broker-state/` namespace.
+
+Local broker repository URLs select the backing storage:
+
+```bash
+bgit clone file://app.git
+bgit clone s3://app.git --profile work --region eu-west-1
+bgit clone gs://app.git --profile work --region europe-west1
+```
+
+`file://` repositories are stored below `~/.bgit/local-broker`. `s3://` and
+`gs://` repositories use one cloud bucket per repository, named from the cached
+AWS account ID or GCP project ID plus the repo name, for example
+`123456789012-app`. The visible repository name remains `app.git`. If
+`--profile` or `--region` is omitted, BucketGit uses `default` plus the
+provider's default region (`us-east-1` for AWS, `us-central1` for GCP).
 
 Create a broker repository, then attach a local checkout:
 
@@ -222,11 +244,24 @@ AWS config/credentials files and can use the AWS CLI when profile creation is
 requested; it deploys the broker stack, Lambda materializer handoff, CodeBuild
 integration, and broker-managed secrets.
 
+Local broker repositories use the same broker authorization and ref-safety
+model without deploying a shared broker. Repository metadata is persisted under
+`.bucketgit/broker-state/`. Ref updates are committed through per-ref broker
+state records and short lock files, then materialized back to normal Git ref
+files.
+
+Cloud-backed local broker repositories use cached profile metadata from
+`~/.bgit/config.yaml` for deterministic bucket naming. `bgit setup profile
+create --provider aws NAME` records the AWS account ID for a profile, and
+`bgit setup profile create --provider gcp NAME` records the GCP project ID. If
+an existing AWS or GCP CLI profile is used before it is cached, BucketGit imports
+that account/project ID once and then reuses the cached value.
+
 `bgit setup` also manages configured brokers. From the setup UI you can create,
 update, manage, or delete brokers, manage users and teams, and seed the default
 `core` team. Repositories are created explicitly with `bgit admin repo create`
-or through the setup broker-management UI; `bgit init` attaches a local checkout
-to an existing broker repository.
+or through the setup broker-management UI; `bgit init` asks for the repository
+name when needed and attaches the checkout to that broker repository.
 
 Broker setup uses one-time owner bootstrap tokens. The deployed broker stores a
 token hash, not a readable token, and marks the bootstrap as used after the
@@ -529,9 +564,8 @@ Run the local broker integration suite:
 ./testsuite/run-local-broker.sh aws
 ```
 
-The integration suite uses local SQLite-backed broker runtimes, local object
-storage, and fake provider clients for GCP and AWS. It does not require cloud
-credentials or deployed brokers.
+The integration suite uses local object storage and fake provider clients for
+GCP and AWS. It does not require cloud credentials or deployed brokers.
 
 ## Requirements
 

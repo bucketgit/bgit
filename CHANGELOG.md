@@ -4,6 +4,16 @@ All notable changes to `bgit` are documented in this file.
 
 This project follows semantic versioning.
 
+## 1.2.2
+
+Added
+
+- Added Go-native local broker support with repository-backed metadata,
+  filesystem-backed `file://` repositories, and AWS/GCP-backed `s3://` or
+  `gs://` repositories behind the normal broker authorization model.
+- Added storage-backed local broker ref safeguards with per-ref state records
+  and short leases before ref materialization.
+
 ## 1.2.1
 
 Fixed

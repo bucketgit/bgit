@@ -18,6 +18,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"golang.org/x/crypto/ssh"
 )
 
 type brokerProfile struct {
@@ -766,10 +768,11 @@ func brokerAdminRepoCreateCommand(cfg config, args []string, stdout io.Writer) e
 	if err != nil {
 		return err
 	}
-	repo, err := brokerRepoForAdminTarget(cfg, repoName, teamID)
+	repo, err := brokerRepoForAdminCreateTarget(cfg, brokerURL, repoName, teamID)
 	if err != nil {
 		return err
 	}
+	repo.TeamName = team
 	req := brokerRepoAdminRequest{Repo: repo, Role: role}
 	if err := brokerPost(brokerURL, "/repos/create", req, nil); err != nil {
 		return err
@@ -824,6 +827,9 @@ func brokerInitCommand(args []string, stdin io.Reader, stdout io.Writer) error {
 	if !opts.noninteractive {
 		opts.interactive = true
 	}
+	if _, _, _, _, ok := storageTargetParts(repoName); ok && opts.brokerURL == "" {
+		return brokerInitWithEphemeralLocalBroker(opts, repoName, stdout)
+	}
 	var interactiveReader *bufio.Reader
 	if opts.interactive {
 		if reader, ok := stdin.(*bufio.Reader); ok {
@@ -839,7 +845,7 @@ func brokerInitCommand(args []string, stdin io.Reader, stdout io.Writer) error {
 		if strings.TrimSpace(repoName) == "" {
 			return errors.New("init --noninteractive requires --repo NAME")
 		}
-		if strings.TrimSpace(opts.team) == "" {
+		if !brokerInitProfileIsLocal(opts.profile) && strings.TrimSpace(opts.team) == "" {
 			return errors.New("init --noninteractive requires --team TEAM")
 		}
 	}
@@ -848,6 +854,7 @@ func brokerInitCommand(args []string, stdin io.Reader, stdout io.Writer) error {
 		return err
 	}
 	profiles := brokerProfilesFromGlobalConfig(global)
+	profiles = brokerInitProfilesWithLocal(profiles)
 	if len(profiles) == 0 && opts.interactive {
 		fmt.Fprint(stdout, "No broker profiles found. Run bgit setup now? [y/N] ")
 		answer, _ := interactiveReader.ReadString('\n')
@@ -864,6 +871,7 @@ func brokerInitCommand(args []string, stdin io.Reader, stdout io.Writer) error {
 				return err
 			}
 			profiles = brokerProfilesFromGlobalConfig(global)
+			profiles = brokerInitProfilesWithLocal(profiles)
 		}
 	}
 	if len(profiles) == 0 {
@@ -920,6 +928,23 @@ func brokerInitCommand(args []string, stdin io.Reader, stdout io.Writer) error {
 	if err != nil {
 		return err
 	}
+	if profile.Provider == "local" {
+		if strings.TrimSpace(repoName) == "" {
+			if opts.interactive {
+				var storageRegion string
+				repoName, storageRegion, err = brokerInitPromptLocalStorage(interactiveReader, stdin, stdout, opts)
+				if err != nil {
+					return err
+				}
+				if strings.TrimSpace(opts.region) == "" {
+					opts.region = storageRegion
+				}
+			} else {
+				return errors.New("init with local broker requires s3://, gs://, file://, or a repository name")
+			}
+		}
+		return brokerInitWithLocalProfile(opts, repoName, profile, global, path, identityName, identityEmail, stdout)
+	}
 	teamID := strings.TrimSpace(opts.team)
 	if opts.interactive && teamID == "" {
 		teamID, err = brokerInitSelectTeam(interactiveReader, stdin, stdout, profile)
@@ -941,11 +966,7 @@ func brokerInitCommand(args []string, stdin io.Reader, stdout io.Writer) error {
 			return err
 		}
 	} else if strings.TrimSpace(repoName) == "" {
-		wd, err := os.Getwd()
-		if err != nil {
-			return err
-		}
-		repoName = filepath.Base(wd) + ".git"
+		return errors.New("init requires a repository name")
 	}
 	if identityName == "" && identityEmail == "" {
 		identity := initDialogInitialState(target, global, repoName, opts.profile)
@@ -959,6 +980,9 @@ func brokerCloneCommand(args []string, stdin io.Reader, stdout io.Writer) error 
 	opts, repoName, err := parseBrokerInitArgs(args)
 	if err != nil {
 		return err
+	}
+	if _, _, _, _, ok := storageTargetParts(repoName); ok && opts.brokerURL == "" {
+		return brokerCloneWithEphemeralLocalBroker(opts, repoName, stdout)
 	}
 	discoveredTeamID := ""
 	if opts.brokerURL == "" {
@@ -1023,10 +1047,471 @@ func brokerCloneCommand(args []string, stdin io.Reader, stdout io.Writer) error 
 	return brokerCloneWithProfile(opts, repoName, profile, stdout)
 }
 
+func brokerCloneWithEphemeralLocalBroker(opts brokerInitOptions, repoName string, stdout io.Writer) error {
+	global, path, err := loadGlobalConfigForInit(opts.configPath)
+	if err != nil {
+		return err
+	}
+	profile, region, managed, err := startDefaultLocalBroker(global)
+	if err != nil {
+		return err
+	}
+	defer managed.Close()
+	global = upsertGlobalLocalProfile(global, globalLocalProfile{
+		Name:      profile.Name,
+		Root:      profile.Root,
+		Autostart: true,
+		Regions:   []globalProfileRegion{region},
+	})
+	if err := writeGlobalConfig(path, global); err != nil {
+		return err
+	}
+	keys := defaultOwnerPublicKeys()
+	profileName, regionName := storageProfileRegionFromOptions(repoName, opts.profile, opts.region)
+	repo, err := localBrokerRepoForTarget(config{provider: "local", brokerURL: managed.URL, gcloudConfiguration: profileName, region: regionName}, repoName, coreTeamID)
+	if err != nil {
+		return err
+	}
+	repo, err = prepareLocalBrokerRepository(managed.URL, managed.BootstrapToken, repo, keys)
+	if err != nil {
+		return err
+	}
+	cloneProfile := brokerProfile{Provider: "local", Name: profile.Name, Region: region.Name, QualifiedName: "local:" + profile.Name + "/" + region.Name, BrokerURL: managed.URL, TeamID: coreTeamID}
+	target := opts.directory
+	if target == "" {
+		target = strings.TrimSuffix(filepath.Base(strings.Trim(repo.Logical, "/")), ".git")
+	}
+	if err := ensureCloneDestinationAvailable(target); err != nil {
+		return err
+	}
+	if err := initBrokerWorktreeWithLocalRepo(target, repo, cloneProfile, "", "", io.Discard); err != nil {
+		return err
+	}
+	if _, err := runGit(target, "fetch", "origin"); err != nil {
+		return err
+	}
+	if _, err := runGit(target, "checkout", "--quiet", "-B", defaultBranch, "origin/"+defaultBranch); err != nil {
+		_, _ = runGit(target, "checkout", "--quiet", "-B", defaultBranch)
+	}
+	fmt.Fprintf(stdout, "Cloned %s into '%s'\n", repo.Logical, target)
+	return nil
+}
+
+func startDefaultLocalBroker(global globalConfig) (globalLocalProfile, globalProfileRegion, *managedLocalBroker, error) {
+	profile := ensureDefaultLocalProfile(global)
+	region := ensureDefaultLocalRegion(profile)
+	managed, err := ensureManagedLocalBroker(context.Background(), profile, region)
+	if err != nil {
+		return globalLocalProfile{}, globalProfileRegion{}, nil, err
+	}
+	profile.Root = managed.Root
+	region.BrokerURL = managed.URL
+	region.BrokerVersion = brokerVersion()
+	region.LastSetupAt = time.Now().UTC().Format(time.RFC3339)
+	return profile, region, managed, nil
+}
+
+func prepareLocalBrokerRepository(brokerURL, bootstrapToken string, repo brokerRepo, keys []string) (brokerRepo, error) {
+	if len(keys) == 0 {
+		return brokerRepo{}, errors.New("local broker requires at least one local SSH public key")
+	}
+	if err := brokerUpsertOwners(brokerURL, bootstrapToken, keys); err != nil {
+		return brokerRepo{}, err
+	}
+	if err := brokerEnsureCoreTeam(brokerURL); err != nil {
+		return brokerRepo{}, err
+	}
+	repo.TeamName = coreTeamName
+	var resp struct {
+		Repo brokerRepo `json:"repo"`
+	}
+	err := brokerPost(brokerURL, "/repos/create", brokerRepoAdminRequest{Repo: repo, Role: "developer", User: "owner", PublicKeys: keys}, &resp)
+	if err == nil {
+		if strings.TrimSpace(resp.Repo.Logical) != "" {
+			return resp.Repo, nil
+		}
+		return repo, nil
+	}
+	if !strings.Contains(err.Error(), "already exists") {
+		return brokerRepo{}, err
+	}
+	if getErr := brokerPost(brokerURL, "/repos/get", brokerRepoRequest{Repo: repo}, &resp); getErr != nil {
+		return brokerRepo{}, err
+	}
+	if strings.TrimSpace(resp.Repo.Logical) != "" {
+		if !localBrokerStorageCompatible(repo, resp.Repo) {
+			return brokerRepo{}, fmt.Errorf("repository %s already exists with %s storage; requested %s storage", resp.Repo.Logical, localBrokerStorageDescription(resp.Repo), localBrokerStorageDescription(repo))
+		}
+		return resp.Repo, nil
+	}
+	return repo, nil
+}
+
+func brokerInitWithEphemeralLocalBroker(opts brokerInitOptions, repoName string, stdout io.Writer) error {
+	global, path, err := loadGlobalConfigForInit(opts.configPath)
+	if err != nil {
+		return err
+	}
+	profile := brokerInitLocalProfile(global)
+	return brokerInitWithLocalProfile(opts, repoName, profile, global, path, "", "", stdout)
+}
+
+func brokerInitWithLocalProfile(opts brokerInitOptions, repoName string, profile brokerProfile, global globalConfig, path, identityName, identityEmail string, stdout io.Writer) error {
+	localProfile := ensureDefaultLocalProfile(global)
+	if profile.Name != "" {
+		localProfile.Name = profile.Name
+	}
+	localRegion := ensureDefaultLocalRegion(localProfile)
+	if profile.Region != "" {
+		localRegion.Name = profile.Region
+	}
+	managed, err := ensureManagedLocalBroker(context.Background(), localProfile, localRegion)
+	if err != nil {
+		return err
+	}
+	defer managed.Close()
+	localProfile.Root = managed.Root
+	localRegion.BrokerURL = managed.URL
+	localRegion.BrokerVersion = brokerVersion()
+	localRegion.LastSetupAt = time.Now().UTC().Format(time.RFC3339)
+	global = upsertGlobalLocalProfile(global, globalLocalProfile{
+		Name:      localProfile.Name,
+		Root:      localProfile.Root,
+		Autostart: true,
+		Regions:   []globalProfileRegion{localRegion},
+	})
+	if err := writeGlobalConfig(path, global); err != nil {
+		return err
+	}
+	keys := defaultOwnerPublicKeys()
+	profileName, regionName := storageProfileRegionFromOptions(repoName, opts.profile, opts.region)
+	repo, err := localBrokerRepoForTarget(config{provider: "local", brokerURL: managed.URL, gcloudConfiguration: profileName, region: regionName}, repoName, coreTeamID)
+	if err != nil {
+		return err
+	}
+	repo, err = prepareLocalBrokerRepository(managed.URL, managed.BootstrapToken, repo, keys)
+	if err != nil {
+		return err
+	}
+	initProfile := brokerProfile{
+		Provider:      "local",
+		Name:          localProfile.Name,
+		Region:        localRegion.Name,
+		QualifiedName: "local:" + localProfile.Name + "/" + localRegion.Name,
+		BrokerURL:     managed.URL,
+		TeamID:        coreTeamID,
+	}
+	return initBrokerWorktreeWithLocalRepo(firstNonEmpty(opts.directory, "."), repo, initProfile, identityName, identityEmail, stdout)
+}
+
+func ensureDefaultLocalProfile(global globalConfig) globalLocalProfile {
+	for _, profile := range global.LocalProfiles {
+		if profile.Name == "default" {
+			return profile
+		}
+	}
+	home, err := os.UserHomeDir()
+	root := "~/.bgit/local-broker"
+	if err == nil {
+		root = filepath.Join(home, ".bgit", "local-broker")
+	}
+	return globalLocalProfile{Name: "default", Root: root, Autostart: true}
+}
+
+func ensureDefaultLocalRegion(profile globalLocalProfile) globalProfileRegion {
+	for _, region := range profile.Regions {
+		if region.Name == "default" {
+			return region
+		}
+	}
+	if len(profile.Regions) > 0 {
+		return profile.Regions[0]
+	}
+	return globalProfileRegion{Name: "default"}
+}
+
+func defaultOwnerPublicKeys() []string {
+	var out []string
+	for _, signer := range explicitBrokerSigners() {
+		out = append(out, strings.TrimSpace(string(ssh.MarshalAuthorizedKey(signer.PublicKey()))))
+	}
+	keys, err := discoverSetupSSHKeys(setupSSHKeyOptions{})
+	if err != nil {
+		return uniqueStrings(out)
+	}
+	for _, key := range keys {
+		out = append(out, key.PublicKey)
+	}
+	return uniqueStrings(out)
+}
+
+func brokerRepoForAdminCreateTarget(cfg config, brokerURL, repoName, teamID string) (brokerRepo, error) {
+	if cfg.provider == "local" {
+		local := cfg
+		local.brokerURL = firstNonEmpty(strings.TrimSpace(local.brokerURL), strings.TrimSpace(brokerURL))
+		return localBrokerRepoForTarget(local, repoName, teamID)
+	}
+	return brokerRepoForAdminTarget(cfg, repoName, teamID)
+}
+
+func localBrokerRepoForTarget(cfg config, repoName, teamID string) (brokerRepo, error) {
+	raw := strings.TrimSpace(repoName)
+	scheme, _, _, _, ok := storageTargetParts(raw)
+	if !ok || scheme == "" {
+		return brokerRepoForAdminTarget(cfg, repoName, teamID)
+	}
+	logical, err := logicalRepoFromStorageTarget(raw)
+	if err != nil {
+		return brokerRepo{}, err
+	}
+	storageProvider := mapLocalStorageSchemeToProvider(scheme)
+	storageProfile := ""
+	storageRegion := ""
+	physical := raw
+	if scheme == "s3" || scheme == "gs" {
+		physical, storageProvider, storageProfile, storageRegion, err = deterministicLocalBrokerCloudStorageTarget(context.Background(), cfg, raw, logical)
+		if err != nil {
+			return brokerRepo{}, err
+		}
+	}
+	local := cfg
+	local.logicalRepo = logical
+	local.prefix = ""
+	local.bucket = physical
+	local.origin = "git@" + defaultSSHHost + ":" + logical
+	local.provider = "local"
+	local.storageProvider = storageProvider
+	local.storageProfile = storageProfile
+	local.storageRegion = storageRegion
+	if strings.TrimSpace(teamID) != "" {
+		local.teamID = strings.TrimSpace(teamID)
+	}
+	return repoForBroker(local), nil
+}
+
+var localBrokerCloudIdentity = localBrokerCloudIdentityFromConfig
+
+func deterministicLocalBrokerCloudStorageTarget(ctx context.Context, cfg config, target, logical string) (bucket, provider, profile, region string, err error) {
+	scheme, _, _, _, ok := storageTargetParts(target)
+	if !ok || (scheme != "s3" && scheme != "gs") {
+		return target, mapLocalStorageSchemeToProvider(scheme), profile, region, nil
+	}
+	profile = firstNonEmpty(strings.TrimSpace(cfg.gcloudConfiguration), "default")
+	if scheme == "s3" {
+		region = firstNonEmpty(strings.TrimSpace(cfg.region), "us-east-1")
+	} else {
+		region = firstNonEmpty(strings.TrimSpace(cfg.region), "us-central1")
+	}
+	owner, err := localBrokerCloudIdentity(ctx, scheme, profile)
+	if err != nil {
+		return "", "", "", "", err
+	}
+	bucket, err = deterministicLocalBrokerCloudBucketName(owner, logical)
+	if err != nil {
+		return "", "", "", "", err
+	}
+	return bucket, mapLocalStorageSchemeToProvider(scheme), profile, region, nil
+}
+
+func localBrokerCloudIdentityFromConfig(ctx context.Context, scheme, profile string) (string, error) {
+	_ = ctx
+	path, err := defaultGlobalConfigPath()
+	if err != nil {
+		return "", err
+	}
+	global, err := readGlobalConfig(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			global = globalConfig{Version: globalConfigVersion}
+		} else {
+			return "", fmt.Errorf("read bgit config for local broker cloud identity: %w", err)
+		}
+	}
+	profile = firstNonEmpty(strings.TrimSpace(profile), "default")
+	switch scheme {
+	case "s3":
+		for _, candidate := range global.AWSProfiles {
+			if candidate.Name != profile {
+				continue
+			}
+			if accountID := strings.TrimSpace(candidate.AccountID); accountID != "" {
+				return accountID, nil
+			}
+			return localBrokerImportCloudIdentity(ctx, scheme, profile, global, path)
+		}
+		return localBrokerImportCloudIdentity(ctx, scheme, profile, global, path)
+	case "gs":
+		for _, candidate := range global.GCPProfiles {
+			if candidate.Name != profile {
+				continue
+			}
+			if projectID := strings.TrimSpace(candidate.ProjectID); projectID != "" {
+				return projectID, nil
+			}
+			return localBrokerImportCloudIdentity(ctx, scheme, profile, global, path)
+		}
+		return localBrokerImportCloudIdentity(ctx, scheme, profile, global, path)
+	}
+	return "", fmt.Errorf("unsupported local broker cloud scheme %q", scheme)
+}
+
+func localBrokerImportCloudIdentity(ctx context.Context, scheme, profile string, global globalConfig, path string) (string, error) {
+	profile = firstNonEmpty(strings.TrimSpace(profile), "default")
+	if global.Version == 0 {
+		global.Version = globalConfigVersion
+	}
+	switch scheme {
+	case "s3":
+		accountID, arn := awsCallerIdentity(ctx, profile)
+		if accountID == "" {
+			return "", fmt.Errorf("AWS profile %q has no cached account id; configure or refresh it with `bgit setup profile create --provider aws %s`, or verify `aws sts get-caller-identity --profile %s`", profile, profile, profile)
+		}
+		global = upsertGlobalAWSProfile(global, globalAWSProfile{
+			Name:      profile,
+			AccountID: accountID,
+			ARN:       arn,
+			Regions:   []globalProfileRegion{{Name: firstNonEmpty(configuredAWSProfileRegion(profile), "us-east-1")}},
+		})
+		if err := writeGlobalConfig(path, global); err != nil {
+			return "", err
+		}
+		return accountID, nil
+	case "gs":
+		projectID := gcloudConfigValue(ctx, profile, "project")
+		if projectID == "" {
+			return "", fmt.Errorf("GCP profile %q has no cached project id; configure or refresh it with `bgit setup profile create --provider gcp %s`, or run `gcloud config set project PROJECT --configuration %s`", profile, profile, profile)
+		}
+		global = upsertGlobalGCPProfile(global, globalGCPProfile{
+			Name:      profile,
+			ProjectID: projectID,
+			Account:   gcloudConfigValue(ctx, profile, "account"),
+			Regions:   []globalProfileRegion{{Name: firstNonEmpty(gcloudConfigValue(ctx, profile, "run/region"), gcloudConfigValue(ctx, profile, "functions/region"), "us-central1")}},
+		})
+		if err := writeGlobalConfig(path, global); err != nil {
+			return "", err
+		}
+		return projectID, nil
+	default:
+		return "", fmt.Errorf("unsupported local broker cloud scheme %q", scheme)
+	}
+}
+
+func deterministicLocalBrokerCloudBucketName(owner, logical string) (string, error) {
+	owner = sanitizeBucketLabel(owner)
+	if owner == "" {
+		return "", errors.New("cloud account or project id is required for local broker bucket naming")
+	}
+	base := sanitizeBucketLabel(strings.TrimSuffix(strings.TrimSpace(logical), ".git"))
+	if base == "" {
+		return "", errors.New("repository name is required for local broker bucket naming")
+	}
+	maxBase := 63 - len(owner) - 1
+	if len(base) > maxBase {
+		base = strings.Trim(base[:maxBase], "-")
+	}
+	if base == "" {
+		return "", fmt.Errorf("cloud account or project id %q leaves no room for repository name in bucket", owner)
+	}
+	return owner + "-" + base, nil
+}
+
+func sanitizeBucketLabel(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	var b strings.Builder
+	lastDash := false
+	for _, r := range value {
+		ok := (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9')
+		if ok {
+			b.WriteRune(r)
+			lastDash = false
+			continue
+		}
+		if !lastDash {
+			b.WriteByte('-')
+			lastDash = true
+		}
+	}
+	return strings.Trim(b.String(), "-")
+}
+
+func mapLocalStorageSchemeToProvider(scheme string) string {
+	switch scheme {
+	case "gs":
+		return "gcs"
+	case "s3", "file":
+		return scheme
+	default:
+		return "file"
+	}
+}
+
+func localBrokerStorageCompatible(requested, existing brokerRepo) bool {
+	requested = normalizeLocalBrokerStorageRepo(requested)
+	existing = normalizeLocalBrokerStorageRepo(existing)
+	if requested.Provider == "" || existing.Provider == "" {
+		return true
+	}
+	if requested.Provider != existing.Provider {
+		return false
+	}
+	switch requested.Provider {
+	case "s3", "gcs":
+		if strings.TrimSpace(requested.Bucket) != "" && strings.TrimSpace(existing.Bucket) != "" && requested.Bucket != existing.Bucket {
+			return false
+		}
+		return firstNonEmpty(requested.Profile, "default") == firstNonEmpty(existing.Profile, "default") &&
+			localBrokerDefaultRegion(requested.Provider, requested.Region) == localBrokerDefaultRegion(existing.Provider, existing.Region)
+	case "file":
+		return true
+	default:
+		return strings.TrimSpace(requested.Bucket) == "" || strings.TrimSpace(existing.Bucket) == "" || requested.Bucket == existing.Bucket
+	}
+}
+
+func normalizeLocalBrokerStorageRepo(repo brokerRepo) brokerRepo {
+	if cfg, ok, _ := localBrokerCloudConfig(repo.Bucket); ok {
+		repo.Provider = cfg.provider
+		repo.Bucket = cfg.bucket
+		repo.Profile = cfg.gcloudConfiguration
+		repo.Region = cfg.region
+	}
+	if repo.Provider == "local" {
+		repo.Provider = "file"
+	}
+	return repo
+}
+
+func localBrokerDefaultRegion(provider, region string) string {
+	if strings.TrimSpace(region) != "" {
+		return strings.TrimSpace(region)
+	}
+	if provider == "gcs" {
+		return "us-central1"
+	}
+	return "us-east-1"
+}
+
+func localBrokerStorageDescription(repo brokerRepo) string {
+	repo = normalizeLocalBrokerStorageRepo(repo)
+	switch repo.Provider {
+	case "s3":
+		return fmt.Sprintf("s3 profile %s region %s", firstNonEmpty(repo.Profile, "default"), localBrokerDefaultRegion(repo.Provider, repo.Region))
+	case "gcs":
+		return fmt.Sprintf("gcs profile %s region %s", firstNonEmpty(repo.Profile, "default"), localBrokerDefaultRegion(repo.Provider, repo.Region))
+	case "file":
+		return "file"
+	default:
+		return firstNonEmpty(repo.Provider, "unknown")
+	}
+}
+
 func brokerCloneWithProfile(opts brokerInitOptions, repoName string, profile brokerProfile, stdout io.Writer) error {
 	target := opts.directory
 	if target == "" {
 		target = strings.TrimSuffix(filepath.Base(strings.Trim(repoName, "/")), ".git")
+	}
+	if err := ensureCloneDestinationAvailable(target); err != nil {
+		return err
 	}
 	if strings.TrimSpace(profile.TeamID) == "" {
 		profile.TeamID = coreTeamID
@@ -1623,6 +2108,9 @@ func parseCancelInviteTarget(cfg config, args []string) (string, string, string,
 }
 
 func brokerRepoForAdminTarget(cfg config, repoName, teamID string) (brokerRepo, error) {
+	if repo, ok, err := brokerRepoForStorageTarget(cfg, repoName, teamID); ok || err != nil {
+		return repo, err
+	}
 	logical, err := normalizeLogicalRepoName(repoName)
 	if err != nil {
 		return brokerRepo{}, err
@@ -1636,6 +2124,141 @@ func brokerRepoForAdminTarget(cfg config, repoName, teamID string) (brokerRepo, 
 		local.teamID = strings.TrimSpace(teamID)
 	}
 	return repoForBroker(local), nil
+}
+
+func brokerRepoForStorageTarget(cfg config, repoName, teamID string) (brokerRepo, bool, error) {
+	raw := strings.TrimSpace(repoName)
+	scheme := ""
+	switch {
+	case strings.HasPrefix(raw, "s3://"):
+		scheme = "s3"
+	case strings.HasPrefix(raw, "gs://"):
+		scheme = "gcs"
+	case strings.HasPrefix(raw, "file://"):
+		scheme = "file"
+	default:
+		return brokerRepo{}, false, nil
+	}
+	logical, err := logicalRepoFromStorageTarget(raw)
+	if err != nil {
+		return brokerRepo{}, true, err
+	}
+	local := cfg
+	local.logicalRepo = logical
+	local.prefix = ""
+	local.bucket = raw
+	local.origin = "git@" + defaultSSHHost + ":" + logical
+	local.provider = scheme
+	if strings.TrimSpace(teamID) != "" {
+		local.teamID = strings.TrimSpace(teamID)
+	}
+	return repoForBroker(local), true, nil
+}
+
+func logicalRepoFromStorageTarget(target string) (string, error) {
+	_, _, _, bucket, ok := storageTargetParts(target)
+	if !ok || bucket == "" {
+		return "", errors.New("storage repository URI must include a bucket name")
+	}
+	return normalizeLogicalRepoName(bucket)
+}
+
+func storageTargetParts(target string) (scheme, profile, region, bucket string, ok bool) {
+	raw := strings.TrimSpace(target)
+	switch {
+	case strings.HasPrefix(raw, "s3://"):
+		scheme = "s3"
+		raw = strings.TrimPrefix(raw, "s3://")
+	case strings.HasPrefix(raw, "gs://"):
+		scheme = "gs"
+		raw = strings.TrimPrefix(raw, "gs://")
+	case strings.HasPrefix(raw, "file://"):
+		scheme = "file"
+		raw = strings.TrimPrefix(raw, "file://")
+	default:
+		return "", "", "", "", false
+	}
+	if slash := strings.Index(raw, "/"); slash >= 0 {
+		if scheme == "s3" || scheme == "gs" {
+			return scheme, "", "", "", true
+		}
+		raw = raw[:slash]
+	}
+	raw = strings.TrimSuffix(raw, ".git")
+	parts := strings.Split(raw, ".")
+	labels := parts[:0]
+	for _, part := range parts {
+		if strings.TrimSpace(part) != "" {
+			labels = append(labels, strings.TrimSpace(part))
+		}
+	}
+	if len(labels) == 0 {
+		return scheme, "", "", "", true
+	}
+	return scheme, "", "", strings.Join(labels, "."), true
+}
+
+func storageProfileRegionFromOptions(target, selectedProfile, selectedRegion string) (string, string) {
+	scheme, _, _, _, ok := storageTargetParts(target)
+	if !ok || (scheme != "s3" && scheme != "gs") {
+		return "", ""
+	}
+	profile, region := splitProfileRegionOption(scheme, selectedProfile, selectedRegion)
+	profile = firstNonEmpty(profile, "default")
+	if scheme == "s3" {
+		region = firstNonEmpty(region, "us-east-1")
+	} else {
+		region = firstNonEmpty(region, "us-central1")
+	}
+	return profile, region
+}
+
+func splitProfileRegionOption(scheme, profile, region string) (string, string) {
+	profile = strings.TrimSpace(profile)
+	region = strings.TrimSpace(region)
+	if profile == "local" || strings.HasPrefix(profile, "local:") {
+		return "", region
+	}
+	for _, prefix := range []string{"aws:", "s3:", "gcp:", "gcs:", "gs:"} {
+		if strings.HasPrefix(profile, prefix) {
+			profile = strings.TrimPrefix(profile, prefix)
+			break
+		}
+	}
+	if strings.Contains(profile, "/") {
+		parts := strings.SplitN(profile, "/", 2)
+		profile = strings.TrimSpace(parts[0])
+		if region == "" {
+			region = strings.TrimSpace(parts[1])
+		}
+	} else if region == "" {
+		parts := strings.Split(profile, ".")
+		if len(parts) >= 2 {
+			candidate := parts[len(parts)-1]
+			if scheme == "s3" && setupAWSRegionPattern.MatchString(candidate) || scheme == "gs" && looksLikeGCPRegion(candidate) {
+				profile = strings.Join(parts[:len(parts)-1], ".")
+				region = candidate
+			}
+		}
+	}
+	return strings.TrimSpace(profile), strings.TrimSpace(region)
+}
+
+func looksLikeGCPRegion(value string) bool {
+	parts := strings.Split(value, "-")
+	if len(parts) != 2 && len(parts) != 3 {
+		return false
+	}
+	last := parts[len(parts)-1]
+	if last == "" {
+		return false
+	}
+	for _, r := range last {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 func parseInviteCode(code string) (ownerTransferCodePayload, error) {
@@ -2875,6 +3498,15 @@ func brokerProfilesFromGlobalConfig(cfg globalConfig) []brokerProfile {
 			profiles = append(profiles, brokerProfile{Provider: "s3", Name: profile.Name, Region: region.Name, QualifiedName: name, BrokerURL: region.BrokerURL})
 		}
 	}
+	for _, profile := range cfg.LocalProfiles {
+		for _, region := range profile.Regions {
+			if strings.TrimSpace(region.BrokerURL) == "" {
+				continue
+			}
+			name := "local:" + profile.Name + "/" + region.Name
+			profiles = append(profiles, brokerProfile{Provider: "local", Name: profile.Name, Region: region.Name, QualifiedName: name, BrokerURL: region.BrokerURL})
+		}
+	}
 	return profiles
 }
 
@@ -2940,6 +3572,9 @@ func providerProfileName(provider string) string {
 	if provider == "s3" {
 		return "aws"
 	}
+	if provider == "local" {
+		return "local"
+	}
 	return "gcp"
 }
 
@@ -2989,6 +3624,125 @@ func brokerInitSelectProfile(reader *bufio.Reader, rawInput io.Reader, stdout io
 		return "", errors.New("init canceled")
 	}
 	return value, nil
+}
+
+func brokerInitProfilesWithLocal(profiles []brokerProfile) []brokerProfile {
+	out := append([]brokerProfile{}, profiles...)
+	for _, profile := range out {
+		if profile.Provider == "local" {
+			return out
+		}
+	}
+	out = append(out, brokerInitLocalProfile(globalConfig{}))
+	return out
+}
+
+func brokerInitLocalProfile(global globalConfig) brokerProfile {
+	profile := ensureDefaultLocalProfile(global)
+	region := ensureDefaultLocalRegion(profile)
+	return brokerProfile{
+		Provider:      "local",
+		Name:          firstNonEmpty(profile.Name, "default"),
+		Region:        firstNonEmpty(region.Name, "default"),
+		QualifiedName: "local broker",
+		BrokerURL:     region.BrokerURL,
+		TeamID:        coreTeamID,
+	}
+}
+
+func brokerInitProfileIsLocal(profile string) bool {
+	profile = strings.TrimSpace(strings.ToLower(profile))
+	return profile == "local" || profile == "local broker" || strings.HasPrefix(profile, "local:")
+}
+
+func brokerInitPromptLocalStorage(reader *bufio.Reader, rawInput io.Reader, stdout io.Writer, opts brokerInitOptions) (string, string, error) {
+	fields, ok, err := runSetupTextFormWithRaw(reader, rawInput, stdout, "Create local broker repository", []setupTextField{{Label: "Repository", Required: true}})
+	if err != nil {
+		return "", "", err
+	}
+	if !ok || len(fields) == 0 || strings.TrimSpace(fields[0]) == "" {
+		return "", "", errors.New("init canceled")
+	}
+	repoName := strings.TrimSpace(fields[0])
+	choices := []setupChoice{
+		{Label: "local filesystem", Value: "file", Help: "store under the local broker object root"},
+		{Label: "AWS S3", Value: "s3", Help: "store in an account-scoped S3 bucket"},
+		{Label: "GCS", Value: "gs", Help: "store in a project-scoped GCS bucket"},
+	}
+	storage, ok, err := runSetupSelectWithRaw(reader, rawInput, stdout, "Select local broker storage", choices, choices[0].Value)
+	if err != nil {
+		return "", "", err
+	}
+	if !ok || strings.TrimSpace(storage) == "" {
+		return "", "", errors.New("init canceled")
+	}
+	logical, err := normalizeLogicalRepoName(repoName)
+	if err != nil {
+		return "", "", err
+	}
+	switch storage {
+	case "file":
+		return "file://" + logical, "", nil
+	case "s3":
+		region, err := brokerInitPromptStorageRegion(reader, rawInput, stdout, "AWS", "s3", opts)
+		if err != nil {
+			return "", "", err
+		}
+		return "s3://" + logical, region, nil
+	case "gs":
+		region, err := brokerInitPromptStorageRegion(reader, rawInput, stdout, "GCP", "gs", opts)
+		if err != nil {
+			return "", "", err
+		}
+		return "gs://" + logical, region, nil
+	default:
+		return "", "", fmt.Errorf("unsupported local broker storage %q", storage)
+	}
+}
+
+func brokerInitPromptStorageRegion(reader *bufio.Reader, rawInput io.Reader, stdout io.Writer, label, scheme string, opts brokerInitOptions) (string, error) {
+	_, explicitRegion := splitProfileRegionOption(scheme, opts.profile, opts.region)
+	if strings.TrimSpace(explicitRegion) != "" {
+		return explicitRegion, nil
+	}
+	defaultRegion := "us-east-1"
+	regions := awsSetupRegions
+	if scheme == "gs" {
+		defaultRegion = "us-central1"
+		regions = gcpSetupRegions(defaultRegion)
+	} else if profile, _ := splitProfileRegionOption(scheme, opts.profile, ""); profile != "" {
+		defaultRegion = firstNonEmpty(configuredAWSProfileRegion(profile), defaultRegion)
+	}
+	choices := setupRegionChoices(defaultRegion, regions)
+	region, ok, err := runSetupSelectWithRaw(reader, rawInput, stdout, "Select "+label+" region", choices, defaultRegion)
+	if err != nil {
+		return "", err
+	}
+	if !ok || strings.TrimSpace(region) == "" {
+		return "", errors.New("init canceled")
+	}
+	return region, nil
+}
+
+func setupRegionChoices(defaultRegion string, regions []string) []setupChoice {
+	seen := map[string]struct{}{}
+	var choices []setupChoice
+	add := func(region, help string) {
+		region = strings.TrimSpace(region)
+		if region == "" {
+			return
+		}
+		if _, ok := seen[region]; ok {
+			return
+		}
+		seen[region] = struct{}{}
+		choices = append(choices, setupChoice{Label: region, Value: region, Help: help})
+	}
+	add(defaultRegion, "default")
+	for _, region := range regions {
+		add(region, "")
+	}
+	return choices
 }
 
 func brokerInitSelectTeam(reader *bufio.Reader, rawInput io.Reader, stdout io.Writer, profile brokerProfile) (string, error) {
@@ -3124,8 +3878,8 @@ func runInitDialogWithRaw(reader *bufio.Reader, rawInput io.Reader, stdout io.Wr
 	defer restore()
 	selectedProfile := initDialogSelectedProfile(profiles, initial.ProfileName)
 	state := initDialogState{
-		repoName:             firstNonEmpty(strings.TrimSpace(initial.RepoName), defaultInitRepoName()),
-		initialRepoName:      firstNonEmpty(strings.TrimSpace(initial.RepoName), defaultInitRepoName()),
+		repoName:             strings.TrimSpace(initial.RepoName),
+		initialRepoName:      strings.TrimSpace(initial.RepoName),
 		profileName:          strings.TrimSpace(initial.ProfileName),
 		initialProfileName:   strings.TrimSpace(initial.ProfileName),
 		identityName:         firstNonEmpty(strings.TrimSpace(initial.IdentityName), defaultBucketGitIdentityName),
@@ -3222,21 +3976,6 @@ func runInitDialogWithRaw(reader *bufio.Reader, rawInput io.Reader, stdout io.Wr
 	}
 }
 
-func defaultInitRepoName() string {
-	wd, err := os.Getwd()
-	if err != nil {
-		return "repo.git"
-	}
-	name := strings.TrimSpace(filepath.Base(wd))
-	if name == "" || name == "." || name == string(filepath.Separator) {
-		return "repo.git"
-	}
-	if !strings.HasSuffix(name, ".git") {
-		name += ".git"
-	}
-	return name
-}
-
 func logicalRepoWithGit(name string) string {
 	logical, err := normalizeLogicalRepoName(name)
 	if err != nil {
@@ -3266,7 +4005,7 @@ func logicalRepoDisplayName(name string) string {
 
 func initDialogInitialState(target string, global globalConfig, repoName, profileName string) initDialogConfig {
 	initial := initDialogConfig{
-		RepoName:      firstNonEmpty(strings.TrimSpace(repoName), defaultInitRepoName()),
+		RepoName:      strings.TrimSpace(repoName),
 		ProfileName:   strings.TrimSpace(profileName),
 		IdentityName:  firstNonEmpty(strings.TrimSpace(global.Identity.Name), defaultBucketGitIdentityName),
 		IdentityEmail: firstNonEmpty(strings.TrimSpace(global.Identity.Email), defaultBucketGitIdentityEmail()),
@@ -3579,19 +4318,31 @@ func parsePositiveInt(value string) int {
 }
 
 func initBrokerWorktree(target, repoName string, profile brokerProfile, identityName, identityEmail string, stdout io.Writer) error {
+	repoName, err := normalizeLogicalRepoName(repoName)
+	if err != nil {
+		return err
+	}
+	repo := brokerRepo{Provider: profile.Provider, Logical: repoName, Prefix: repoName, Origin: fmt.Sprintf("git@%s:%s", defaultSSHHost, repoName), TeamID: profile.TeamID}
+	return initBrokerWorktreeWithLocalRepo(target, repo, profile, identityName, identityEmail, stdout)
+}
+
+func initBrokerWorktreeWithLocalRepo(target string, repo brokerRepo, profile brokerProfile, identityName, identityEmail string, stdout io.Writer) error {
 	absTarget, err := filepath.Abs(target)
 	if err != nil {
 		return err
 	}
-	repoName, err = normalizeLogicalRepoName(repoName)
-	if err != nil {
-		return err
-	}
+	repoName := repo.Logical
 	if strings.TrimSpace(profile.TeamID) == "" {
 		return errors.New("init requires a selected team")
 	}
-	if err := brokerRequireExistingLogicalRepo(profile.BrokerURL, profile.Provider, repoName, profile.TeamID); err != nil {
-		return err
+	if profile.Provider == "local" {
+		if strings.TrimSpace(repoName) == "" {
+			return errors.New("local broker repository is missing a logical name")
+		}
+	} else {
+		if err := brokerRequireExistingLogicalRepo(profile.BrokerURL, profile.Provider, repoName, profile.TeamID); err != nil {
+			return err
+		}
 	}
 	if err := os.MkdirAll(absTarget, 0o755); err != nil {
 		return err
@@ -3609,7 +4360,16 @@ func initBrokerWorktree(target, repoName string, profile brokerProfile, identity
 		{"bucketgit.region", profile.Region},
 		{"bucketgit.provider", profile.Provider},
 		{"bucketgit.logicalRepo", repoName},
+		{"bucketgit.bucket", repo.Bucket},
+		{"bucketgit.prefix", firstNonEmpty(repo.Prefix, repoName)},
 		{"core.sshCommand", sshCommand},
+	}
+	if profile.Provider == "local" && repo.Provider != "" && repo.Provider != "local" && repo.Provider != "file" {
+		pairs = append(pairs,
+			[]string{"bucketgit.storageProvider", repo.Provider},
+			[]string{"bucketgit.storageProfile", repo.Profile},
+			[]string{"bucketgit.storageRegion", repo.Region},
+		)
 	}
 	if strings.TrimSpace(profile.TeamID) != "" {
 		pairs = append(pairs, []string{"bucketgit.team", strings.TrimSpace(profile.TeamID)})

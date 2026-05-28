@@ -90,6 +90,9 @@ func (s *brokerGitStore) objectCapability(ctx context.Context, objectPath, opera
 }
 
 func (s *brokerGitStore) getWithCapability(ctx context.Context, capability brokerObjectCapabilityResponse) ([]byte, error) {
+	if capability.Mode == "local" {
+		return localBrokerCapabilityRead(ctx, capability)
+	}
 	if capability.Mode == "sts" || capability.Provider == "s3" {
 		client := s3ClientForBrokerCapability(capability)
 		out, err := client.GetObject(ctx, &s3.GetObjectInput{
@@ -128,6 +131,9 @@ func (s *brokerGitStore) getWithCapability(ctx context.Context, capability broke
 }
 
 func (s *brokerGitStore) writeWithCapability(ctx context.Context, capability brokerObjectCapabilityResponse, data []byte) error {
+	if capability.Mode == "local" {
+		return localBrokerCapabilityWrite(ctx, capability, data)
+	}
 	if capability.Mode == "sts" || capability.Provider == "s3" {
 		client := s3ClientForBrokerCapability(capability)
 		_, err := client.PutObject(ctx, &s3.PutObjectInput{
@@ -158,6 +164,9 @@ func (s *brokerGitStore) writeWithCapability(ctx context.Context, capability bro
 }
 
 func (s *brokerGitStore) deleteWithCapability(ctx context.Context, capability brokerObjectCapabilityResponse) error {
+	if capability.Mode == "local" {
+		return localBrokerCapabilityDelete(ctx, capability)
+	}
 	if capability.Mode == "sts" || capability.Provider == "s3" {
 		client := s3ClientForBrokerCapability(capability)
 		_, err := client.DeleteObject(ctx, &s3.DeleteObjectInput{

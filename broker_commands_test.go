@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -92,6 +93,142 @@ func TestBrokerInitWritesBrokerGitConfig(t *testing.T) {
 	}
 }
 
+func TestLocalBrokerRepoForCloudTargetUsesAccountScopedBucket(t *testing.T) {
+	oldIdentity := localBrokerCloudIdentity
+	localBrokerCloudIdentity = func(ctx context.Context, scheme, profile string) (string, error) {
+		if scheme != "s3" || profile != "work" {
+			t.Fatalf("identity lookup = scheme %q profile %q", scheme, profile)
+		}
+		return "123456789012", nil
+	}
+	defer func() { localBrokerCloudIdentity = oldIdentity }()
+
+	repo, err := localBrokerRepoForTarget(config{provider: "local", brokerURL: "local://default/default", gcloudConfiguration: "work", region: "eu-west-1"}, "s3://my-local-repo7.git", coreTeamID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if repo.Bucket != "123456789012-my-local-repo7" {
+		t.Fatalf("bucket = %q", repo.Bucket)
+	}
+	if strings.HasSuffix(repo.Bucket, ".git") {
+		t.Fatalf("physical bucket should not be repo-shaped with .git suffix: %q", repo.Bucket)
+	}
+	if repo.Provider != "s3" || repo.Profile != "work" || repo.Region != "eu-west-1" {
+		t.Fatalf("storage = provider %q profile %q region %q", repo.Provider, repo.Profile, repo.Region)
+	}
+	if repo.Logical != "my-local-repo7.git" {
+		t.Fatalf("logical = %q", repo.Logical)
+	}
+}
+
+func TestDeterministicLocalBrokerCloudBucketNameTruncatesRepo(t *testing.T) {
+	got, err := deterministicLocalBrokerCloudBucketName("project-id", "this-is-a-very-long-repository-name-that-needs-to-fit-inside-a-bucket.git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) > 63 {
+		t.Fatalf("bucket length = %d for %q", len(got), got)
+	}
+	if !strings.HasPrefix(got, "project-id-this-is-a-very-long") {
+		t.Fatalf("bucket = %q", got)
+	}
+}
+
+func TestLocalBrokerCloudIdentityUsesGlobalConfig(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	path, err := defaultGlobalConfigPath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	global := globalConfig{
+		AWSProfiles: []globalAWSProfile{{
+			Name:      "work",
+			AccountID: "123456789012",
+		}},
+		GCPProfiles: []globalGCPProfile{{
+			Name:      "prod",
+			ProjectID: "example-project",
+		}},
+	}
+	if err := writeGlobalConfig(path, global); err != nil {
+		t.Fatal(err)
+	}
+	got, err := localBrokerCloudIdentityFromConfig(context.Background(), "s3", "work")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "123456789012" {
+		t.Fatalf("aws identity = %q", got)
+	}
+	got, err = localBrokerCloudIdentityFromConfig(context.Background(), "gs", "prod")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "example-project" {
+		t.Fatalf("gcp identity = %q", got)
+	}
+}
+
+func TestLocalBrokerCloudIdentityImportsExistingAWSProfile(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	awsDir := filepath.Join(home, ".aws")
+	if err := os.MkdirAll(awsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(awsDir, "credentials"), []byte("[default]\naws_access_key_id = test\naws_secret_access_key = test\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(awsDir, "config"), []byte("[default]\nregion = eu-west-1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	bin := t.TempDir()
+	writeFakeCLI(t, bin, "aws", []fakeCLIAction{
+		{match: "sts get-caller-identity --output json --profile default", stdout: `{"Account":"123456789012","Arn":"arn:aws:iam::123456789012:user/demo"}`},
+	})
+	t.Setenv("PATH", bin)
+	got, err := localBrokerCloudIdentityFromConfig(context.Background(), "s3", "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "123456789012" {
+		t.Fatalf("identity = %q", got)
+	}
+	path, err := defaultGlobalConfigPath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	global, err := readGlobalConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(global.AWSProfiles) != 1 || global.AWSProfiles[0].AccountID != "123456789012" {
+		t.Fatalf("global AWS profiles = %#v", global.AWSProfiles)
+	}
+}
+
+func TestLocalBrokerStorageCompatibleRequiresSameCloudBucket(t *testing.T) {
+	requested := brokerRepo{Provider: "s3", Bucket: "123456789012-demo", Profile: "default", Region: "us-east-1"}
+	existing := brokerRepo{Provider: "s3", Bucket: "123456789012-demo", Profile: "default", Region: "us-east-1"}
+	if !localBrokerStorageCompatible(requested, existing) {
+		t.Fatal("same deterministic s3 repo should be compatible")
+	}
+	existing.Bucket = "123456789012-other"
+	if localBrokerStorageCompatible(requested, existing) {
+		t.Fatal("different s3 buckets should not be compatible")
+	}
+	existing.Bucket = requested.Bucket
+	existing.Region = "eu-west-1"
+	if localBrokerStorageCompatible(requested, existing) {
+		t.Fatal("different s3 regions should not be compatible")
+	}
+	fileRepo := brokerRepo{Provider: "file", Bucket: "file://demo.git"}
+	if localBrokerStorageCompatible(requested, fileRepo) {
+		t.Fatal("s3 and file local broker repos should not be compatible")
+	}
+}
+
 func TestShellQuoteForGitSSHCommand(t *testing.T) {
 	got := shellQuoteForGitSSHCommand(`D:\a\bgit\bgit\bgit.exe`)
 	if got != `'D:\a\bgit\bgit\bgit.exe'` {
@@ -104,6 +241,35 @@ func TestShellQuoteForGitSSHCommand(t *testing.T) {
 	got = shellQuoteForGitSSHCommand(`/tmp/dennis' test/bgit`)
 	if got != `'/tmp/dennis'\'' test/bgit'` {
 		t.Fatalf("quoted apostrophe path = %q", got)
+	}
+}
+
+func TestStorageTargetPartsTreatsURIHostAsRepoName(t *testing.T) {
+	scheme, profile, region, bucket, ok := storageTargetParts("s3://my-local.repo.git")
+	if !ok {
+		t.Fatal("storage target did not parse")
+	}
+	if scheme != "s3" || profile != "" || region != "" || bucket != "my-local.repo" {
+		t.Fatalf("parts = scheme %q profile %q region %q bucket %q", scheme, profile, region, bucket)
+	}
+}
+
+func TestStorageProfileRegionFromOptions(t *testing.T) {
+	profile, region := storageProfileRegionFromOptions("s3://app.git", "work", "eu-west-1")
+	if profile != "work" || region != "eu-west-1" {
+		t.Fatalf("s3 profile/region = %q/%q", profile, region)
+	}
+	profile, region = storageProfileRegionFromOptions("s3://app.git", "local:default/default", "")
+	if profile != "default" || region != "us-east-1" {
+		t.Fatalf("local broker profile leaked into s3 profile/region = %q/%q", profile, region)
+	}
+	profile, region = storageProfileRegionFromOptions("s3://app.git", "local:default/default", "eu-west-1")
+	if profile != "default" || region != "eu-west-1" {
+		t.Fatalf("local broker profile dropped explicit s3 region = %q/%q", profile, region)
+	}
+	profile, region = storageProfileRegionFromOptions("gs://app.git", "", "")
+	if profile != "default" || region != "us-central1" {
+		t.Fatalf("gs default profile/region = %q/%q", profile, region)
 	}
 }
 
@@ -841,7 +1007,7 @@ func TestBrokerInitInteractiveSelectsTeamThenRepository(t *testing.T) {
 		t.Fatal(err)
 	}
 	var stdout bytes.Buffer
-	err = brokerInitCommand([]string{"--config", configPath}, strings.NewReader("\n\x1b[B\n"), &stdout)
+	err = brokerInitCommand([]string{"--config", configPath}, strings.NewReader("\n\n\x1b[B\n"), &stdout)
 	if err != nil {
 		t.Fatal(err)
 	}

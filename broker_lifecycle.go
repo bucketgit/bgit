@@ -22,7 +22,7 @@ type brokerDeleteOptions struct {
 
 func brokerCommand(ctx context.Context, base config, args []string, stdin io.Reader, stdout io.Writer) error {
 	if len(args) == 0 {
-		return errors.New("usage: bgit broker delete [--provider gcp|aws] [--profile NAME] [--region REGION] [--data] --yes")
+		return errors.New("usage: bgit broker delete [args]")
 	}
 	switch args[0] {
 	case "delete", "decommission":
@@ -30,6 +30,34 @@ func brokerCommand(ctx context.Context, base config, args []string, stdin io.Rea
 	default:
 		return fmt.Errorf("unknown broker command %q", args[0])
 	}
+}
+
+type managedLocalBroker struct {
+	URL            string
+	Root           string
+	BootstrapToken string
+}
+
+func ensureManagedLocalBroker(ctx context.Context, profile globalLocalProfile, region globalProfileRegion) (*managedLocalBroker, error) {
+	_ = ctx
+	root := expandHome(firstNonEmpty(profile.Root, "~/.bgit/local-broker"))
+	token, err := randomBrokerSecret()
+	if err != nil {
+		return nil, err
+	}
+	return &managedLocalBroker{
+		URL:            localBrokerURL(firstNonEmpty(profile.Name, "default"), firstNonEmpty(region.Name, "default")),
+		Root:           root,
+		BootstrapToken: token,
+	}, nil
+}
+
+func (b *managedLocalBroker) Close() {
+	_ = b
+}
+
+func localBrokerURL(profile, region string) string {
+	return "local://" + firstNonEmpty(strings.TrimSpace(profile), "default") + "/" + firstNonEmpty(strings.TrimSpace(region), "default")
 }
 
 func brokerDeleteCommand(ctx context.Context, base config, args []string, stdin io.Reader, stdout io.Writer) error {

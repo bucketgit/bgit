@@ -310,9 +310,23 @@ func openWebRepository(ctx context.Context, cfg config, local bool) (*nativeGitR
 	if cfg.bucket == "" && cfg.brokerURL == "" {
 		return nil, nil, nil, cfg, errors.New("--bucket is required outside a bucketgit checkout")
 	}
+	localBroker, err := ensureLocalBrokerForCommand(ctx, &cfg)
+	if err != nil {
+		return nil, nil, nil, cfg, err
+	}
 	store, closeStore, err := newRemoteStore(ctx, cfg, true)
 	if err != nil {
+		if localBroker != nil {
+			localBroker.Close()
+		}
 		return nil, nil, nil, cfg, fmt.Errorf("create remote store: %w", err)
+	}
+	if localBroker != nil {
+		originalClose := closeStore
+		closeStore = func() {
+			originalClose()
+			localBroker.Close()
+		}
 	}
 	remoteRepo := openNativeGitRepo(store, cfg)
 	if seedRepo == nil {
@@ -691,6 +705,16 @@ func (s *webServer) handleAPIRefs(ctx context.Context, w http.ResponseWriter, r 
 func (s *webServer) handleAPITree(ctx context.Context, w http.ResponseWriter, r *http.Request) {
 	_, commit, ref, err := s.headCommit(ctx, r)
 	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			s.renderJSON(w, map[string]any{
+				"ref":            ref,
+				"path":           cleanWebPath(r.URL.Query().Get("path")),
+				"entries":        []webAPITreeEntry{},
+				"recent_commits": []webAPICommit{},
+				"empty":          true,
+			})
+			return
+		}
 		s.renderJSONError(w, http.StatusNotFound, err)
 		return
 	}
@@ -958,6 +982,10 @@ func (s *webServer) settingsInfo(ctx context.Context) webSettingsInfo {
 		Errors:        map[string]string{},
 	}
 	if strings.TrimSpace(s.cfg.brokerURL) == "" || strings.TrimSpace(s.cfg.logicalRepo) == "" {
+		return info
+	}
+	if s.cfg.provider == "local" {
+		info.Errors = nil
 		return info
 	}
 	var repoInfo brokerRepoInfoResponse
@@ -2336,6 +2364,10 @@ func localChangedFilesBetween(repo *localRepository, base, head string) []string
 func (s *webServer) handleTree(ctx context.Context, w http.ResponseWriter, r *http.Request, repoPath string) {
 	_, commit, ref, err := s.headCommit(ctx, r)
 	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			s.renderEmptyRepository(w, ref, cleanWebPath(repoPath))
+			return
+		}
 		s.renderError(w, http.StatusNotFound, err)
 		return
 	}
@@ -2408,6 +2440,104 @@ func (s *webServer) handleTree(ctx context.Context, w http.ResponseWriter, r *ht
 	body.WriteString(s.repoSidePanelHTML(contributorsFromCommits(repoCommits)))
 	body.WriteString(`</div></main>`)
 	s.renderPage(w, webPageTitle(s.title, repoPath), body.String())
+}
+
+func (s *webServer) renderEmptyRepository(w http.ResponseWriter, ref, repoPath string) {
+	var body strings.Builder
+	body.WriteString(`<main class="layout" data-bgit-head="" data-bgit-source="seed">`)
+	body.WriteString(s.headerHTML(ref, repoPath))
+	body.WriteString(s.emptyRepositoryBootstrapHTML(ref))
+	body.WriteString(`</main>`)
+	s.renderPage(w, webPageTitle(s.title, repoPath), body.String())
+}
+
+func (s *webServer) emptyRepositoryBootstrapHTML(ref string) string {
+	repoName := strings.TrimSuffix(strings.Trim(s.title, "/"), ".git")
+	if repoName == "" {
+		repoName = "repository"
+	}
+	repoTarget := firstNonEmpty(s.primaryRepoTarget(), repoName+".git")
+	cloneCommand := "bgit clone " + shellSingleToken(repoTarget)
+	firstCommit := strings.Join([]string{
+		`echo "# ` + shellDoubleQuoteText(repoName) + `" >> README.md`,
+		"bgit init " + shellSingleToken(repoTarget),
+		"bgit add README.md",
+		`bgit commit -m "first commit"`,
+		"bgit push -u origin main",
+	}, "\n")
+	existingRepo := strings.Join([]string{
+		"bgit init " + shellSingleToken(repoTarget),
+		"bgit push -u origin main",
+	}, "\n")
+	var b strings.Builder
+	b.WriteString(`<div class="empty-repo-wrap">`)
+	b.WriteString(`<div class="empty-repo-cards">`)
+	b.WriteString(`<section class="empty-repo-card"><div class="empty-repo-icon">` + repoIconHTML() + `</div><h2>Create the first commit</h2><p>Add a README or push existing source to make this repository browsable.</p></section>`)
+	b.WriteString(`<section class="empty-repo-card"><div class="empty-repo-icon">` + userPlusIconHTML() + `</div><h2>Give access to collaborators</h2><p>Use Settings to grant users and teams access to this repository.</p><a class="button-link" href="/settings">Manage access</a></section>`)
+	b.WriteString(`</div>`)
+	b.WriteString(`<section class="empty-repo-setup">`)
+	b.WriteString(`<div class="empty-repo-quick"><h2>Quick setup if you have done this kind of thing before</h2><div class="empty-repo-clone"><code id="empty-clone-command">` + html.EscapeString(cloneCommand) + `</code><button class="copy-button copy-icon-button" data-copy-icon data-copy-target="empty-clone-command" aria-label="Copy clone command" title="Copy clone command"><span aria-hidden="true">📋</span></button></div><p>Get started by creating a README, LICENSE, or .gitignore, then push your first commit.</p></div>`)
+	b.WriteString(emptyRepoCommandBlockHTML("...or create a new repository on the command line", "empty-first-commit", firstCommit))
+	b.WriteString(emptyRepoCommandBlockHTML("...or push an existing repository from the command line", "empty-existing-repo", existingRepo))
+	b.WriteString(`</section></div>`)
+	return b.String()
+}
+
+func (s *webServer) primaryRepoTarget() string {
+	logicalRepo := strings.Trim(s.cfg.logicalRepo, "/")
+	if s.cfg.provider == "local" && logicalRepo != "" {
+		return localBrokerBootstrapTarget(s.cfg, logicalRepo)
+	}
+	if s.cfg.brokerURL != "" && logicalRepo != "" {
+		return brokerCloneCommandURL(s.cfg.brokerURL, s.cfg.teamID, logicalRepo)
+	}
+	if s.cfg.origin != "" {
+		return s.cfg.origin
+	}
+	return ""
+}
+
+func localBrokerBootstrapTarget(cfg config, logicalRepo string) string {
+	logicalRepo = strings.Trim(logicalRepo, "/")
+	if logicalRepo == "" {
+		return ""
+	}
+	provider := firstNonEmpty(strings.TrimSpace(cfg.storageProvider), strings.TrimSpace(cfg.provider))
+	if parsed, ok, _ := localBrokerCloudConfig(cfg.bucket); ok {
+		provider = parsed.provider
+	}
+	switch provider {
+	case "s3":
+		return "s3://" + logicalRepo
+	case "gcs", "gs":
+		return "gs://" + logicalRepo
+	case "file", "local":
+		if strings.HasPrefix(cfg.bucket, "file://") {
+			return cfg.bucket
+		}
+		return "file://" + logicalRepo
+	default:
+		return "file://" + logicalRepo
+	}
+}
+
+func emptyRepoCommandBlockHTML(title, id, command string) string {
+	return `<div class="empty-repo-command"><h2>` + html.EscapeString(title) + `</h2><div class="empty-repo-code"><pre id="` + html.EscapeString(id) + `">` + html.EscapeString(command) + `</pre><button class="copy-button copy-icon-button" data-copy-icon data-copy-target="` + html.EscapeString(id) + `" aria-label="Copy commands" title="Copy commands"><span aria-hidden="true">📋</span></button></div></div>`
+}
+
+func shellSingleToken(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "origin"
+	}
+	if strings.ContainsAny(value, " \t\n'\"\\$`") {
+		return "'" + strings.ReplaceAll(value, "'", `'\''`) + "'"
+	}
+	return value
+}
+
+func shellDoubleQuoteText(value string) string {
+	return strings.NewReplacer(`\`, `\\`, `"`, `\"`, `$`, `\$`, "`", "\\`").Replace(value)
 }
 
 func (s *webServer) handleCommits(ctx context.Context, w http.ResponseWriter, r *http.Request) {
@@ -3739,6 +3869,14 @@ func userMenuHTML() string {
 
 func userIconHTML() string {
 	return `<svg viewBox="0 0 24 24" fill="none" aria-hidden="true" focusable="false"><path d="M12 12a4 4 0 1 0 0-8 4 4 0 0 0 0 8Z" stroke="currentColor" stroke-width="2"/><path d="M4 21a8 8 0 0 1 16 0" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>`
+}
+
+func userPlusIconHTML() string {
+	return `<svg viewBox="0 0 24 24" fill="none" aria-hidden="true" focusable="false"><path d="M15 19a6 6 0 0 0-12 0" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M9 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8Z" stroke="currentColor" stroke-width="2"/><path d="M19 8v6M16 11h6" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>`
+}
+
+func repoIconHTML() string {
+	return `<svg viewBox="0 0 24 24" fill="none" aria-hidden="true" focusable="false"><path d="M6 3h9l3 3v15H6a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2Z" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/><path d="M14 3v4h4M8 12h6M8 16h8" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>`
 }
 
 func remoteSyncHTML() string {

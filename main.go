@@ -52,6 +52,9 @@ type config struct {
 	logicalRepo                 string
 	teamID                      string
 	region                      string
+	storageProvider             string
+	storageProfile              string
+	storageRegion               string
 	auth                        string
 	gcloudConfiguration         string
 	identity                    string
@@ -237,6 +240,11 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 	}
 
 	ctx := context.Background()
+	localBroker, err := ensureLocalBrokerForCommand(ctx, &cfg)
+	if err != nil {
+		return err
+	}
+	defer localBroker.Close()
 	store, closeStore, err := newRemoteStore(ctx, cfg, isReadOnlyRemoteCommand(cmd))
 	if err != nil {
 		return fmt.Errorf("create remote store: %w", err)
@@ -306,6 +314,71 @@ func applyExplicitBrokerProfileSelection(cfg *config, cmd string) error {
 		cfg.logicalRepo = strings.Trim(cfg.prefix, "/")
 	}
 	return nil
+}
+
+func ensureLocalBrokerForCommand(ctx context.Context, cfg *config) (*managedLocalBroker, error) {
+	if cfg == nil || cfg.provider != "local" {
+		return nil, nil
+	}
+	path, err := defaultGlobalConfigPath()
+	if err != nil {
+		return nil, err
+	}
+	global, err := readGlobalConfig(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	profileName, regionName := localProfileSelection(cfg.gcloudConfiguration)
+	profile, region, ok := globalLocalProfileForSelection(global, profileName, regionName)
+	if !ok {
+		return nil, nil
+	}
+	managed, err := ensureManagedLocalBroker(ctx, profile, region)
+	if err != nil {
+		return nil, err
+	}
+	cfg.brokerURL = managed.URL
+	return managed, nil
+}
+
+func localProfileSelection(value string) (string, string) {
+	value = strings.TrimSpace(value)
+	value = strings.TrimPrefix(value, "local:")
+	if value == "" {
+		return "default", "default"
+	}
+	if strings.Contains(value, "/") {
+		parts := strings.SplitN(value, "/", 2)
+		return firstNonEmpty(parts[0], "default"), firstNonEmpty(parts[1], "default")
+	}
+	if strings.Contains(value, ".") {
+		parts := strings.SplitN(value, ".", 2)
+		return firstNonEmpty(parts[0], "default"), firstNonEmpty(parts[1], "default")
+	}
+	return value, "default"
+}
+
+func globalLocalProfileForSelection(global globalConfig, profileName, regionName string) (globalLocalProfile, globalProfileRegion, bool) {
+	profileName = firstNonEmpty(strings.TrimSpace(profileName), "default")
+	regionName = firstNonEmpty(strings.TrimSpace(regionName), "default")
+	for _, profile := range global.LocalProfiles {
+		if profile.Name != profileName {
+			continue
+		}
+		for _, region := range profile.Regions {
+			if region.Name == regionName {
+				return profile, region, true
+			}
+		}
+		if len(profile.Regions) > 0 {
+			return profile, profile.Regions[0], true
+		}
+		return profile, globalProfileRegion{Name: regionName}, true
+	}
+	return globalLocalProfile{}, globalProfileRegion{}, false
 }
 
 func mergeBrokerProfileArg(args []string, cfg config) []string {
@@ -645,18 +718,52 @@ func readLocalConfig(dir string) (config, error) {
 	if providerOut, providerErr := runGit(dir, "config", "--get", "bucketgit.provider"); providerErr == nil {
 		localProvider = strings.TrimSpace(string(providerOut))
 	}
+	storageProvider := ""
+	if out, err := runGit(dir, "config", "--get", "bucketgit.storageProvider"); err == nil {
+		storageProvider = strings.TrimSpace(string(out))
+	}
+	storageProfile := ""
+	if out, err := runGit(dir, "config", "--get", "bucketgit.storageProfile"); err == nil {
+		storageProfile = strings.TrimSpace(string(out))
+	}
+	storageRegion := ""
+	if out, err := runGit(dir, "config", "--get", "bucketgit.storageRegion"); err == nil {
+		storageRegion = strings.TrimSpace(string(out))
+	}
 	if brokerURL != "" && logicalRepo != "" {
 		identity := localIdentityPreference(dir)
 		provider := firstNonEmpty(localProvider, "gcs")
+		bucket := ""
+		if bucketOut, bucketErr := runGit(dir, "config", "--get", "bucketgit.bucket"); bucketErr == nil {
+			bucket = strings.TrimSpace(string(bucketOut))
+		}
+		if provider == "local" && storageProvider == "" {
+			if parsed, ok, _ := localBrokerCloudConfig(bucket); ok {
+				storageProvider = parsed.provider
+				storageProfile = parsed.gcloudConfiguration
+				storageRegion = parsed.region
+				bucket = parsed.bucket
+			}
+		}
+		prefix := logicalRepo
+		if prefixOut, prefixErr := runGit(dir, "config", "--get", "bucketgit.prefix"); prefixErr == nil {
+			if value := strings.Trim(strings.TrimSpace(string(prefixOut)), "/"); value != "" {
+				prefix = value
+			}
+		}
 		return config{
 			provider:            provider,
-			prefix:              logicalRepo,
+			bucket:              bucket,
+			prefix:              prefix,
 			branch:              branch,
 			origin:              fmt.Sprintf("git@%s:%s", defaultSSHHost, logicalRepo),
 			brokerURL:           brokerURL,
 			logicalRepo:         logicalRepo,
 			teamID:              teamID,
 			region:              localRegion,
+			storageProvider:     storageProvider,
+			storageProfile:      storageProfile,
+			storageRegion:       storageRegion,
 			identity:            identity,
 			auth:                localAuth.auth,
 			gcloudConfiguration: localAuth.gcloudConfiguration,
@@ -1401,6 +1508,9 @@ func createGcloudProfileCommand(args []string, stdin io.Reader, stdout io.Writer
 	if err := runGcloudProfileCommand(stdout, "auth", "login", "--configuration", profile); err != nil {
 		return err
 	}
+	if err := recordCreatedCloudProfile("gcs", profile, "", stdout); err != nil {
+		return err
+	}
 	if repo, err := openLocalRepository("."); err == nil {
 		if err := repo.config([]string{"bucketgit.profile", profile}, stdout); err != nil {
 			return err
@@ -1444,6 +1554,9 @@ func createAWSProfileCommand(args []string, stdin io.Reader, stdout io.Writer) e
 	if err := runAWSProfileCommand(stdout, "configure", "--profile", profile); err != nil {
 		return err
 	}
+	if err := recordCreatedCloudProfile("s3", profile, configuredAWSProfileRegion(profile), stdout); err != nil {
+		return err
+	}
 	fmt.Fprintf(stdout, "created AWS profile %s\n", profile)
 	return nil
 }
@@ -1474,7 +1587,62 @@ func createAWSProfileConfigured(profile, accessKey, secretKey, region string, st
 			return err
 		}
 	}
+	if err := recordCreatedCloudProfile("s3", profile, region, stdout); err != nil {
+		return err
+	}
 	fmt.Fprintf(stdout, "created AWS profile %s\n", profile)
+	return nil
+}
+
+func recordCreatedCloudProfile(provider, profile, region string, stdout io.Writer) error {
+	path, err := defaultGlobalConfigPath()
+	if err != nil {
+		return err
+	}
+	global, err := readGlobalConfig(path)
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		global = globalConfig{Version: globalConfigVersion}
+	}
+	if global.Version == 0 {
+		global.Version = globalConfigVersion
+	}
+	profile = firstNonEmpty(strings.TrimSpace(profile), "default")
+	switch provider {
+	case "gcs":
+		projectID := gcloudConfigValue(context.Background(), profile, "project")
+		if projectID == "" {
+			return fmt.Errorf("gcloud profile %s has no project configured; run `gcloud config set project PROJECT --configuration %s`", profile, profile)
+		}
+		account := gcloudConfigValue(context.Background(), profile, "account")
+		region = firstNonEmpty(strings.TrimSpace(region), gcloudConfigValue(context.Background(), profile, "run/region"), gcloudConfigValue(context.Background(), profile, "functions/region"), "us-central1")
+		global = upsertGlobalGCPProfile(global, globalGCPProfile{
+			Name:      profile,
+			ProjectID: projectID,
+			Account:   account,
+			Regions:   []globalProfileRegion{{Name: region}},
+		})
+	case "s3":
+		accountID, arn := awsCallerIdentity(context.Background(), profile)
+		if accountID == "" {
+			return fmt.Errorf("AWS profile %s has no account identity; check credentials for that profile", profile)
+		}
+		region = firstNonEmpty(strings.TrimSpace(region), configuredAWSProfileRegion(profile), "us-east-1")
+		global = upsertGlobalAWSProfile(global, globalAWSProfile{
+			Name:      profile,
+			AccountID: accountID,
+			ARN:       arn,
+			Regions:   []globalProfileRegion{{Name: region}},
+		})
+	default:
+		return fmt.Errorf("unsupported profile provider %q", provider)
+	}
+	if err := writeGlobalConfig(path, global); err != nil {
+		return err
+	}
+	fmt.Fprintf(stdout, "saved bgit %s profile %s\n", providerProfileName(provider), profile)
 	return nil
 }
 
@@ -1583,6 +1751,9 @@ func cloneCommand(ctx context.Context, base config, args []string, stdout io.Wri
 	if len(rest) == 2 {
 		target = rest[1]
 	}
+	if err := ensureCloneDestinationAvailable(target); err != nil {
+		return err
+	}
 	store, closeStore, err := newRemoteStore(ctx, uriCfg, true)
 	if err != nil {
 		return fmt.Errorf("create remote store: %w", err)
@@ -1590,6 +1761,30 @@ func cloneCommand(ctx context.Context, base config, args []string, stdout io.Wri
 	defer closeStore()
 	repo := openNativeGitRepo(store, uriCfg)
 	return repo.initWorktree(ctx, []string{target}, stdout)
+}
+
+func ensureCloneDestinationAvailable(target string) error {
+	if strings.TrimSpace(target) == "" {
+		return errors.New("clone destination is required")
+	}
+	info, err := os.Stat(target)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("destination path %q already exists and is not a directory", target)
+	}
+	entries, err := os.ReadDir(target)
+	if err != nil {
+		return err
+	}
+	if len(entries) > 0 {
+		return fmt.Errorf("destination path %q already exists and is not an empty directory", target)
+	}
+	return nil
 }
 
 func initEmptyWorktree(args []string, stdout io.Writer) error {
@@ -1723,6 +1918,9 @@ func unsetGitBranchTracking(worktree, branch string) error {
 func originForConfig(cfg config) string {
 	if cfg.origin != "" {
 		return cfg.origin
+	}
+	if cfg.brokerURL != "" && cfg.logicalRepo != "" {
+		return fmt.Sprintf("git@%s:%s", defaultSSHHost, cfg.logicalRepo)
 	}
 	if cfg.bucket == "" || cfg.prefix == "" {
 		return ""

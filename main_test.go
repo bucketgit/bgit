@@ -1335,6 +1335,61 @@ func TestBrokerAssetsUseBgitVersion(t *testing.T) {
 	}
 }
 
+func TestLocalBrokerURLUsesInternalScheme(t *testing.T) {
+	if got := localBrokerURL("default", "default"); got != "local://default/default" {
+		t.Fatalf("local broker URL = %q", got)
+	}
+}
+
+func TestLocalBrokerRelativeFileRepoUsesBrokerRoot(t *testing.T) {
+	root := t.TempDir()
+	server := &localBrokerServer{root: root, objectRoot: filepath.Join(root, "objects")}
+	got := server.bucketDir("file://my-local-repo4.git")
+	want := filepath.Join(root, "objects", "my-local-repo4.git")
+	if got != want {
+		t.Fatalf("relative file repo path = %q, want %q", got, want)
+	}
+}
+
+func TestEnsureCloneDestinationAvailableRejectsNonEmptyDirectory(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "README.md"), []byte("content\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	err := ensureCloneDestinationAvailable(dir)
+	if err == nil || !strings.Contains(err.Error(), "not an empty directory") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestEnsureCloneDestinationAvailableAllowsMissingAndEmptyDirectory(t *testing.T) {
+	root := t.TempDir()
+	missing := filepath.Join(root, "missing")
+	if err := ensureCloneDestinationAvailable(missing); err != nil {
+		t.Fatalf("missing destination: %v", err)
+	}
+	empty := filepath.Join(root, "empty")
+	if err := os.Mkdir(empty, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := ensureCloneDestinationAvailable(empty); err != nil {
+		t.Fatalf("empty destination: %v", err)
+	}
+}
+
+func TestOriginForConfigUsesLogicalBrokerOrigin(t *testing.T) {
+	cfg := config{
+		provider:    "local",
+		brokerURL:   "local://default/default",
+		logicalRepo: "my-local-repo9.git",
+		bucket:      "bgit-my-local-repo9-29f30f0f6f5f",
+		prefix:      "my-local-repo9.git",
+	}
+	if got := originForConfig(cfg); got != "git@git.bucketgit.com:my-local-repo9.git" {
+		t.Fatalf("origin = %q", got)
+	}
+}
+
 func TestGCPBrokerSourceUsesFirestoreAndSignatureHeaders(t *testing.T) {
 	dir := t.TempDir()
 	if err := writeGCPBrokerSource(dir); err != nil {
@@ -1860,6 +1915,65 @@ func TestReadLocalConfigFallsBackToGCSRemoteOrigin(t *testing.T) {
 	}
 	if cfg.bucket != "bucket-name" || cfg.prefix != "path/repo.git" {
 		t.Fatalf("cfg = %#v", cfg)
+	}
+}
+
+func TestReadLocalConfigPreservesBrokerBucket(t *testing.T) {
+	target := t.TempDir()
+	if _, err := runGit("", "init", target); err != nil {
+		t.Fatal(err)
+	}
+	for _, pair := range [][]string{
+		{"bucketgit.broker", "local://default/default"},
+		{"bucketgit.provider", "local"},
+		{"bucketgit.logicalRepo", "my-local-repo7.git"},
+		{"bucketgit.bucket", "bgit-my-local-repo7-abc123def456"},
+		{"bucketgit.storageProvider", "s3"},
+		{"bucketgit.storageProfile", "default"},
+		{"bucketgit.storageRegion", "us-east-1"},
+		{"bucketgit.prefix", ""},
+		{"bucketgit.team", coreTeamID},
+	} {
+		if _, err := runGit(target, "config", "--local", pair[0], pair[1]); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cfg, err := readLocalConfig(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.bucket != "bgit-my-local-repo7-abc123def456" {
+		t.Fatalf("bucket = %q", cfg.bucket)
+	}
+	if cfg.storageProvider != "s3" || cfg.storageProfile != "default" || cfg.storageRegion != "us-east-1" {
+		t.Fatalf("storage = provider %q profile %q region %q", cfg.storageProvider, cfg.storageProfile, cfg.storageRegion)
+	}
+	if cfg.prefix != "my-local-repo7.git" {
+		t.Fatalf("prefix = %q", cfg.prefix)
+	}
+}
+
+func TestLocalBrokerCloudConfigParsesAWSAndGCP(t *testing.T) {
+	awsCfg, ok, err := localBrokerCloudConfig("s3://work.eu-west-1.my-local-repo7.git")
+	if err != nil || !ok {
+		t.Fatalf("aws parse ok=%v err=%v", ok, err)
+	}
+	if awsCfg.provider != "s3" || awsCfg.gcloudConfiguration != "work" || awsCfg.region != "eu-west-1" || awsCfg.bucket != "my-local-repo7.git" {
+		t.Fatalf("aws cfg = %#v", awsCfg)
+	}
+	gcpCfg, ok, err := localBrokerCloudConfig("gs://default.us-central1.my-local-repo7.git")
+	if err != nil || !ok {
+		t.Fatalf("gcp parse ok=%v err=%v", ok, err)
+	}
+	if gcpCfg.provider != "gcs" || gcpCfg.gcloudConfiguration != "default" || gcpCfg.region != "us-central1" || gcpCfg.bucket != "my-local-repo7.git" {
+		t.Fatalf("gcp cfg = %#v", gcpCfg)
+	}
+	generatedCfg, ok, err := localBrokerCloudConfig("s3://default.us-east-1.bgit-my-local-repo7-abc123def456")
+	if err != nil || !ok {
+		t.Fatalf("generated aws parse ok=%v err=%v", ok, err)
+	}
+	if generatedCfg.provider != "s3" || generatedCfg.gcloudConfiguration != "default" || generatedCfg.region != "us-east-1" || generatedCfg.bucket != "bgit-my-local-repo7-abc123def456" {
+		t.Fatalf("generated cfg = %#v", generatedCfg)
 	}
 }
 
@@ -3816,6 +3930,61 @@ func TestWebClonePanelShowsBrokerCloneCommand(t *testing.T) {
 	}
 	if !strings.Contains(html, "git@git.bucketgit.com:app.git") {
 		t.Fatalf("clone panel missing ssh origin: %s", html)
+	}
+}
+
+func TestWebEmptyRepoBootstrapUsesLocalBrokerStorageScheme(t *testing.T) {
+	tests := []struct {
+		name string
+		cfg  config
+		want string
+	}{
+		{
+			name: "s3",
+			cfg: config{
+				provider:        "local",
+				logicalRepo:     "app.git",
+				bucket:          "bgit-app-123456789abc",
+				storageProvider: "s3",
+				storageProfile:  "default",
+				storageRegion:   "us-east-1",
+			},
+			want: "s3://app.git",
+		},
+		{
+			name: "gcs",
+			cfg: config{
+				provider:        "local",
+				logicalRepo:     "app.git",
+				bucket:          "bgit-app-123456789abc",
+				storageProvider: "gcs",
+				storageProfile:  "default",
+				storageRegion:   "us-central1",
+			},
+			want: "gs://app.git",
+		},
+		{
+			name: "file",
+			cfg: config{
+				provider:        "local",
+				logicalRepo:     "app.git",
+				bucket:          "file://app.git",
+				storageProvider: "file",
+			},
+			want: "file://app.git",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := &webServer{cfg: tt.cfg, title: tt.cfg.logicalRepo}
+			if got := server.primaryRepoTarget(); got != tt.want {
+				t.Fatalf("primaryRepoTarget() = %q, want %q", got, tt.want)
+			}
+			html := server.emptyRepositoryBootstrapHTML(defaultBranch)
+			if !strings.Contains(html, "bgit init "+tt.want) {
+				t.Fatalf("empty repo bootstrap missing init target %q: %s", tt.want, html)
+			}
+		})
 	}
 }
 

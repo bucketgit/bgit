@@ -13,11 +13,12 @@ import (
 const globalConfigVersion = 1
 
 type globalConfig struct {
-	Version     int
-	Identity    globalIdentityConfig
-	GCPProfiles []globalGCPProfile
-	AWSProfiles []globalAWSProfile
-	Repos       []globalRepoConfig
+	Version       int
+	Identity      globalIdentityConfig
+	GCPProfiles   []globalGCPProfile
+	AWSProfiles   []globalAWSProfile
+	LocalProfiles []globalLocalProfile
+	Repos         []globalRepoConfig
 }
 
 type globalIdentityConfig struct {
@@ -41,6 +42,17 @@ type globalAWSProfile struct {
 	Name          string
 	AccountID     string
 	ARN           string
+	Region        string
+	BrokerURL     string
+	BrokerVersion string
+	LastSetupAt   string
+	Regions       []globalProfileRegion
+}
+
+type globalLocalProfile struct {
+	Name          string
+	Root          string
+	Autostart     bool
 	Region        string
 	BrokerURL     string
 	BrokerVersion string
@@ -87,6 +99,7 @@ type globalConfigYAML struct {
 	Identity globalIdentityYAML        `yaml:"identity,omitempty"`
 	GCP      globalGCPConfigYAML       `yaml:"gcp,omitempty"`
 	AWS      globalAWSConfigYAML       `yaml:"aws,omitempty"`
+	Local    globalLocalConfigYAML     `yaml:"local,omitempty"`
 	Repos    map[string]globalRepoYAML `yaml:"repos,omitempty"`
 }
 
@@ -103,6 +116,10 @@ type globalAWSConfigYAML struct {
 	Profiles map[string]globalAWSProfileYAML `yaml:"profiles,omitempty"`
 }
 
+type globalLocalConfigYAML struct {
+	Profiles map[string]globalLocalProfileYAML `yaml:"profiles,omitempty"`
+}
+
 type globalGCPProfileYAML struct {
 	ProjectID      string                             `yaml:"project_id,omitempty"`
 	Account        string                             `yaml:"account,omitempty"`
@@ -113,6 +130,12 @@ type globalGCPProfileYAML struct {
 type globalAWSProfileYAML struct {
 	AccountID string                             `yaml:"account_id,omitempty"`
 	ARN       string                             `yaml:"arn,omitempty"`
+	Regions   map[string]globalProfileRegionYAML `yaml:"regions,omitempty"`
+}
+
+type globalLocalProfileYAML struct {
+	Root      string                             `yaml:"root,omitempty"`
+	Autostart bool                               `yaml:"autostart,omitempty"`
 	Regions   map[string]globalProfileRegionYAML `yaml:"regions,omitempty"`
 }
 
@@ -183,6 +206,19 @@ func globalConfigFromYAML(raw globalConfigYAML) globalConfig {
 		sortGlobalProfileRegions(next.Regions)
 		cfg.AWSProfiles = append(cfg.AWSProfiles, next)
 	}
+	for name, profile := range raw.Local.Profiles {
+		next := globalLocalProfile{Name: name, Root: profile.Root, Autostart: profile.Autostart}
+		for regionName, region := range profile.Regions {
+			next.Regions = append(next.Regions, globalProfileRegion{
+				Name:          regionName,
+				BrokerURL:     region.BrokerURL,
+				BrokerVersion: region.BrokerVersion,
+				LastSetupAt:   region.LastSetupAt,
+			})
+		}
+		sortGlobalProfileRegions(next.Regions)
+		cfg.LocalProfiles = append(cfg.LocalProfiles, next)
+	}
 	for name, repo := range raw.Repos {
 		cfg.Repos = append(cfg.Repos, globalRepoConfig{Name: name, Profile: repo.Profile, BrokerURL: repo.BrokerURL})
 	}
@@ -201,6 +237,7 @@ func globalConfigToYAML(cfg globalConfig) globalConfigYAML {
 		},
 		GCP:   globalGCPConfigYAML{Profiles: map[string]globalGCPProfileYAML{}},
 		AWS:   globalAWSConfigYAML{Profiles: map[string]globalAWSProfileYAML{}},
+		Local: globalLocalConfigYAML{Profiles: map[string]globalLocalProfileYAML{}},
 		Repos: map[string]globalRepoYAML{},
 	}
 	if out.Version == 0 {
@@ -237,6 +274,21 @@ func globalConfigToYAML(cfg globalConfig) globalConfigYAML {
 		}
 		out.AWS.Profiles[profile.Name] = next
 	}
+	for _, profile := range cfg.LocalProfiles {
+		next := globalLocalProfileYAML{
+			Root:      profile.Root,
+			Autostart: profile.Autostart,
+			Regions:   map[string]globalProfileRegionYAML{},
+		}
+		for _, region := range profile.Regions {
+			next.Regions[region.Name] = globalProfileRegionYAML{
+				BrokerURL:     region.BrokerURL,
+				BrokerVersion: region.BrokerVersion,
+				LastSetupAt:   region.LastSetupAt,
+			}
+		}
+		out.Local.Profiles[profile.Name] = next
+	}
 	for _, repo := range cfg.Repos {
 		out.Repos[repo.Name] = globalRepoYAML{Profile: repo.Profile, BrokerURL: repo.BrokerURL}
 	}
@@ -255,6 +307,12 @@ func sortGlobalConfig(cfg *globalConfig) {
 	})
 	for i := range cfg.AWSProfiles {
 		sortGlobalProfileRegions(cfg.AWSProfiles[i].Regions)
+	}
+	sort.Slice(cfg.LocalProfiles, func(i, j int) bool {
+		return cfg.LocalProfiles[i].Name < cfg.LocalProfiles[j].Name
+	})
+	for i := range cfg.LocalProfiles {
+		sortGlobalProfileRegions(cfg.LocalProfiles[i].Regions)
 	}
 	sort.Slice(cfg.Repos, func(i, j int) bool {
 		return cfg.Repos[i].Name < cfg.Repos[j].Name
@@ -302,6 +360,21 @@ func normalizeGlobalConfigProfileRegions(cfg *globalConfig) {
 		if len(profile.Regions) == 0 && strings.TrimSpace(profile.BrokerURL) != "" {
 			profile.Regions = append(profile.Regions, globalProfileRegion{
 				Name:          firstNonEmpty(profile.Region, "us-east-1"),
+				BrokerURL:     profile.BrokerURL,
+				BrokerVersion: profile.BrokerVersion,
+				LastSetupAt:   profile.LastSetupAt,
+			})
+		}
+		profile.Region = ""
+		profile.BrokerURL = ""
+		profile.BrokerVersion = ""
+		profile.LastSetupAt = ""
+	}
+	for i := range cfg.LocalProfiles {
+		profile := &cfg.LocalProfiles[i]
+		if len(profile.Regions) == 0 && strings.TrimSpace(profile.BrokerURL) != "" {
+			profile.Regions = append(profile.Regions, globalProfileRegion{
+				Name:          firstNonEmpty(profile.Region, "default"),
 				BrokerURL:     profile.BrokerURL,
 				BrokerVersion: profile.BrokerVersion,
 				LastSetupAt:   profile.LastSetupAt,

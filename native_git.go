@@ -405,9 +405,6 @@ func (r *nativeGitRepo) pull(ctx context.Context, args []string, stdout io.Write
 	if *rebase {
 		return unsupportedCommand("rebase")
 	}
-	if err := r.fetchIntoWorktree(ctx, worktree, true, stdout); err != nil {
-		return err
-	}
 	localRepo, err := openLocalRepository(worktree)
 	if err != nil {
 		return err
@@ -417,6 +414,26 @@ func (r *nativeGitRepo) pull(ctx context.Context, args []string, stdout io.Write
 		branch = rest[0]
 	} else {
 		branch = firstNonEmpty(localRepo.currentBranch(), r.cfg.branch, defaultBranch)
+	}
+	refs, err := r.refs(ctx)
+	if err != nil {
+		return err
+	}
+	remoteRef := "refs/remotes/bucketgit/" + shortBranchName(branch)
+	if remoteHash := refs[branchRef(branch)]; remoteHash != "" {
+		currentHash, _ := localRepo.resolveRevision("HEAD")
+		if currentHash == remoteHash {
+			if gitDir, err := localGitDir(worktree); err == nil {
+				if err := writeRefFile(filepath.Join(gitDir, filepath.FromSlash(remoteRef)), remoteHash); err != nil {
+					return err
+				}
+			}
+			fmt.Fprintln(stdout, "Already up to date.")
+			return nil
+		}
+	}
+	if err := r.fetchIntoWorktree(ctx, worktree, true, stdout); err != nil {
+		return err
 	}
 	remoteHash, err := localRepo.resolveRevision("refs/remotes/bucketgit/" + shortBranchName(branch))
 	if err != nil {

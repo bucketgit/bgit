@@ -524,6 +524,13 @@ func (r *nativeGitRepo) pushWorktree(ctx context.Context, worktree string, opts 
 		branch := firstNonEmpty(localRepo.currentBranch(), r.cfg.branch, defaultBranch)
 		ref := branchRef(branch)
 		if oldHash := pushOldHash(gitDir, refs, ref); oldHash == hash {
+			if brokerURL != "" {
+				cfg := r.cfg
+				cfg.brokerURL = brokerURL
+				if err := brokerRequirePush(ctx, cfg); err != nil {
+					return brokerPushError(err)
+				}
+			}
 			if err := updateLocalRemoteTrackingRef(gitDir, ref, hash); err != nil {
 				return err
 			}

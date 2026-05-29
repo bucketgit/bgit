@@ -3736,6 +3736,9 @@ func createBareFixture(t *testing.T) string {
 	if _, err := runGit(source, "push", bare, "HEAD:refs/heads/main"); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := runGit(bare, "symbolic-ref", "HEAD", "refs/heads/main"); err != nil {
+		t.Fatal(err)
+	}
 	return bare
 }
 

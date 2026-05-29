@@ -628,7 +628,10 @@ func (s *localBrokerServer) handleRefsUpdate(w http.ResponseWriter, r *http.Requ
 
 func (s *localBrokerServer) acquireRefLock(repo brokerRepo, ref string) (func(), error) {
 	lockName := base64.RawURLEncoding.EncodeToString([]byte(ref)) + ".lock"
-	path := s.objectPath(repo, filepath.ToSlash(filepath.Join(".bucketgit", "broker-state", "v1", "locks", lockName)))
+	path, err := s.objectPath(repo, filepath.ToSlash(filepath.Join(".bucketgit", "broker-state", "v1", "locks", lockName)))
+	if err != nil {
+		return nil, err
+	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return nil, err
 	}
@@ -1014,7 +1017,11 @@ func (s *localBrokerServer) readObject(repo brokerRepo, object string) ([]byte, 
 		}
 		return store.read(context.Background(), object)
 	}
-	return os.ReadFile(s.objectPath(repo, object))
+	path, err := s.objectPath(repo, object)
+	if err != nil {
+		return nil, err
+	}
+	return os.ReadFile(path)
 }
 
 func (s *localBrokerServer) writeObject(repo brokerRepo, object string, data []byte) error {
@@ -1027,7 +1034,10 @@ func (s *localBrokerServer) writeObject(repo brokerRepo, object string, data []b
 		}
 		return store.write(context.Background(), object, data)
 	}
-	path := s.objectPath(repo, object)
+	path, err := s.objectPath(repo, object)
+	if err != nil {
+		return err
+	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
@@ -1044,7 +1054,11 @@ func (s *localBrokerServer) deleteObject(repo brokerRepo, object string) error {
 		}
 		return store.delete(context.Background(), object)
 	}
-	return os.Remove(s.objectPath(repo, object))
+	path, err := s.objectPath(repo, object)
+	if err != nil {
+		return err
+	}
+	return os.Remove(path)
 }
 
 func (s *localBrokerServer) listObjects(repo brokerRepo, prefix string) ([]string, error) {
@@ -1064,7 +1078,11 @@ func (s *localBrokerServer) listObjects(repo brokerRepo, prefix string) ([]strin
 	}
 	searchRoot := root
 	if strings.TrimSpace(repo.Prefix) != "" {
-		searchRoot = filepath.Join(searchRoot, filepath.FromSlash(strings.Trim(repo.Prefix, "/")))
+		var err error
+		searchRoot, err = safeJoinLocalPath(searchRoot, strings.Trim(repo.Prefix, "/"))
+		if err != nil {
+			return nil, err
+		}
 	}
 	var paths []string
 	err := filepath.WalkDir(searchRoot, func(path string, d fs.DirEntry, err error) error {
@@ -1088,14 +1106,14 @@ func (s *localBrokerServer) listObjects(repo brokerRepo, prefix string) ([]strin
 	return paths, err
 }
 
-func (s *localBrokerServer) objectPath(repo brokerRepo, object string) string {
+func (s *localBrokerServer) objectPath(repo brokerRepo, object string) (string, error) {
 	root := s.bucketDir(repo.Bucket)
 	prefix := strings.Trim(repo.Prefix, "/")
 	if prefix != "" {
 		object = prefix + "/" + strings.TrimPrefix(object, "/")
 	}
-	clean := filepath.Clean(strings.TrimPrefix(object, "/"))
-	return filepath.Join(root, clean)
+	clean := strings.TrimPrefix(filepath.ToSlash(filepath.Clean("/"+object)), "/")
+	return safeJoinLocalPath(root, clean)
 }
 
 func (s *localBrokerServer) loadOwners() (localBrokerOwners, error) {
@@ -1268,7 +1286,7 @@ func (s *localBrokerServer) localRefHash(repo brokerRepo, ref, fallback string) 
 	var record struct {
 		Hash string `json:"hash"`
 	}
-	if s.readJSON(s.objectPath(repo, localBrokerRefRecordPath(ref)), &record) == nil && record.Hash != "" {
+	if path, err := s.objectPath(repo, localBrokerRefRecordPath(ref)); err == nil && s.readJSON(path, &record) == nil && record.Hash != "" {
 		return record.Hash
 	}
 	if data, err := s.readObject(repo, ref); err == nil {

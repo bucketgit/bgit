@@ -1216,7 +1216,7 @@ func simpleLineDiff(left, right string) []string {
 	if left == right {
 		return nil
 	}
-	if len(a)*len(b) > 900000 {
+	if len(a) != 0 && len(b) > 900000/len(a) {
 		return simpleWholeFileDiff(a, b)
 	}
 	ops := simpleLineDiffOps(a, b)

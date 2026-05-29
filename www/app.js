@@ -393,7 +393,7 @@ function navigateToLocalURL(value) {
   }
   if (url.origin !== window.location.origin) return;
   if (url.protocol !== 'http:' && url.protocol !== 'https:') return;
-  window.location.href = url.pathname + url.search + url.hash;
+  window.location.assign(url.pathname + url.search + url.hash);
 }
 
 document.addEventListener('input', function (event) {
@@ -414,7 +414,7 @@ document.addEventListener('keydown', function (event) {
   const match = findIndexedFile(input.value);
   if (!match) return;
   event.preventDefault();
-  window.location.href = match.url;
+  navigateToLocalURL(match.url);
 });
 
 document.addEventListener('DOMContentLoaded', function () {

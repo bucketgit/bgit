@@ -40,7 +40,14 @@ type managedLocalBroker struct {
 
 func ensureManagedLocalBroker(ctx context.Context, profile globalLocalProfile, region globalProfileRegion) (*managedLocalBroker, error) {
 	_ = ctx
-	root := expandHome(firstNonEmpty(profile.Root, "~/.bgit/local-broker"))
+	root := expandHome(profile.Root)
+	if strings.TrimSpace(root) == "" {
+		var err error
+		root, err = defaultLocalBrokerRoot()
+		if err != nil {
+			return nil, err
+		}
+	}
 	token, err := randomBrokerSecret()
 	if err != nil {
 		return nil, err
@@ -75,6 +82,9 @@ func brokerDeleteCommand(ctx context.Context, base config, args []string, stdin 
 	provider := firstNonEmpty(opts.provider, normalizeSetupProvider(firstNonEmpty(base.provider, "gcp")))
 	if provider == "" {
 		return errors.New("broker delete requires --provider gcp|aws")
+	}
+	if strings.TrimSpace(opts.region) == "" && strings.TrimSpace(base.region) != "" {
+		opts.region = strings.TrimSpace(base.region)
 	}
 	cfg := base
 	cfg.provider = mapSetupProviderToConfig(provider)

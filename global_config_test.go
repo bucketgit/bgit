@@ -117,6 +117,34 @@ func TestDefaultGlobalConfigPathUsesYAML(t *testing.T) {
 	}
 }
 
+func TestBGitHomeOverridesDefaultPaths(t *testing.T) {
+	home := t.TempDir()
+	setTestHome(t, t.TempDir())
+	t.Setenv("BGIT_HOME", home)
+
+	configPath, err := defaultGlobalConfigPath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := filepath.Join(home, "config.yaml"); configPath != want {
+		t.Fatalf("config path = %q, want %q", configPath, want)
+	}
+	localRoot, err := defaultLocalBrokerRoot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := filepath.Join(home, "local-broker"); localRoot != want {
+		t.Fatalf("local broker root = %q, want %q", localRoot, want)
+	}
+	cacheDir, err := defaultBGitCacheDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := filepath.Join(home, "cache"); cacheDir != want {
+		t.Fatalf("cache dir = %q, want %q", cacheDir, want)
+	}
+}
+
 func TestReadGlobalConfigDoesNotFallBackToLegacyConfig(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), ".bgit")
 	if err := os.MkdirAll(dir, 0o755); err != nil {

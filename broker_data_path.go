@@ -32,6 +32,7 @@ type brokerObjectCapabilityResponse struct {
 	Bucket      string                     `json:"bucket,omitempty"`
 	Prefix      string                     `json:"prefix,omitempty"`
 	Object      string                     `json:"object,omitempty"`
+	Profile     string                     `json:"profile,omitempty"`
 	Region      string                     `json:"region,omitempty"`
 	Credentials brokerObjectAWSCredentials `json:"credentials,omitempty"`
 }

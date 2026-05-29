@@ -101,6 +101,9 @@ func setupCommand(ctx context.Context, base config, args []string, stdin io.Read
 	if len(opts.profiles) == 0 && base.gcloudConfigurationExplicit && strings.TrimSpace(base.gcloudConfiguration) != "" {
 		opts.profiles = append(opts.profiles, strings.TrimSpace(base.gcloudConfiguration))
 	}
+	if strings.TrimSpace(opts.region) == "" && strings.TrimSpace(base.region) != "" {
+		opts.region = strings.TrimSpace(base.region)
+	}
 	interactiveReader := bufio.NewReader(stdin)
 	path := opts.configPath
 	if path == "" {
@@ -636,7 +639,14 @@ func setupProvisionSelectedProfile(base config, path, now string, profile setupP
 			}},
 		})
 	case "local":
-		root := expandHome(firstNonEmpty(os.Getenv("BGIT_LOCAL_BROKER_ROOT"), "~/.bgit/local-broker"))
+		root := expandHome(os.Getenv("BGIT_LOCAL_BROKER_ROOT"))
+		if strings.TrimSpace(root) == "" {
+			var err error
+			root, err = defaultLocalBrokerRoot()
+			if err != nil {
+				return err
+			}
+		}
 		*global = upsertGlobalLocalProfile(*global, globalLocalProfile{
 			Name:      profile.Name,
 			Root:      root,

@@ -506,6 +506,9 @@ func (r *nativeGitRepo) pushWorktree(ctx context.Context, worktree string, opts 
 		return err
 	}
 	updateRef := func(ref, oldHash, newHash string) error {
+		if err := ensurePushFastForward(localRepo, ref, oldHash, newHash, opts.force); err != nil {
+			return err
+		}
 		if brokerURL != "" {
 			if err := brokerUpdateRefWithOverride(brokerURL, r.cfg, ref, oldHash, newHash, opts.force); err != nil {
 				return brokerPushError(err)
@@ -616,6 +619,17 @@ func (r *nativeGitRepo) pushWorktree(ctx context.Context, worktree string, opts 
 	fmt.Fprintf(stdout, "To %s\n", originForConfig(r.cfg))
 	for _, line := range updates {
 		fmt.Fprintln(stdout, line)
+	}
+	return nil
+}
+
+func ensurePushFastForward(localRepo *localRepository, ref, oldHash, newHash string, force bool) error {
+	if force || !strings.HasPrefix(ref, "refs/heads/") || oldHash == zeroObjectID() || newHash == zeroObjectID() {
+		return nil
+	}
+	ancestor, err := localRepo.isAncestor(oldHash, newHash)
+	if err != nil || !ancestor {
+		return fmt.Errorf("non-fast-forward update; pull first or use --force")
 	}
 	return nil
 }
@@ -1235,6 +1249,28 @@ func (r *nativeGitRepo) commit(ctx context.Context, hash string) (commitObject, 
 		return commitObject{}, err
 	}
 	return commit, nil
+}
+
+func (r *nativeGitRepo) isAncestor(ctx context.Context, ancestor, descendant string) (bool, error) {
+	stack := []string{descendant}
+	seen := map[string]struct{}{}
+	for len(stack) > 0 {
+		hash := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		if hash == ancestor {
+			return true, nil
+		}
+		if _, ok := seen[hash]; ok {
+			continue
+		}
+		seen[hash] = struct{}{}
+		commit, err := r.commit(ctx, hash)
+		if err != nil {
+			return false, err
+		}
+		stack = append(stack, commit.parents...)
+	}
+	return false, nil
 }
 
 func parseCommit(hash string, data []byte) (commitObject, error) {

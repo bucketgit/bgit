@@ -1210,10 +1210,9 @@ func ensureDefaultLocalProfile(global globalConfig) globalLocalProfile {
 			return profile
 		}
 	}
-	home, err := os.UserHomeDir()
-	root := "~/.bgit/local-broker"
-	if err == nil {
-		root = filepath.Join(home, ".bgit", "local-broker")
+	root, err := defaultLocalBrokerRoot()
+	if err != nil {
+		root = "~/.bgit/local-broker"
 	}
 	return globalLocalProfile{Name: "default", Root: root, Autostart: true}
 }
@@ -1506,6 +1505,9 @@ func localBrokerStorageDescription(repo brokerRepo) string {
 }
 
 func brokerCloneWithProfile(opts brokerInitOptions, repoName string, profile brokerProfile, stdout io.Writer) error {
+	if profile.Provider == "local" || isLocalBrokerURL(profile.BrokerURL) {
+		return brokerCloneWithLocalProfile(opts, repoName, profile, stdout)
+	}
 	target := opts.directory
 	if target == "" {
 		target = strings.TrimSuffix(filepath.Base(strings.Trim(repoName, "/")), ".git")
@@ -1526,6 +1528,72 @@ func brokerCloneWithProfile(opts brokerInitOptions, repoName string, profile bro
 		_, _ = runGit(target, "checkout", "--quiet", "-B", defaultBranch)
 	}
 	fmt.Fprintf(stdout, "Cloned %s into '%s'\n", repoName, target)
+	return nil
+}
+
+func brokerCloneWithLocalProfile(opts brokerInitOptions, repoName string, profile brokerProfile, stdout io.Writer) error {
+	global, path, err := loadGlobalConfigForInit(opts.configPath)
+	if err != nil {
+		return err
+	}
+	localProfile := ensureDefaultLocalProfile(global)
+	if profile.Name != "" {
+		localProfile.Name = profile.Name
+	}
+	localRegion := ensureDefaultLocalRegion(localProfile)
+	if profile.Region != "" {
+		localRegion.Name = profile.Region
+	}
+	managed, err := ensureManagedLocalBroker(context.Background(), localProfile, localRegion)
+	if err != nil {
+		return err
+	}
+	defer managed.Close()
+	localProfile.Root = managed.Root
+	localRegion.BrokerURL = managed.URL
+	localRegion.BrokerVersion = brokerVersion()
+	localRegion.LastSetupAt = time.Now().UTC().Format(time.RFC3339)
+	global = upsertGlobalLocalProfile(global, globalLocalProfile{
+		Name:      localProfile.Name,
+		Root:      localProfile.Root,
+		Autostart: true,
+		Regions:   []globalProfileRegion{localRegion},
+	})
+	if err := writeGlobalConfig(path, global); err != nil {
+		return err
+	}
+	logical, err := normalizeLogicalRepoName(repoName)
+	if err != nil {
+		return err
+	}
+	var resp struct {
+		Repo brokerRepo `json:"repo"`
+	}
+	req := brokerRepoRequest{Repo: brokerRepo{Logical: logical, TeamID: firstNonEmpty(profile.TeamID, coreTeamID)}}
+	if err := brokerPost(managed.URL, "/repos/get", req, &resp); err != nil {
+		return err
+	}
+	if strings.TrimSpace(resp.Repo.Logical) == "" {
+		return fmt.Errorf("repository not found")
+	}
+	target := opts.directory
+	if target == "" {
+		target = strings.TrimSuffix(filepath.Base(strings.Trim(resp.Repo.Logical, "/")), ".git")
+	}
+	if err := ensureCloneDestinationAvailable(target); err != nil {
+		return err
+	}
+	cloneProfile := brokerProfile{Provider: "local", Name: localProfile.Name, Region: localRegion.Name, QualifiedName: "local:" + localProfile.Name + "/" + localRegion.Name, BrokerURL: managed.URL, TeamID: firstNonEmpty(profile.TeamID, coreTeamID)}
+	if err := initBrokerWorktreeWithLocalRepo(target, resp.Repo, cloneProfile, "", "", io.Discard); err != nil {
+		return err
+	}
+	if _, err := runGit(target, "fetch", "origin"); err != nil {
+		return err
+	}
+	if _, err := runGit(target, "checkout", "--quiet", "-B", defaultBranch, "origin/"+defaultBranch); err != nil {
+		_, _ = runGit(target, "checkout", "--quiet", "-B", defaultBranch)
+	}
+	fmt.Fprintf(stdout, "Cloned %s into '%s'\n", resp.Repo.Logical, target)
 	return nil
 }
 

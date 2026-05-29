@@ -74,11 +74,38 @@ type globalRepoConfig struct {
 }
 
 func defaultGlobalConfigPath() (string, error) {
+	home, err := bgitHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, "config.yaml"), nil
+}
+
+func defaultLocalBrokerRoot() (string, error) {
+	home, err := bgitHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, "local-broker"), nil
+}
+
+func defaultBGitCacheDir() (string, error) {
+	home, err := bgitHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, "cache"), nil
+}
+
+func bgitHomeDir() (string, error) {
+	if value := strings.TrimSpace(os.Getenv("BGIT_HOME")); value != "" {
+		return expandHome(value), nil
+	}
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(home, ".bgit", "config.yaml"), nil
+	return filepath.Join(home, ".bgit"), nil
 }
 
 func readGlobalConfig(path string) (globalConfig, error) {

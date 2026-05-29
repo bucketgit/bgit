@@ -313,6 +313,15 @@ func validateReceivePackCommand(ctx context.Context, repo *nativeGitRepo, refs m
 		if current != cmd.old {
 			return fmt.Errorf("stale ref")
 		}
+		if strings.HasPrefix(cmd.ref, "refs/heads/") {
+			ancestor, err := repo.isAncestor(ctx, current, cmd.new)
+			if err != nil {
+				return err
+			}
+			if !ancestor {
+				return fmt.Errorf("non-fast-forward update")
+			}
+		}
 	case "delete":
 		if !exists {
 			return fmt.Errorf("ref does not exist")

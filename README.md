@@ -66,7 +66,8 @@ bgit setup
 `bgit setup` is the interactive broker setup and management tool. It discovers
 GCP and AWS profiles, lets you choose regions, creates or updates brokers,
 imports owner SSH keys, manages users and teams, and writes global configuration
-to `~/.bgit/config.yaml`.
+to `~/.bgit/config.yaml`. Set `BGIT_HOME` to use another BucketGit config
+directory.
 
 For local hosting, `bgit clone file://repo.git`, `bgit clone s3://repo.git`,
 and `bgit clone gs://repo.git` create or attach a broker-backed repository
@@ -82,7 +83,8 @@ bgit clone s3://app.git --profile work --region eu-west-1
 bgit clone gs://app.git --profile work --region europe-west1
 ```
 
-`file://` repositories are stored below `~/.bgit/local-broker`. `s3://` and
+`file://` repositories are stored below `~/.bgit/local-broker` or
+`$BGIT_HOME/local-broker`. `s3://` and
 `gs://` repositories use one cloud bucket per repository, named from the cached
 AWS account ID or GCP project ID plus the repo name, for example
 `123456789012-app`. The visible repository name remains `app.git`. If
@@ -207,7 +209,8 @@ bgit admin repo info
 
 ## Setup And Broker Management
 
-Global configuration is stored in `~/.bgit/config.yaml`. Profiles are
+Global configuration is stored in `~/.bgit/config.yaml`, or
+`$BGIT_HOME/config.yaml` when `BGIT_HOME` is set. Profiles are
 provider- and region-aware, so the same cloud account can have brokers in
 multiple regions.
 
@@ -251,7 +254,7 @@ state records and short lock files, then materialized back to normal Git ref
 files.
 
 Cloud-backed local broker repositories use cached profile metadata from
-`~/.bgit/config.yaml` for deterministic bucket naming. `bgit setup profile
+the global BucketGit config for deterministic bucket naming. `bgit setup profile
 create --provider aws NAME` records the AWS account ID for a profile, and
 `bgit setup profile create --provider gcp NAME` records the GCP project ID. If
 an existing AWS or GCP CLI profile is used before it is cached, BucketGit imports
@@ -275,7 +278,7 @@ bgit admin broker owner-bootstrap reset
 
 ## Identity
 
-BucketGit supports a global name and email in `~/.bgit/config.yaml` and per-repo
+BucketGit supports a global name and email in the global BucketGit config and per-repo
 identity in `.git/config`, matching the way Git users expect identity to work.
 The repo-local identity overrides the global one.
 

@@ -107,7 +107,7 @@ func localBrokerCapabilityTarget(capability brokerObjectCapabilityResponse) (*lo
 	if err != nil {
 		return nil, brokerRepo{}, err
 	}
-	repo := brokerRepo{Provider: capability.Provider, Bucket: capability.Bucket, Prefix: capability.Prefix}
+	repo := brokerRepo{Provider: capability.Provider, Bucket: capability.Bucket, Prefix: capability.Prefix, Profile: capability.Profile, Region: capability.Region}
 	return server, repo, nil
 }
 
@@ -125,7 +125,13 @@ func localBrokerServerForURL(brokerURL string) (*localBrokerServer, error) {
 	if !ok {
 		profile = ensureDefaultLocalProfile(global)
 	}
-	root := expandHome(firstNonEmpty(profile.Root, "~/.bgit/local-broker"))
+	root := expandHome(profile.Root)
+	if strings.TrimSpace(root) == "" {
+		root, err = defaultLocalBrokerRoot()
+		if err != nil {
+			return nil, err
+		}
+	}
 	server := &localBrokerServer{root: root, objectRoot: filepath.Join(root, "objects"), baseURL: localBrokerURL(profileName, regionName)}
 	if err := os.MkdirAll(server.objectRoot, 0o755); err != nil {
 		return nil, err
@@ -221,7 +227,7 @@ func (s *localBrokerServer) localPost(path string, req any) ([]byte, int, error)
 			return mustJSON(map[string]string{"error": err.Error()}), http.StatusForbidden, nil
 		}
 		object := localBrokerObjectName(state.Repo, objectPath)
-		return mustJSON(brokerObjectCapabilityResponse{Provider: state.Repo.Provider, Mode: "local", URL: s.baseURL, Bucket: state.Repo.Bucket, Prefix: state.Repo.Prefix, Object: object}), 200, nil
+		return mustJSON(brokerObjectCapabilityResponse{Provider: state.Repo.Provider, Mode: "local", URL: s.baseURL, Bucket: state.Repo.Bucket, Prefix: state.Repo.Prefix, Object: object, Profile: state.Repo.Profile, Region: state.Repo.Region}), 200, nil
 	case "/objects/read":
 		r := req.(brokerObjectRequest)
 		state, err := s.loadRepoForRequest(r.Repo)
@@ -521,6 +527,8 @@ func (s *localBrokerServer) handleObjectCapability(w http.ResponseWriter, r *htt
 		Bucket:   state.Repo.Bucket,
 		Prefix:   state.Repo.Prefix,
 		Object:   object,
+		Profile:  state.Repo.Profile,
+		Region:   state.Repo.Region,
 	})
 }
 

@@ -1186,8 +1186,9 @@ examples:
   bgit init --noninteractive --repo NAME --profile PROFILE[.REGION] --team TEAM [--region REGION] [directory]
 
 Create a local Git repository and attach it to an existing BucketGit repository from
-~/.bgit/config.yaml. Without --noninteractive, init prompts for missing repo,
-profile, region, and team choices.
+the global BucketGit config. Set BGIT_HOME to use a config directory other than
+~/.bgit. Without --noninteractive, init prompts for missing repo, profile,
+region, and team choices.
 
 examples:
   bgit init
@@ -1200,7 +1201,8 @@ examples:
   bgit setup profile create --provider gcp|aws NAME
 
 Discover cloud profiles, deploy or update a bgit broker, import owner SSH keys,
-and write the global BucketGit config at ~/.bgit/config.yaml.
+and write the global BucketGit config. Set BGIT_HOME to use a config directory
+other than ~/.bgit.
 
 GCP profiles are discovered from gcloud configurations. AWS profiles are
 discovered from AWS config/credentials files and aws configure list-profiles
@@ -1339,6 +1341,7 @@ Pull requests are stored in the broker control plane, not in Git itself.
 
 Show the SSH identity, repo role, and broker capabilities for the current
 broker-backed repository. Results are cached under ~/.bgit/cache/<broker>/.
+Set BGIT_HOME to use a different cache directory.
 Use --all to list repositories visible to the SSH keys currently loaded in
 ssh-agent.
 `,

@@ -3813,6 +3813,79 @@ func TestWebHandlerRendersBranchSelector(t *testing.T) {
 	}
 }
 
+func TestLocalUntrackedFileDiffRejectsSymlink(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink creation requires extra privileges on Windows")
+	}
+	worktree := t.TempDir()
+	if _, err := runGit("", "init", "--initial-branch", "main", worktree); err != nil {
+		t.Fatal(err)
+	}
+	secret := filepath.Join(t.TempDir(), "secret.txt")
+	if err := os.WriteFile(secret, []byte("secret\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(secret, filepath.Join(worktree, "leak.txt")); err != nil {
+		t.Fatal(err)
+	}
+
+	oldDir, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(oldDir)
+	if err := os.Chdir(worktree); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := localUntrackedFileDiff("leak.txt"); err == nil || !strings.Contains(err.Error(), "symlink") {
+		t.Fatalf("err = %v, want symlink rejection", err)
+	}
+}
+
+func TestLocalRepositoryAddSymlinkHashesLinkTarget(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink creation requires extra privileges on Windows")
+	}
+	worktree := t.TempDir()
+	if _, err := runGit("", "init", "--initial-branch", "main", worktree); err != nil {
+		t.Fatal(err)
+	}
+	repo, err := openLocalRepository(worktree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("/tmp/outside-secret", filepath.Join(worktree, "link.txt")); err != nil {
+		t.Fatal(err)
+	}
+	idx := gitIndex{}
+	if err := repo.addPathToIndex(&idx, "link.txt"); err != nil {
+		t.Fatal(err)
+	}
+	if len(idx.entries) != 1 {
+		t.Fatalf("entries = %#v", idx.entries)
+	}
+	want, err := repo.writeObject(gitObjectBlob, []byte("/tmp/outside-secret"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if idx.entries[0].hash != want {
+		t.Fatalf("hash = %s, want symlink target blob %s", idx.entries[0].hash, want)
+	}
+}
+
+func TestLocalGitStoreRejectsEscapingPath(t *testing.T) {
+	store := &localGitStore{root: t.TempDir()}
+	if _, err := store.read(context.Background(), "../outside"); err == nil {
+		t.Fatal("read accepted escaping path")
+	}
+	if err := store.write(context.Background(), "../outside", []byte("nope")); err == nil {
+		t.Fatal("write accepted escaping path")
+	}
+	if err := store.delete(context.Background(), "../outside"); err == nil {
+		t.Fatal("delete accepted escaping path")
+	}
+}
+
 func TestWebHandlerServesJSONAPI(t *testing.T) {
 	bare := createBareFixture(t)
 	repo := newNativeGitRepoForStore(config{branch: "main", origin: "gs://bucket/repo.git"}, &localGitStore{root: bare})

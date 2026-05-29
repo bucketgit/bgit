@@ -1863,7 +1863,11 @@ If using --auth adc, refresh Application Default Credentials:
 
 func (s *localGitStore) read(ctx context.Context, path string) ([]byte, error) {
 	_ = ctx
-	data, err := os.ReadFile(filepath.Join(s.root, filepath.FromSlash(path)))
+	target, err := s.path(path)
+	if err != nil {
+		return nil, err
+	}
+	data, err := os.ReadFile(target)
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil, fs.ErrNotExist
 	}
@@ -1872,9 +1876,12 @@ func (s *localGitStore) read(ctx context.Context, path string) ([]byte, error) {
 
 func (s *localGitStore) list(ctx context.Context, prefix string) ([]string, error) {
 	_ = ctx
-	root := filepath.Join(s.root, filepath.FromSlash(prefix))
+	root, err := s.path(prefix)
+	if err != nil {
+		return nil, err
+	}
 	var paths []string
-	err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
+	err = filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			if errors.Is(walkErr, fs.ErrNotExist) {
 				return nil
@@ -1896,7 +1903,10 @@ func (s *localGitStore) list(ctx context.Context, prefix string) ([]string, erro
 
 func (s *localGitStore) write(ctx context.Context, path string, data []byte) error {
 	_ = ctx
-	target := filepath.Join(s.root, filepath.FromSlash(path))
+	target, err := s.path(path)
+	if err != nil {
+		return err
+	}
 	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
 		return err
 	}
@@ -1905,9 +1915,17 @@ func (s *localGitStore) write(ctx context.Context, path string, data []byte) err
 
 func (s *localGitStore) delete(ctx context.Context, path string) error {
 	_ = ctx
-	err := os.Remove(filepath.Join(s.root, filepath.FromSlash(path)))
+	target, pathErr := s.path(path)
+	if pathErr != nil {
+		return pathErr
+	}
+	err := os.Remove(target)
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil
 	}
 	return err
+}
+
+func (s *localGitStore) path(path string) (string, error) {
+	return safeJoinLocalPath(s.root, path)
 }

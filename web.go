@@ -2141,7 +2141,7 @@ func localFileVisualDiffHTML(repoPath, mode string) (string, error) {
 		if oldData == nil {
 			oldData = gitBlobData("HEAD:" + repoPath)
 		}
-		if data, err := os.ReadFile(repoPath); err == nil {
+		if data, err := readLocalWorktreeRegularFile(repo.worktree, repoPath); err == nil {
 			newData = data
 		}
 	default:
@@ -2160,7 +2160,11 @@ func gitBlobData(revisionPath string) []byte {
 }
 
 func localUntrackedFileDiff(repoPath string) (string, error) {
-	data, err := os.ReadFile(repoPath)
+	repo, err := openLocalRepository(".")
+	if err != nil {
+		return "", err
+	}
+	data, err := readLocalWorktreeRegularFile(repo.worktree, repoPath)
 	if err != nil {
 		return "", err
 	}
@@ -2180,6 +2184,32 @@ func localUntrackedFileDiff(repoPath string) (string, error) {
 		b.WriteString("\n")
 	}
 	return b.String(), nil
+}
+
+func readLocalWorktreeRegularFile(worktree, repoPath string) ([]byte, error) {
+	repoPath = cleanWebPath(repoPath)
+	if repoPath == "" {
+		return nil, errors.New("file path is required")
+	}
+	target := filepath.Join(worktree, filepath.FromSlash(repoPath))
+	rel, err := filepath.Rel(worktree, target)
+	if err != nil {
+		return nil, err
+	}
+	if rel == "." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || rel == ".." || filepath.IsAbs(rel) {
+		return nil, fmt.Errorf("path escapes worktree: %s", repoPath)
+	}
+	info, err := os.Lstat(target)
+	if err != nil {
+		return nil, err
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return nil, fmt.Errorf("refusing to read symlink: %s", repoPath)
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("not a regular file: %s", repoPath)
+	}
+	return os.ReadFile(target)
 }
 
 func localCommitDiff(hash string) (string, error) {

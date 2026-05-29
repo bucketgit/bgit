@@ -4,7 +4,7 @@ All notable changes to `bgit` are documented in this file.
 
 This project follows semantic versioning.
 
-## 1.2.2
+## 1.3.0
 
 Added
 
@@ -13,6 +13,7 @@ Added
   `gs://` repositories behind the normal broker authorization model.
 - Added storage-backed local broker ref safeguards with per-ref state records
   and short leases before ref materialization.
+- Misc codeql finding fixes
 
 ## 1.2.1
 

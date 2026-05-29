@@ -172,7 +172,7 @@ func TestLocalBrokerCloudIdentityUsesGlobalConfig(t *testing.T) {
 
 func TestLocalBrokerCloudIdentityImportsExistingAWSProfile(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	setTestHome(t, home)
 	awsDir := filepath.Join(home, ".aws")
 	if err := os.MkdirAll(awsDir, 0o755); err != nil {
 		t.Fatal(err)

@@ -46,6 +46,10 @@ type writableGitRemoteStore interface {
 	delete(ctx context.Context, path string) error
 }
 
+type refListingGitRemoteStore interface {
+	listRefs(ctx context.Context) (map[string]string, error)
+}
+
 type fallbackGitRemoteStore struct {
 	primary  gitRemoteStore
 	fallback gitRemoteStore
@@ -508,6 +512,25 @@ func (r *nativeGitRepo) pushWorktree(ctx context.Context, worktree string, opts 
 	if !opts.skipBroker {
 		brokerURL = optionalBrokerURLForPush()
 	}
+	refs, err := r.refs(ctx)
+	if err != nil {
+		return err
+	}
+	if len(opts.refs) == 0 && !opts.tags && !opts.delete {
+		hash, err := gitRevParse(worktree, "HEAD")
+		if err != nil {
+			return err
+		}
+		branch := firstNonEmpty(localRepo.currentBranch(), r.cfg.branch, defaultBranch)
+		ref := branchRef(branch)
+		if oldHash := pushOldHash(gitDir, refs, ref); oldHash == hash {
+			if err := updateLocalRemoteTrackingRef(gitDir, ref, hash); err != nil {
+				return err
+			}
+			fmt.Fprintln(stdout, "Everything up-to-date")
+			return nil
+		}
+	}
 	if brokerURL != "" {
 		cfg := r.cfg
 		cfg.brokerURL = brokerURL
@@ -516,10 +539,6 @@ func (r *nativeGitRepo) pushWorktree(ctx context.Context, worktree string, opts 
 		}
 	}
 	if err := uploadLocalObjects(ctx, store, gitDir); err != nil {
-		return err
-	}
-	refs, err := r.refs(ctx)
-	if err != nil {
 		return err
 	}
 	updateRef := func(ref, oldHash, newHash string) error {
@@ -862,6 +881,15 @@ func (r *nativeGitRepo) resolveRevision(ctx context.Context, revision string) (s
 }
 
 func (r *nativeGitRepo) refs(ctx context.Context) (map[string]string, error) {
+	if store, ok := r.store.(refListingGitRemoteStore); ok {
+		refs, err := store.listRefs(ctx)
+		if err == nil {
+			return refs, nil
+		}
+		if !isBrokerCapabilityUnsupported(err) {
+			return nil, err
+		}
+	}
 	refs := map[string]string{}
 	for _, dir := range []string{"refs/heads", "refs/tags"} {
 		paths, err := r.store.list(ctx, dir)

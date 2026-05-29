@@ -4295,6 +4295,33 @@ func TestBrokerGitStoreMapsMissingObjectToNotExist(t *testing.T) {
 	}
 }
 
+func TestBrokerGitStoreListRefsUsesBrokerEndpoint(t *testing.T) {
+	var got brokerRefsRequest
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/refs/list" {
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+		if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+			t.Fatal(err)
+		}
+		w.Header().Set("content-type", "application/json")
+		_, _ = w.Write([]byte(`{"refs":{"refs/heads/main":"0123456789abcdef0123456789abcdef01234567","refs/tags/bad":"not-a-hash","HEAD":"0123456789abcdef0123456789abcdef01234567"}}`))
+	}))
+	defer server.Close()
+
+	store := &brokerGitStore{brokerURL: server.URL, cfg: config{provider: "gcs", bucket: "bucket", prefix: "repo.git"}}
+	refs, err := store.listRefs(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Repo.Prefix != "repo.git" {
+		t.Fatalf("repo = %#v", got.Repo)
+	}
+	if len(refs) != 1 || refs["refs/heads/main"] != "0123456789abcdef0123456789abcdef01234567" {
+		t.Fatalf("refs = %#v", refs)
+	}
+}
+
 func mustReadFile(t *testing.T, path string) []byte {
 	t.Helper()
 	data, err := os.ReadFile(path)

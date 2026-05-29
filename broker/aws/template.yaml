@@ -2793,6 +2793,11 @@ Resources:
                 const repo = await ensurePhysicalRepo(entry);
                 return response(200, {paths: await listObjects(repo, body.prefix)});
               }
+              if (path === "/refs/list" && method === "POST") {
+                const entry = await loadRepo(body.repo);
+                await requireOperation(event, entry, "read");
+                return response(200, {refs: entry.data.refs || {}});
+              }
               if (path === "/refs/update" && method === "POST") {
                 const entry = await loadRepo(body.repo);
                 const key = await requireOperation(event, entry, "write");

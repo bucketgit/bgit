@@ -43,6 +43,28 @@ type brokerObjectAWSCredentials struct {
 	SessionToken    string `json:"session_token"`
 }
 
+type brokerRefsRequest struct {
+	Repo brokerRepo `json:"repo"`
+}
+
+type brokerRefsResponse struct {
+	Refs map[string]string `json:"refs"`
+}
+
+func (s *brokerGitStore) listRefs(ctx context.Context) (map[string]string, error) {
+	var resp brokerRefsResponse
+	if err := brokerPostContext(ctx, s.brokerURL, "/refs/list", brokerRefsRequest{Repo: repoForBroker(s.cfg)}, &resp); err != nil {
+		return nil, err
+	}
+	refs := map[string]string{}
+	for ref, hash := range resp.Refs {
+		if strings.HasPrefix(ref, "refs/") && isHexHash(strings.TrimSpace(hash)) {
+			refs[ref] = strings.TrimSpace(hash)
+		}
+	}
+	return refs, nil
+}
+
 func (s *brokerGitStore) write(ctx context.Context, objectPath string, data []byte) error {
 	capability, err := s.objectCapability(ctx, objectPath, "write", int64(len(data)))
 	if err != nil {

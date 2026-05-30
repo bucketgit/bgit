@@ -1216,7 +1216,7 @@ func simpleLineDiff(left, right string) []string {
 	if left == right {
 		return nil
 	}
-	if len(a) != 0 && len(b) > 900000/len(a) {
+	if simpleLineDiffShouldFallback(len(a), len(b)) {
 		return simpleWholeFileDiff(a, b)
 	}
 	ops := simpleLineDiffOps(a, b)
@@ -1245,9 +1245,14 @@ type simpleDiffHunk struct {
 }
 
 func simpleLineDiffOps(a, b []string) []simpleDiffOp {
-	rows := make([][]int, len(a)+1)
+	if simpleLineDiffShouldFallback(len(a), len(b)) {
+		return simpleWholeFileDiffOps(a, b)
+	}
+	rowCount := len(a) + 1
+	colCount := len(b) + 1
+	rows := make([][]int, rowCount)
 	for i := range rows {
-		rows[i] = make([]int, len(b)+1)
+		rows[i] = make([]int, colCount)
 	}
 	for i := len(a) - 1; i >= 0; i-- {
 		for j := len(b) - 1; j >= 0; j-- {
@@ -1275,6 +1280,29 @@ func simpleLineDiffOps(a, b []string) []simpleDiffOp {
 			ops = append(ops, simpleDiffOp{kind: '+', text: b[j], oldLine: i + 1, newLine: j + 1})
 			j++
 		}
+	}
+	return ops
+}
+
+func simpleLineDiffShouldFallback(leftLines, rightLines int) bool {
+	const maxSimpleDiffCells = 900000
+	maxInt := int(^uint(0) >> 1)
+	if leftLines >= maxInt || rightLines >= maxInt {
+		return true
+	}
+	if leftLines != 0 && rightLines > maxSimpleDiffCells/leftLines {
+		return true
+	}
+	return false
+}
+
+func simpleWholeFileDiffOps(a, b []string) []simpleDiffOp {
+	var ops []simpleDiffOp
+	for i, line := range a {
+		ops = append(ops, simpleDiffOp{kind: '-', text: line, oldLine: i + 1})
+	}
+	for i, line := range b {
+		ops = append(ops, simpleDiffOp{kind: '+', text: line, newLine: i + 1})
 	}
 	return ops
 }

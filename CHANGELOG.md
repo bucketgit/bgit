@@ -4,6 +4,13 @@ All notable changes to `bgit` are documented in this file.
 
 This project follows semantic versioning.
 
+## 1.3.1
+
+Fixed
+
+- Guarded oversized local and web diff/index allocation paths to avoid integer
+  overflow in pathological repositories.
+
 ## 1.3.0
 
 Added

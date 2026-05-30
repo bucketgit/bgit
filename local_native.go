@@ -702,6 +702,7 @@ func (r *localRepository) checkoutPaths(source string, paths []string) error {
 		return err
 	}
 	for _, path := range paths {
+		path = cleanRepoPath(path)
 		prefix := strings.TrimSuffix(path, "/") + "/"
 		matched := false
 		for file, meta := range files {
@@ -716,7 +717,11 @@ func (r *localRepository) checkoutPaths(source string, paths []string) error {
 		}
 		if !matched {
 			idx.removePath(path)
-			if err := os.RemoveAll(filepath.Join(r.worktree, filepath.FromSlash(path))); err != nil {
+			full, err := r.worktreePath(path)
+			if err != nil {
+				return err
+			}
+			if err := os.RemoveAll(full); err != nil {
 				return err
 			}
 		}
@@ -1034,7 +1039,10 @@ func (r *localRepository) writeIndex(idx gitIndex) error {
 
 func (r *localRepository) addPathToIndex(idx *gitIndex, rel string) error {
 	rel = cleanRepoPath(rel)
-	full := filepath.Join(r.worktree, filepath.FromSlash(rel))
+	full, err := r.worktreePath(rel)
+	if err != nil {
+		return err
+	}
 	info, err := os.Lstat(full)
 	if err != nil {
 		return err
@@ -1075,7 +1083,24 @@ func (r *localRepository) addPathToIndex(idx *gitIndex, rel string) error {
 }
 
 func (r *localRepository) writeBlobFromWorktree(path string) (string, error) {
-	data, err := os.ReadFile(filepath.Join(r.worktree, filepath.FromSlash(path)))
+	full, err := r.worktreePath(path)
+	if err != nil {
+		return "", err
+	}
+	info, err := os.Lstat(full)
+	if err != nil {
+		return "", err
+	}
+	var data []byte
+	if info.Mode()&os.ModeSymlink != 0 {
+		target, err := os.Readlink(full)
+		if err != nil {
+			return "", err
+		}
+		data = []byte(target)
+	} else {
+		data, err = os.ReadFile(full)
+	}
 	if err != nil {
 		return "", err
 	}
@@ -1375,7 +1400,11 @@ func parseAncestorRevision(rev string) (string, int, bool) {
 }
 
 func (r *localRepository) readRef(ref string) (string, error) {
-	data, err := os.ReadFile(filepath.Join(r.gitDir, filepath.FromSlash(ref)))
+	refPath, err := r.gitPath(ref)
+	if err != nil {
+		return "", fs.ErrNotExist
+	}
+	data, err := os.ReadFile(refPath)
 	if err == nil {
 		hash := strings.TrimSpace(string(data))
 		if isHexHash(hash) {
@@ -1573,8 +1602,11 @@ func hasTrackedPathUnder(index map[string]indexEntry, dir string) bool {
 
 func (r *localRepository) expandPathArg(arg string) ([]string, error) {
 	rel := cleanRepoPath(arg)
-	full := filepath.Join(r.worktree, filepath.FromSlash(rel))
-	info, err := os.Stat(full)
+	full, err := r.worktreePath(rel)
+	if err != nil {
+		return nil, err
+	}
+	info, err := os.Lstat(full)
 	if err != nil {
 		return nil, err
 	}
@@ -1582,6 +1614,30 @@ func (r *localRepository) expandPathArg(arg string) ([]string, error) {
 		return r.filesUnder(rel)
 	}
 	return []string{rel}, nil
+}
+
+func (r *localRepository) worktreePath(rel string) (string, error) {
+	return safeJoinLocalPath(r.worktree, cleanRepoPath(rel))
+}
+
+func (r *localRepository) gitPath(rel string) (string, error) {
+	return safeJoinLocalPath(r.gitDir, cleanRepoPath(rel))
+}
+
+func safeJoinLocalPath(root, rel string) (string, error) {
+	rootAbs, err := filepath.Abs(root)
+	if err != nil {
+		return "", err
+	}
+	target := filepath.Join(rootAbs, filepath.FromSlash(rel))
+	targetRel, err := filepath.Rel(rootAbs, target)
+	if err != nil {
+		return "", err
+	}
+	if targetRel == "." || targetRel == ".." || strings.HasPrefix(targetRel, ".."+string(filepath.Separator)) || filepath.IsAbs(targetRel) {
+		return "", fmt.Errorf("path escapes repository: %s", rel)
+	}
+	return target, nil
 }
 
 func (r *localRepository) configValue(key string) string {

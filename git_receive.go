@@ -162,9 +162,10 @@ func serveReceivePack(ctx context.Context, repo *nativeGitRepo, stdin io.Reader,
 		return errors.New("receive-pack requires a writable store")
 	}
 
+	var received map[string]gitObject
 	var unpackErr error
 	if receivePackNeedsPack(req.commands) {
-		_, unpackErr = ingestReceivePack(ctx, repo, store, req.pack)
+		received, unpackErr = ingestReceivePack(ctx, repo, store, req.pack)
 	}
 	if unpackErr != nil {
 		if req.caps["report-status"] || req.caps["report-status-v2"] {
@@ -181,7 +182,7 @@ func serveReceivePack(ctx context.Context, repo *nativeGitRepo, stdin io.Reader,
 			return err
 		}
 	}
-	commandErrs, applyErr := applyReceivePackCommands(ctx, repo, store, req.commands, req.caps["atomic"], brokerURL)
+	commandErrs, applyErr := applyReceivePackCommands(ctx, repo, store, req.commands, req.caps["atomic"], brokerURL, received)
 	if req.caps["report-status"] || req.caps["report-status-v2"] {
 		if err := writeReceivePackReport(stdout, req, nil, commandErrs); err != nil && applyErr == nil {
 			return err
@@ -213,7 +214,7 @@ func receivePackNeedsPack(commands []receivePackCommand) bool {
 	return false
 }
 
-func applyReceivePackCommands(ctx context.Context, repo *nativeGitRepo, store writableGitRemoteStore, commands []receivePackCommand, atomic bool, brokerURL string) (map[string]error, error) {
+func applyReceivePackCommands(ctx context.Context, repo *nativeGitRepo, store writableGitRemoteStore, commands []receivePackCommand, atomic bool, brokerURL string, received map[string]gitObject) (map[string]error, error) {
 	refs, err := repo.refs(ctx)
 	if err != nil {
 		return nil, err
@@ -221,7 +222,7 @@ func applyReceivePackCommands(ctx context.Context, repo *nativeGitRepo, store wr
 	commandErrs := map[string]error{}
 	var firstErr error
 	for _, cmd := range commands {
-		if err := validateReceivePackCommand(ctx, repo, refs, cmd); err != nil {
+		if err := validateReceivePackCommand(ctx, repo, refs, cmd, received); err != nil {
 			commandErrs[cmd.ref] = err
 			if firstErr == nil {
 				firstErr = err
@@ -299,7 +300,7 @@ func applyReceivePackCommands(ctx context.Context, repo *nativeGitRepo, store wr
 	return commandErrs, firstErr
 }
 
-func validateReceivePackCommand(ctx context.Context, repo *nativeGitRepo, refs map[string]string, cmd receivePackCommand) error {
+func validateReceivePackCommand(ctx context.Context, repo *nativeGitRepo, refs map[string]string, cmd receivePackCommand, received map[string]gitObject) error {
 	current, exists := refs[cmd.ref]
 	switch cmd.action() {
 	case "create":
@@ -312,6 +313,15 @@ func validateReceivePackCommand(ctx context.Context, repo *nativeGitRepo, refs m
 		}
 		if current != cmd.old {
 			return fmt.Errorf("stale ref")
+		}
+		if strings.HasPrefix(cmd.ref, "refs/heads/") {
+			ancestor, err := isAncestorWithReceived(ctx, repo, received, current, cmd.new)
+			if err != nil {
+				return err
+			}
+			if !ancestor {
+				return fmt.Errorf("non-fast-forward update")
+			}
 		}
 	case "delete":
 		if !exists {
@@ -328,6 +338,9 @@ func validateReceivePackCommand(ctx context.Context, repo *nativeGitRepo, refs m
 	if cmd.new == zeroObjectID() {
 		return nil
 	}
+	if _, ok := received[cmd.new]; ok {
+		return nil
+	}
 	if _, err := repo.object(ctx, cmd.new); err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			return fmt.Errorf("missing object %s", cmd.new)
@@ -335,4 +348,36 @@ func validateReceivePackCommand(ctx context.Context, repo *nativeGitRepo, refs m
 		return err
 	}
 	return nil
+}
+
+func isAncestorWithReceived(ctx context.Context, repo *nativeGitRepo, received map[string]gitObject, ancestor, descendant string) (bool, error) {
+	stack := []string{descendant}
+	seen := map[string]struct{}{}
+	for len(stack) > 0 {
+		hash := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		if hash == ancestor {
+			return true, nil
+		}
+		if _, ok := seen[hash]; ok {
+			continue
+		}
+		seen[hash] = struct{}{}
+		commit, err := commitWithReceived(ctx, repo, received, hash)
+		if err != nil {
+			return false, err
+		}
+		stack = append(stack, commit.parents...)
+	}
+	return false, nil
+}
+
+func commitWithReceived(ctx context.Context, repo *nativeGitRepo, received map[string]gitObject, hash string) (commitObject, error) {
+	if obj, ok := received[hash]; ok {
+		if obj.typ != "commit" {
+			return commitObject{}, fmt.Errorf("object %s is %s, not commit", hash, obj.typ)
+		}
+		return parseCommit(hash, obj.data)
+	}
+	return repo.commit(ctx, hash)
 }

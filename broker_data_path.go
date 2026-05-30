@@ -32,6 +32,7 @@ type brokerObjectCapabilityResponse struct {
 	Bucket      string                     `json:"bucket,omitempty"`
 	Prefix      string                     `json:"prefix,omitempty"`
 	Object      string                     `json:"object,omitempty"`
+	Profile     string                     `json:"profile,omitempty"`
 	Region      string                     `json:"region,omitempty"`
 	Credentials brokerObjectAWSCredentials `json:"credentials,omitempty"`
 }
@@ -40,6 +41,28 @@ type brokerObjectAWSCredentials struct {
 	AccessKeyID     string `json:"access_key_id"`
 	SecretAccessKey string `json:"secret_access_key"`
 	SessionToken    string `json:"session_token"`
+}
+
+type brokerRefsRequest struct {
+	Repo brokerRepo `json:"repo"`
+}
+
+type brokerRefsResponse struct {
+	Refs map[string]string `json:"refs"`
+}
+
+func (s *brokerGitStore) listRefs(ctx context.Context) (map[string]string, error) {
+	var resp brokerRefsResponse
+	if err := brokerPostContext(ctx, s.brokerURL, "/refs/list", brokerRefsRequest{Repo: repoForBroker(s.cfg)}, &resp); err != nil {
+		return nil, err
+	}
+	refs := map[string]string{}
+	for ref, hash := range resp.Refs {
+		if strings.HasPrefix(ref, "refs/") && isHexHash(strings.TrimSpace(hash)) {
+			refs[ref] = strings.TrimSpace(hash)
+		}
+	}
+	return refs, nil
 }
 
 func (s *brokerGitStore) write(ctx context.Context, objectPath string, data []byte) error {
@@ -90,6 +113,9 @@ func (s *brokerGitStore) objectCapability(ctx context.Context, objectPath, opera
 }
 
 func (s *brokerGitStore) getWithCapability(ctx context.Context, capability brokerObjectCapabilityResponse) ([]byte, error) {
+	if capability.Mode == "local" {
+		return localBrokerCapabilityRead(ctx, capability)
+	}
 	if capability.Mode == "sts" || capability.Provider == "s3" {
 		client := s3ClientForBrokerCapability(capability)
 		out, err := client.GetObject(ctx, &s3.GetObjectInput{
@@ -128,6 +154,9 @@ func (s *brokerGitStore) getWithCapability(ctx context.Context, capability broke
 }
 
 func (s *brokerGitStore) writeWithCapability(ctx context.Context, capability brokerObjectCapabilityResponse, data []byte) error {
+	if capability.Mode == "local" {
+		return localBrokerCapabilityWrite(ctx, capability, data)
+	}
 	if capability.Mode == "sts" || capability.Provider == "s3" {
 		client := s3ClientForBrokerCapability(capability)
 		_, err := client.PutObject(ctx, &s3.PutObjectInput{
@@ -158,6 +187,9 @@ func (s *brokerGitStore) writeWithCapability(ctx context.Context, capability bro
 }
 
 func (s *brokerGitStore) deleteWithCapability(ctx context.Context, capability brokerObjectCapabilityResponse) error {
+	if capability.Mode == "local" {
+		return localBrokerCapabilityDelete(ctx, capability)
+	}
 	if capability.Mode == "sts" || capability.Provider == "s3" {
 		client := s3ClientForBrokerCapability(capability)
 		_, err := client.DeleteObject(ctx, &s3.DeleteObjectInput{

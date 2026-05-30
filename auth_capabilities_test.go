@@ -54,6 +54,18 @@ func TestWhoamiCommandWritesGlobalCache(t *testing.T) {
 	}
 }
 
+func TestWhoamiCachePathUsesBGitHome(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("BGIT_HOME", home)
+	path, err := whoamiCachePath("https://broker.example.test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := filepath.Join(home, "cache"); !strings.HasPrefix(path, want) {
+		t.Fatalf("cache path = %s, want prefix %s", path, want)
+	}
+}
+
 func TestPreferredBrokerKeyRankUsesConfiguredThenCachedKeys(t *testing.T) {
 	preferred := []string{"SHA256:configured", "SHA256:cached"}
 	if preferredBrokerKeyRank("SHA256:configured", preferred) >= preferredBrokerKeyRank("SHA256:cached", preferred) {

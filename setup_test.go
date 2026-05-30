@@ -522,6 +522,7 @@ func TestCreateAWSProfileConfiguredUsesAWSConfigureSet(t *testing.T) {
 		{match: "configure set aws_access_key_id A3T00123456789ABCDEF --profile demo"},
 		{match: "configure set aws_secret_access_key test-secret-key-value-1234567890 --profile demo"},
 		{match: "configure set region eu-west-1 --profile demo"},
+		{match: "sts get-caller-identity --output json --profile demo", stdout: `{"Account":"123456789012","Arn":"arn:aws:iam::123456789012:user/demo"}`},
 	})
 	t.Setenv("PATH", bin)
 	var stdout bytes.Buffer

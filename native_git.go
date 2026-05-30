@@ -46,6 +46,10 @@ type writableGitRemoteStore interface {
 	delete(ctx context.Context, path string) error
 }
 
+type refListingGitRemoteStore interface {
+	listRefs(ctx context.Context) (map[string]string, error)
+}
+
 type fallbackGitRemoteStore struct {
 	primary  gitRemoteStore
 	fallback gitRemoteStore
@@ -405,9 +409,6 @@ func (r *nativeGitRepo) pull(ctx context.Context, args []string, stdout io.Write
 	if *rebase {
 		return unsupportedCommand("rebase")
 	}
-	if err := r.fetchIntoWorktree(ctx, worktree, true, stdout); err != nil {
-		return err
-	}
 	localRepo, err := openLocalRepository(worktree)
 	if err != nil {
 		return err
@@ -417,6 +418,26 @@ func (r *nativeGitRepo) pull(ctx context.Context, args []string, stdout io.Write
 		branch = rest[0]
 	} else {
 		branch = firstNonEmpty(localRepo.currentBranch(), r.cfg.branch, defaultBranch)
+	}
+	refs, err := r.refs(ctx)
+	if err != nil {
+		return err
+	}
+	remoteRef := "refs/remotes/bucketgit/" + shortBranchName(branch)
+	if remoteHash := refs[branchRef(branch)]; remoteHash != "" {
+		currentHash, _ := localRepo.resolveRevision("HEAD")
+		if currentHash == remoteHash {
+			if gitDir, err := localGitDir(worktree); err == nil {
+				if err := writeRefFile(filepath.Join(gitDir, filepath.FromSlash(remoteRef)), remoteHash); err != nil {
+					return err
+				}
+			}
+			fmt.Fprintln(stdout, "Already up to date.")
+			return nil
+		}
+	}
+	if err := r.fetchIntoWorktree(ctx, worktree, true, stdout); err != nil {
+		return err
 	}
 	remoteHash, err := localRepo.resolveRevision("refs/remotes/bucketgit/" + shortBranchName(branch))
 	if err != nil {
@@ -491,6 +512,32 @@ func (r *nativeGitRepo) pushWorktree(ctx context.Context, worktree string, opts 
 	if !opts.skipBroker {
 		brokerURL = optionalBrokerURLForPush()
 	}
+	refs, err := r.refs(ctx)
+	if err != nil {
+		return err
+	}
+	if len(opts.refs) == 0 && !opts.tags && !opts.delete {
+		hash, err := gitRevParse(worktree, "HEAD")
+		if err != nil {
+			return err
+		}
+		branch := firstNonEmpty(localRepo.currentBranch(), r.cfg.branch, defaultBranch)
+		ref := branchRef(branch)
+		if oldHash := pushOldHash(gitDir, refs, ref); oldHash == hash {
+			if brokerURL != "" {
+				cfg := r.cfg
+				cfg.brokerURL = brokerURL
+				if err := brokerRequirePush(ctx, cfg); err != nil {
+					return brokerPushError(err)
+				}
+			}
+			if err := updateLocalRemoteTrackingRef(gitDir, ref, hash); err != nil {
+				return err
+			}
+			fmt.Fprintln(stdout, "Everything up-to-date")
+			return nil
+		}
+	}
 	if brokerURL != "" {
 		cfg := r.cfg
 		cfg.brokerURL = brokerURL
@@ -501,11 +548,10 @@ func (r *nativeGitRepo) pushWorktree(ctx context.Context, worktree string, opts 
 	if err := uploadLocalObjects(ctx, store, gitDir); err != nil {
 		return err
 	}
-	refs, err := r.refs(ctx)
-	if err != nil {
-		return err
-	}
 	updateRef := func(ref, oldHash, newHash string) error {
+		if err := ensurePushFastForward(localRepo, ref, oldHash, newHash, opts.force); err != nil {
+			return err
+		}
 		if brokerURL != "" {
 			if err := brokerUpdateRefWithOverride(brokerURL, r.cfg, ref, oldHash, newHash, opts.force); err != nil {
 				return brokerPushError(err)
@@ -616,6 +662,17 @@ func (r *nativeGitRepo) pushWorktree(ctx context.Context, worktree string, opts 
 	fmt.Fprintf(stdout, "To %s\n", originForConfig(r.cfg))
 	for _, line := range updates {
 		fmt.Fprintln(stdout, line)
+	}
+	return nil
+}
+
+func ensurePushFastForward(localRepo *localRepository, ref, oldHash, newHash string, force bool) error {
+	if force || !strings.HasPrefix(ref, "refs/heads/") || oldHash == zeroObjectID() || newHash == zeroObjectID() {
+		return nil
+	}
+	ancestor, err := localRepo.isAncestor(oldHash, newHash)
+	if err != nil || !ancestor {
+		return fmt.Errorf("non-fast-forward update; pull first or use --force")
 	}
 	return nil
 }
@@ -831,6 +888,15 @@ func (r *nativeGitRepo) resolveRevision(ctx context.Context, revision string) (s
 }
 
 func (r *nativeGitRepo) refs(ctx context.Context) (map[string]string, error) {
+	if store, ok := r.store.(refListingGitRemoteStore); ok {
+		refs, err := store.listRefs(ctx)
+		if err == nil {
+			return refs, nil
+		}
+		if !isBrokerCapabilityUnsupported(err) {
+			return nil, err
+		}
+	}
 	refs := map[string]string{}
 	for _, dir := range []string{"refs/heads", "refs/tags"} {
 		paths, err := r.store.list(ctx, dir)
@@ -1235,6 +1301,28 @@ func (r *nativeGitRepo) commit(ctx context.Context, hash string) (commitObject, 
 		return commitObject{}, err
 	}
 	return commit, nil
+}
+
+func (r *nativeGitRepo) isAncestor(ctx context.Context, ancestor, descendant string) (bool, error) {
+	stack := []string{descendant}
+	seen := map[string]struct{}{}
+	for len(stack) > 0 {
+		hash := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		if hash == ancestor {
+			return true, nil
+		}
+		if _, ok := seen[hash]; ok {
+			continue
+		}
+		seen[hash] = struct{}{}
+		commit, err := r.commit(ctx, hash)
+		if err != nil {
+			return false, err
+		}
+		stack = append(stack, commit.parents...)
+	}
+	return false, nil
 }
 
 func parseCommit(hash string, data []byte) (commitObject, error) {
@@ -1775,7 +1863,11 @@ If using --auth adc, refresh Application Default Credentials:
 
 func (s *localGitStore) read(ctx context.Context, path string) ([]byte, error) {
 	_ = ctx
-	data, err := os.ReadFile(filepath.Join(s.root, filepath.FromSlash(path)))
+	target, err := s.path(path)
+	if err != nil {
+		return nil, err
+	}
+	data, err := os.ReadFile(target)
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil, fs.ErrNotExist
 	}
@@ -1784,9 +1876,12 @@ func (s *localGitStore) read(ctx context.Context, path string) ([]byte, error) {
 
 func (s *localGitStore) list(ctx context.Context, prefix string) ([]string, error) {
 	_ = ctx
-	root := filepath.Join(s.root, filepath.FromSlash(prefix))
+	root, err := s.path(prefix)
+	if err != nil {
+		return nil, err
+	}
 	var paths []string
-	err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
+	err = filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			if errors.Is(walkErr, fs.ErrNotExist) {
 				return nil
@@ -1808,7 +1903,10 @@ func (s *localGitStore) list(ctx context.Context, prefix string) ([]string, erro
 
 func (s *localGitStore) write(ctx context.Context, path string, data []byte) error {
 	_ = ctx
-	target := filepath.Join(s.root, filepath.FromSlash(path))
+	target, err := s.path(path)
+	if err != nil {
+		return err
+	}
 	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
 		return err
 	}
@@ -1817,9 +1915,17 @@ func (s *localGitStore) write(ctx context.Context, path string, data []byte) err
 
 func (s *localGitStore) delete(ctx context.Context, path string) error {
 	_ = ctx
-	err := os.Remove(filepath.Join(s.root, filepath.FromSlash(path)))
+	target, pathErr := s.path(path)
+	if pathErr != nil {
+		return pathErr
+	}
+	err := os.Remove(target)
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil
 	}
 	return err
+}
+
+func (s *localGitStore) path(path string) (string, error) {
+	return safeJoinLocalPath(s.root, path)
 }

@@ -444,11 +444,11 @@ func repoNameFromBrokerPayload(payload []byte) string {
 }
 
 func whoamiCachePath(brokerURL string) (string, error) {
-	home, err := os.UserHomeDir()
+	cacheDir, err := defaultBGitCacheDir()
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(home, ".bgit", "cache", safeBrokerCacheName(brokerURL), "whoami.json"), nil
+	return filepath.Join(cacheDir, safeBrokerCacheName(brokerURL), "whoami.json"), nil
 }
 
 func safeBrokerCacheName(brokerURL string) string {

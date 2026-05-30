@@ -2564,6 +2564,12 @@ exports.broker = async (req, res) => {
       res.status(200).send(JSON.stringify({paths}));
       return;
     }
+    if (req.path === '/refs/list' && req.method === 'POST') {
+      const entry = await ensureRepo(body.repo);
+      await requireRead(req, entry);
+      res.status(200).send(JSON.stringify({refs: entry.data.refs || {}}));
+      return;
+    }
     if (req.path === '/refs/update' && req.method === 'POST') {
       const entry = await ensureRepo(body.repo);
       const key = await requireWrite(req, entry);

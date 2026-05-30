@@ -143,7 +143,7 @@ async function main() {
       else await handleGCP(handler, req, res, raw);
     } catch (err) {
       res.writeHead(err.statusCode || err.status || 500, {'content-type': 'application/json'});
-      res.end(JSON.stringify({error: err.message || String(err)}));
+      res.end(JSON.stringify({error: err && err.message ? err.message : 'internal test broker error'}));
     }
   });
   await new Promise((resolve) => server.listen(port, '127.0.0.1', resolve));

@@ -159,6 +159,12 @@ func configForSSHRepoForService(ctx context.Context, repo, host string, publicFa
 	if err != nil {
 		return config{}, err
 	}
+	if cfg.provider == "local" {
+		if _, err := ensureLocalBrokerForCommand(ctx, &cfg); err != nil {
+			return config{}, err
+		}
+		return cfg, nil
+	}
 	if cfg.provider != "gcs" || strings.Contains(cleanGitServiceRepo(repo), "://") {
 		persistDiscoveredSSHRepoConfig(cfg)
 		return cfg, nil
@@ -545,7 +551,10 @@ type brokerRepo struct {
 	Origin   string `json:"origin"`
 	Logical  string `json:"logical,omitempty"`
 	Host     string `json:"host,omitempty"`
+	Profile  string `json:"profile,omitempty"`
+	Region   string `json:"region,omitempty"`
 	TeamID   string `json:"team_id,omitempty"`
+	TeamName string `json:"team_name,omitempty"`
 }
 
 const coreTeamID = "t_core"
@@ -729,6 +738,13 @@ func brokerOperationForGitService(service string) (string, error) {
 }
 
 func brokerURLForSSHService(cfg config) (string, error) {
+	if cfg.provider == "local" {
+		if cfg.brokerURL != "" {
+			return cfg.brokerURL, nil
+		}
+		profileName, regionName := localProfileSelection(cfg.gcloudConfiguration)
+		return localBrokerURL(profileName, regionName), nil
+	}
 	if out, err := runGit(".", "config", "--get", "bucketgit.broker"); err == nil {
 		if value := strings.TrimSpace(string(out)); value != "" {
 			return value, nil
@@ -750,11 +766,13 @@ func repoForBroker(cfg config) brokerRepo {
 		logical = normalized
 	}
 	return brokerRepo{
-		Provider: firstNonEmpty(cfg.provider, "gcs"),
+		Provider: firstNonEmpty(cfg.storageProvider, cfg.provider, "gcs"),
 		Bucket:   cfg.bucket,
 		Prefix:   strings.Trim(cfg.prefix, "/"),
 		Origin:   cfg.origin,
 		Logical:  logical,
+		Profile:  cfg.storageProfile,
+		Region:   cfg.storageRegion,
 		TeamID:   brokerTeamIDForConfig(cfg),
 	}
 }
@@ -772,10 +790,16 @@ func brokerPost(brokerURL, path string, req any, resp any) error {
 }
 
 func brokerPostContext(ctx context.Context, brokerURL, path string, req any, resp any) error {
+	if isLocalBrokerURL(brokerURL) {
+		return localBrokerPostContext(ctx, brokerURL, path, req, resp)
+	}
 	return brokerPostJSONContextWithHeaders(ctx, brokerURL, path, req, resp, nil)
 }
 
 func brokerPostJSONContextWithHeaders(ctx context.Context, brokerURL, path string, req any, resp any, extraHeaders map[string]string) error {
+	if isLocalBrokerURL(brokerURL) {
+		return localBrokerPostContext(ctx, brokerURL, path, req, resp)
+	}
 	endpoint := strings.TrimRight(brokerURL, "/") + path
 	data, err := json.Marshal(req)
 	if err != nil {
@@ -1090,6 +1114,13 @@ func provisionBroker(cfg config, opts sshSetupOptions, stdout io.Writer) (provis
 	case "s3":
 		url, err := provisionAWSBrokerURLWithBootstrap(cfg, opts, stdout, hash)
 		return provisionedBroker{URL: url, BootstrapToken: token}, err
+	case "local":
+		url := firstNonEmpty(strings.TrimSpace(os.Getenv("BGIT_LOCAL_BROKER_URL")), localBrokerURL("default", "default"))
+		fmt.Fprintf(stdout, "using local broker %s\n", url)
+		if token := strings.TrimSpace(os.Getenv("BGIT_LOCAL_BROKER_BOOTSTRAP_TOKEN")); token != "" {
+			return provisionedBroker{URL: strings.TrimRight(url, "/"), BootstrapToken: token}, nil
+		}
+		return provisionedBroker{URL: strings.TrimRight(url, "/"), BootstrapToken: token}, nil
 	default:
 		return provisionedBroker{}, fmt.Errorf("unsupported storage provider %q", cfg.provider)
 	}

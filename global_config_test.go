@@ -39,6 +39,17 @@ func TestGlobalConfigRoundTrip(t *testing.T) {
 				LastSetupAt:   "2026-05-16T10:00:00Z",
 			}},
 		}},
+		LocalProfiles: []globalLocalProfile{{
+			Name:      "default",
+			Root:      "/tmp/bgit-local",
+			Autostart: true,
+			Regions: []globalProfileRegion{{
+				Name:          "default",
+				BrokerURL:     "local://default/default",
+				BrokerVersion: brokerVersion(),
+				LastSetupAt:   "2026-05-16T10:00:00Z",
+			}},
+		}},
 		Repos: []globalRepoConfig{{
 			Name:      "app.git",
 			Profile:   "gcp:work",
@@ -57,6 +68,9 @@ func TestGlobalConfigRoundTrip(t *testing.T) {
 		!strings.Contains(text, "identity:") ||
 		!strings.Contains(text, "Dennis Example") ||
 		!strings.Contains(text, "aws:") ||
+		!strings.Contains(text, "local:") ||
+		!strings.Contains(text, "/tmp/bgit-local") ||
+		!strings.Contains(text, "autostart: true") ||
 		!strings.Contains(text, "profiles:") ||
 		!strings.Contains(text, "work:") ||
 		!strings.Contains(text, "regions:") ||
@@ -71,6 +85,7 @@ func TestGlobalConfigRoundTrip(t *testing.T) {
 	if got.Version != want.Version ||
 		len(got.GCPProfiles) != 1 ||
 		len(got.AWSProfiles) != 1 ||
+		len(got.LocalProfiles) != 1 ||
 		len(got.Repos) != 1 ||
 		got.Identity != want.Identity {
 		t.Fatalf("cfg = %#v", got)
@@ -80,6 +95,9 @@ func TestGlobalConfigRoundTrip(t *testing.T) {
 	}
 	if !reflect.DeepEqual(got.AWSProfiles[0], want.AWSProfiles[0]) {
 		t.Fatalf("aws profile = %#v", got.AWSProfiles[0])
+	}
+	if !reflect.DeepEqual(got.LocalProfiles[0], want.LocalProfiles[0]) {
+		t.Fatalf("local profile = %#v", got.LocalProfiles[0])
 	}
 	if got.Repos[0] != want.Repos[0] {
 		t.Fatalf("repo = %#v", got.Repos[0])
@@ -96,6 +114,34 @@ func TestDefaultGlobalConfigPathUsesYAML(t *testing.T) {
 	want := filepath.Join(home, ".bgit", "config.yaml")
 	if got != want {
 		t.Fatalf("path = %q, want %q", got, want)
+	}
+}
+
+func TestBGitHomeOverridesDefaultPaths(t *testing.T) {
+	home := t.TempDir()
+	setTestHome(t, t.TempDir())
+	t.Setenv("BGIT_HOME", home)
+
+	configPath, err := defaultGlobalConfigPath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := filepath.Join(home, "config.yaml"); configPath != want {
+		t.Fatalf("config path = %q, want %q", configPath, want)
+	}
+	localRoot, err := defaultLocalBrokerRoot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := filepath.Join(home, "local-broker"); localRoot != want {
+		t.Fatalf("local broker root = %q, want %q", localRoot, want)
+	}
+	cacheDir, err := defaultBGitCacheDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := filepath.Join(home, "cache"); cacheDir != want {
+		t.Fatalf("cache dir = %q, want %q", cacheDir, want)
 	}
 }
 

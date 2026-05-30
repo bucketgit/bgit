@@ -7,7 +7,7 @@ import (
 	"strings"
 )
 
-//go:embed broker/gcp/package.json broker/gcp/index.js broker/gcp/materializer.js broker/aws/template.yaml
+//go:embed broker/gcp/package.json broker/gcp/index.js broker/gcp/materializer.js broker/aws/template.yaml broker/test_support/sqlite_broker.js
 var brokerAssets embed.FS
 
 func writeGCPBrokerSource(dir string) error {

@@ -14,14 +14,14 @@ document.addEventListener('click', function (event) {
   const fileResult = event.target.closest('[data-file-search-result]');
   if (fileResult) {
     event.preventDefault();
-    window.location.href = fileResult.getAttribute('data-file-search-result');
+    navigateToLocalURL(fileResult.getAttribute('data-file-search-result'));
     return;
   }
 
   const prItem = event.target.closest('[data-pr-href]');
   if (prItem && !event.target.closest('a, button, input, textarea, select, label')) {
     event.preventDefault();
-    window.location.href = prItem.getAttribute('data-pr-href');
+    navigateToLocalURL(prItem.getAttribute('data-pr-href'));
     return;
   }
 
@@ -35,7 +35,7 @@ document.addEventListener('click', function (event) {
   const commitRow = event.target.closest('[data-commit-href]');
   if (commitRow && !event.target.closest('a, button, input, textarea, select, label, .commit-inline-detail')) {
     event.preventDefault();
-    window.location.href = commitRow.getAttribute('data-commit-href');
+    navigateToLocalURL(commitRow.getAttribute('data-commit-href'));
     return;
   }
 
@@ -383,6 +383,19 @@ document.addEventListener('submit', function (event) {
   }
 });
 
+function navigateToLocalURL(value) {
+  if (!value) return;
+  let url;
+  try {
+    url = new URL(value, window.location.origin);
+  } catch (_) {
+    return;
+  }
+  if (url.origin !== window.location.origin) return;
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') return;
+  window.location.assign(url.pathname + url.search + url.hash);
+}
+
 document.addEventListener('input', function (event) {
   const input = event.target.closest('[data-file-search]');
   if (!input) return;
@@ -401,7 +414,7 @@ document.addEventListener('keydown', function (event) {
   const match = findIndexedFile(input.value);
   if (!match) return;
   event.preventDefault();
-  window.location.href = match.url;
+  navigateToLocalURL(match.url);
 });
 
 document.addEventListener('DOMContentLoaded', function () {

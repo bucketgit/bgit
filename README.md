@@ -579,7 +579,7 @@ Runtime requirements depend on the command:
 - `gcloud` for GCP setup and profile creation.
 - AWS config/credentials files and optionally the AWS CLI for AWS setup/profile
   creation.
-- Go 1.22 or newer to build from source.
+- Go 1.24 or newer to build from source.
 
 ## Unsupported Commands
 

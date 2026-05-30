@@ -3875,7 +3875,8 @@ func (s *webServer) fileIndexHTML(ctx context.Context, treeHash, ref string) str
 	if len(paths) > maxInt-len(dirPaths) {
 		return ""
 	}
-	index := make([]webFileIndexEntry, 0, len(paths)+len(dirPaths))
+	indexLen := len(paths) + len(dirPaths)
+	index := make([]webFileIndexEntry, 0, indexLen)
 	for _, dir := range dirPaths {
 		index = append(index, webFileIndexEntry{Path: dir, URL: webURL("tree", dir, ref), Kind: "dir"})
 	}

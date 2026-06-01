@@ -382,6 +382,86 @@ func TestBoardCommandListsStoriesByLane(t *testing.T) {
 	}
 }
 
+func TestBoardCommandEditsAndArchivesStories(t *testing.T) {
+	var updateReq brokerIssueRequest
+	var archiveReq brokerIssueRequest
+	target, server, requests := setupBrokerCommandTestRepo(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/issues/update":
+			if err := json.NewDecoder(r.Body).Decode(&updateReq); err != nil {
+				t.Fatal(err)
+			}
+			_, _ = w.Write([]byte(`{"ok":true}`))
+		case "/issues/archive":
+			if err := json.NewDecoder(r.Body).Decode(&archiveReq); err != nil {
+				t.Fatal(err)
+			}
+			_, _ = w.Write([]byte(`{"ok":true}`))
+		default:
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+	})
+	defer server.Close()
+	oldDir, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(oldDir)
+	if err := os.Chdir(target); err != nil {
+		t.Fatal(err)
+	}
+	var stdout bytes.Buffer
+	if err := boardCommand([]string{"edit", "AP-7", "As", "a", "user,", "I", "want", "edited", "story."}, strings.NewReader(""), &stdout); err != nil {
+		t.Fatal(err)
+	}
+	if updateReq.ID != 7 || updateReq.Type != "story" || updateReq.Body != "As a user, I want edited story." || updateReq.Title != "As a user, I want edited story." {
+		t.Fatalf("update req = %#v", updateReq)
+	}
+	stdout.Reset()
+	if err := boardCommand([]string{"archive", "AP-7"}, strings.NewReader(""), &stdout); err != nil {
+		t.Fatal(err)
+	}
+	if archiveReq.ID != 7 || !archiveReq.Archived {
+		t.Fatalf("archive req = %#v", archiveReq)
+	}
+	if got := strings.Join(*requests, ","); got != "/issues/update,/issues/archive" {
+		t.Fatalf("requests = %s", got)
+	}
+}
+
+func TestBoardCommandListsArchivedStoriesSeparately(t *testing.T) {
+	var listReq brokerIssueRequest
+	target, server, _ := setupBrokerCommandTestRepo(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/issues/list" {
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+		if err := json.NewDecoder(r.Body).Decode(&listReq); err != nil {
+			t.Fatal(err)
+		}
+		_, _ = w.Write([]byte(`{"issues":[{"id":1,"type":"story","title":"Active","lane":"backlog"},{"id":2,"type":"story","title":"Archived","lane":"done","archived":true}]}`))
+	})
+	defer server.Close()
+	oldDir, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(oldDir)
+	if err := os.Chdir(target); err != nil {
+		t.Fatal(err)
+	}
+	var stdout bytes.Buffer
+	if err := boardCommand([]string{"list", "--archived"}, strings.NewReader(""), &stdout); err != nil {
+		t.Fatal(err)
+	}
+	if !listReq.IncludeArchived || listReq.Type != "story" {
+		t.Fatalf("list req = %#v", listReq)
+	}
+	out := stdout.String()
+	if !strings.Contains(out, "archived\n") || !strings.Contains(out, "AP-2\tArchived") || strings.Contains(out, "Active") {
+		t.Fatalf("stdout = %q", out)
+	}
+}
+
 func TestSortedBoardAssigneesDeduplicatesCaseInsensitive(t *testing.T) {
 	got := sortedBoardAssignees([]string{"zoe", "Ada", "ada", "", "mike"})
 	want := []string{"Ada", "mike", "zoe"}

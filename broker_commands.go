@@ -2870,7 +2870,7 @@ func issueCommand(args []string, stdin io.Reader, stdout io.Writer) error {
 func boardCommand(args []string, stdin io.Reader, stdout io.Writer) error {
 	_ = stdin
 	if len(args) == 0 {
-		return errors.New("usage: bgit board list|create|move|take|comment [args]")
+		return errors.New("usage: bgit board list|create|edit|move|take|assign|archive|unarchive|comment [args]")
 	}
 	cfg, err := configForBrokerCommand(config{})
 	if err != nil {
@@ -2879,16 +2879,40 @@ func boardCommand(args []string, stdin io.Reader, stdout io.Writer) error {
 	monogram := repoMonogram(cfg.logicalRepo)
 	switch args[0] {
 	case "list":
+		includeArchived := false
+		for _, arg := range args[1:] {
+			switch arg {
+			case "--archived", "--all":
+				includeArchived = true
+			default:
+				return fmt.Errorf("unsupported board list option %s", arg)
+			}
+		}
 		var resp struct {
 			Issues []brokerIssue `json:"issues"`
 		}
-		if err := brokerPost(cfg.brokerURL, "/issues/list", brokerIssueRequest{Repo: repoForBroker(cfg), Type: "story"}, &resp); err != nil {
+		if err := brokerPost(cfg.brokerURL, "/issues/list", brokerIssueRequest{Repo: repoForBroker(cfg), Type: "story", IncludeArchived: includeArchived}, &resp); err != nil {
 			return err
+		}
+		sortBoardStories(resp.Issues)
+		if includeArchived {
+			fmt.Fprintf(stdout, "archived\n")
+			for _, issue := range resp.Issues {
+				if issue.Type != "story" || !issue.Archived {
+					continue
+				}
+				assignee := ""
+				if issue.Assignee != "" {
+					assignee = "\t@" + issue.Assignee
+				}
+				fmt.Fprintf(stdout, "  %s\t%s%s\n", storyDisplayID(monogram, issue.ID), issue.Title, assignee)
+			}
+			return nil
 		}
 		for _, lane := range kanbanLanes() {
 			fmt.Fprintf(stdout, "%s\n", lane)
 			for _, issue := range resp.Issues {
-				if issue.Type != "story" || normalizeKanbanLane(issue.Lane) != lane {
+				if issue.Type != "story" || issue.Archived || normalizeKanbanLane(issue.Lane) != lane {
 					continue
 				}
 				assignee := ""
@@ -2932,6 +2956,23 @@ func boardCommand(args []string, stdin io.Reader, stdout io.Writer) error {
 		}
 		fmt.Fprintf(stdout, "created story %s\n", storyDisplayID(monogram, resp.Issue.ID))
 		return nil
+	case "edit":
+		if len(args) < 3 {
+			return errors.New("usage: bgit board edit STORY_ID STORY")
+		}
+		id, err := parseBoardStoryIDArg(args[:2], monogram)
+		if err != nil {
+			return err
+		}
+		story := strings.Join(args[2:], " ")
+		if strings.TrimSpace(story) == "" {
+			return errors.New("story is required")
+		}
+		if err := brokerPost(cfg.brokerURL, "/issues/update", brokerIssueRequest{Repo: repoForBroker(cfg), ID: id, Type: "story", Title: storySummary(story), Body: story}, nil); err != nil {
+			return boardUpgradeError(err)
+		}
+		fmt.Fprintf(stdout, "edited story %s\n", storyDisplayID(monogram, id))
+		return nil
 	case "move":
 		if len(args) != 3 {
 			return errors.New("usage: bgit board move STORY_ID backlog|ready|doing|review|done")
@@ -2959,6 +3000,42 @@ func boardCommand(args []string, stdin io.Reader, stdout io.Writer) error {
 		}
 		fmt.Fprintf(stdout, "took story %s\n", storyDisplayID(monogram, id))
 		return nil
+	case "assign":
+		if len(args) != 3 {
+			return errors.New("usage: bgit board assign STORY_ID USER|unassigned")
+		}
+		id, err := parseBoardStoryIDArg(args[:2], monogram)
+		if err != nil {
+			return err
+		}
+		assignee := args[2]
+		if strings.EqualFold(assignee, "unassigned") || strings.EqualFold(assignee, "none") || assignee == "-" {
+			assignee = ""
+		}
+		if err := brokerPost(cfg.brokerURL, "/issues/assign", brokerIssueRequest{Repo: repoForBroker(cfg), ID: id, Assignee: assignee}, nil); err != nil {
+			return err
+		}
+		if assignee == "" {
+			fmt.Fprintf(stdout, "unassigned story %s\n", storyDisplayID(monogram, id))
+		} else {
+			fmt.Fprintf(stdout, "assigned story %s to %s\n", storyDisplayID(monogram, id), assignee)
+		}
+		return nil
+	case "archive", "unarchive":
+		id, err := parseBoardStoryIDArg(args, monogram)
+		if err != nil {
+			return err
+		}
+		archived := args[0] == "archive"
+		if err := brokerPost(cfg.brokerURL, "/issues/archive", brokerIssueRequest{Repo: repoForBroker(cfg), ID: id, Archived: archived}, nil); err != nil {
+			return boardUpgradeError(err)
+		}
+		if archived {
+			fmt.Fprintf(stdout, "archived story %s\n", storyDisplayID(monogram, id))
+		} else {
+			fmt.Fprintf(stdout, "unarchived story %s\n", storyDisplayID(monogram, id))
+		}
+		return nil
 	case "comment":
 		if len(args) < 3 {
 			return errors.New("usage: bgit board comment STORY_ID COMMENT")
@@ -2983,6 +3060,47 @@ func parseBoardStoryIDArg(args []string, monogram string) (int, error) {
 		return 0, errors.New("story id is required")
 	}
 	return parseStoryDisplayID(args[1], monogram)
+}
+
+func boardUpgradeError(err error) error {
+	if err == nil {
+		return nil
+	}
+	if strings.Contains(err.Error(), "unknown broker endpoint") {
+		return fmt.Errorf("%w\nbroker needs to be upgraded for story edit/archive/order support; run `bgit admin broker upgrade`", err)
+	}
+	return err
+}
+
+func sortBoardStories(stories []brokerIssue) {
+	sort.SliceStable(stories, func(i, j int) bool {
+		leftLane := normalizeKanbanLane(stories[i].Lane)
+		rightLane := normalizeKanbanLane(stories[j].Lane)
+		if leftLane != rightLane {
+			return laneSortIndex(leftLane) < laneSortIndex(rightLane)
+		}
+		leftPosition := stories[i].Position
+		rightPosition := stories[j].Position
+		if leftPosition != rightPosition {
+			if leftPosition == 0 {
+				return false
+			}
+			if rightPosition == 0 {
+				return true
+			}
+			return leftPosition < rightPosition
+		}
+		return stories[i].ID < stories[j].ID
+	})
+}
+
+func laneSortIndex(lane string) int {
+	for i, candidate := range kanbanLanes() {
+		if candidate == lane {
+			return i
+		}
+	}
+	return len(kanbanLanes())
 }
 
 func parseIssueIDArg(args []string) (int, error) {

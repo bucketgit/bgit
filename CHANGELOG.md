@@ -4,6 +4,23 @@ All notable changes to `bgit` are documented in this file.
 
 This project follows semantic versioning.
 
+## 1.3.2
+
+Added
+
+- Added Task board story editing, archiving, archived-story listing, activity
+  history, and persistent ordering/reordering support across AWS and GCP
+  brokers.
+- Added `bgit board edit`, `bgit board assign`, `bgit board archive`, and
+  `bgit board unarchive` commands.
+
+Fixed
+
+- `bgit fetch` and `bgit push` now keep matching `origin/*` remote-tracking refs
+  in sync with `bucketgit/*`, so native `git status` no longer reports stale
+  ahead/behind state after bgit operations.
+- `bgit web` now counts only open pull requests in the Pull requests tab badge.
+
 ## 1.3.1
 
 Fixed

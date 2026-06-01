@@ -172,10 +172,13 @@ type brokerIssue struct {
 	Status    string             `json:"status,omitempty"`
 	Lane      string             `json:"lane,omitempty"`
 	Assignee  string             `json:"assignee,omitempty"`
+	Position  float64            `json:"position,omitempty"`
+	Archived  bool               `json:"archived,omitempty"`
 	Author    string             `json:"author,omitempty"`
 	CreatedAt string             `json:"created_at,omitempty"`
 	UpdatedAt string             `json:"updated_at,omitempty"`
 	Comments  []brokerIssueReply `json:"comments,omitempty"`
+	History   []brokerIssueEvent `json:"history,omitempty"`
 }
 
 type brokerIssueReply struct {
@@ -184,15 +187,28 @@ type brokerIssueReply struct {
 	At   string `json:"at,omitempty"`
 }
 
+type brokerIssueEvent struct {
+	User     string `json:"user,omitempty"`
+	Action   string `json:"action,omitempty"`
+	From     string `json:"from,omitempty"`
+	To       string `json:"to,omitempty"`
+	At       string `json:"at,omitempty"`
+	Ref      string `json:"ref,omitempty"`
+	Position string `json:"position,omitempty"`
+}
+
 type brokerIssueRequest struct {
-	Repo     brokerRepo `json:"repo"`
-	ID       int        `json:"id,omitempty"`
-	Type     string     `json:"type,omitempty"`
-	Title    string     `json:"title,omitempty"`
-	Body     string     `json:"body,omitempty"`
-	Lane     string     `json:"lane,omitempty"`
-	Assignee string     `json:"assignee,omitempty"`
-	Comment  string     `json:"comment,omitempty"`
+	Repo            brokerRepo `json:"repo"`
+	ID              int        `json:"id,omitempty"`
+	Type            string     `json:"type,omitempty"`
+	Title           string     `json:"title,omitempty"`
+	Body            string     `json:"body,omitempty"`
+	Lane            string     `json:"lane,omitempty"`
+	Assignee        string     `json:"assignee,omitempty"`
+	Comment         string     `json:"comment,omitempty"`
+	AfterID         *int       `json:"after_id,omitempty"`
+	Archived        bool       `json:"archived,omitempty"`
+	IncludeArchived bool       `json:"include_archived,omitempty"`
 }
 
 type boardRenderContext struct {
@@ -947,13 +963,20 @@ func (s *webServer) handleAPIIssues(ctx context.Context, w http.ResponseWriter, 
 }
 
 func (s *webServer) listIssues(ctx context.Context) ([]brokerIssue, error) {
+	return s.listIssuesWithOptions(ctx, brokerIssueRequest{Repo: repoForBroker(s.cfg)})
+}
+
+func (s *webServer) listIssuesWithOptions(ctx context.Context, req brokerIssueRequest) ([]brokerIssue, error) {
 	if strings.TrimSpace(s.cfg.brokerURL) == "" || strings.TrimSpace(s.cfg.logicalRepo) == "" {
 		return nil, errors.New("broker issues unavailable")
+	}
+	if strings.TrimSpace(req.Repo.Logical) == "" {
+		req.Repo = repoForBroker(s.cfg)
 	}
 	var resp struct {
 		Issues []brokerIssue `json:"issues"`
 	}
-	if err := brokerPostContext(ctx, s.cfg.brokerURL, "/issues/list", brokerIssueRequest{Repo: repoForBroker(s.cfg)}, &resp); err != nil {
+	if err := brokerPostContext(ctx, s.cfg.brokerURL, "/issues/list", req, &resp); err != nil {
 		return nil, err
 	}
 	return resp.Issues, nil
@@ -1832,12 +1855,13 @@ func (s *webServer) handleAPIActionBoard(ctx context.Context, w http.ResponseWri
 		Lane     string `json:"lane"`
 		Assignee string `json:"assignee"`
 		Comment  string `json:"comment"`
+		AfterID  *int   `json:"after_id"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		s.renderJSONError(w, http.StatusBadRequest, err)
 		return
 	}
-	payload := brokerIssueRequest{Repo: repoForBroker(s.cfg), ID: req.ID, Type: "story", Title: strings.TrimSpace(req.Title), Body: strings.TrimSpace(req.Body), Lane: strings.TrimSpace(req.Lane), Assignee: strings.TrimSpace(req.Assignee), Comment: strings.TrimSpace(req.Comment)}
+	payload := brokerIssueRequest{Repo: repoForBroker(s.cfg), ID: req.ID, Type: "story", Title: strings.TrimSpace(req.Title), Body: strings.TrimSpace(req.Body), Lane: strings.TrimSpace(req.Lane), Assignee: strings.TrimSpace(req.Assignee), Comment: strings.TrimSpace(req.Comment), AfterID: req.AfterID}
 	endpoint := ""
 	switch strings.TrimSpace(req.Action) {
 	case "create":
@@ -1852,6 +1876,26 @@ func (s *webServer) handleAPIActionBoard(ctx context.Context, w http.ResponseWri
 		endpoint = "/issues/move"
 		if payload.ID <= 0 || payload.Lane == "" {
 			s.renderJSONError(w, http.StatusBadRequest, errors.New("story move requires an id and lane"))
+			return
+		}
+	case "reorder":
+		endpoint = "/issues/reorder"
+		if payload.ID <= 0 || payload.Lane == "" {
+			s.renderJSONError(w, http.StatusBadRequest, errors.New("story reorder requires an id and lane"))
+			return
+		}
+	case "edit":
+		endpoint = "/issues/update"
+		if payload.ID <= 0 || payload.Body == "" {
+			s.renderJSONError(w, http.StatusBadRequest, errors.New("story edit requires an id and story"))
+			return
+		}
+		payload.Title = firstNonEmpty(payload.Title, storySummary(payload.Body))
+	case "archive", "unarchive":
+		endpoint = "/issues/archive"
+		payload.Archived = strings.TrimSpace(req.Action) == "archive"
+		if payload.ID <= 0 {
+			s.renderJSONError(w, http.StatusBadRequest, errors.New("story archive requires an id"))
 			return
 		}
 	case "take":
@@ -1878,7 +1922,7 @@ func (s *webServer) handleAPIActionBoard(ctx context.Context, w http.ResponseWri
 	}
 	var resp map[string]any
 	if err := brokerPostContext(ctx, s.cfg.brokerURL, endpoint, payload, &resp); err != nil {
-		s.renderJSONError(w, http.StatusBadRequest, err)
+		s.renderJSONError(w, http.StatusBadRequest, boardUpgradeError(err))
 		return
 	}
 	s.renderJSON(w, map[string]any{"ok": true})
@@ -2711,7 +2755,8 @@ func (s *webServer) handleIssues(ctx context.Context, w http.ResponseWriter, r *
 }
 
 func (s *webServer) handleBoard(ctx context.Context, w http.ResponseWriter, r *http.Request) {
-	issues, err := s.listIssues(ctx)
+	archived := r.URL.Query().Get("view") == "archived" || r.URL.Query().Get("archived") == "1"
+	issues, err := s.listIssuesWithOptions(ctx, brokerIssueRequest{Repo: repoForBroker(s.cfg), Type: "story", IncludeArchived: archived})
 	if err != nil {
 		issues = nil
 	}
@@ -2720,8 +2765,16 @@ func (s *webServer) handleBoard(ctx context.Context, w http.ResponseWriter, r *h
 	var body strings.Builder
 	body.WriteString(`<main class="layout" data-bgit-source="seed">`)
 	body.WriteString(s.headerHTML(ref, "board"))
-	body.WriteString(`<div class="repo-content repo-content-single"><div class="repo-primary"><section class="panel board-panel" data-board-panel><div class="panel-title board-title"><span>Task board</span><button class="button-link story-chip" type="button" data-board-only-me aria-pressed="false">Only me</button></div>`)
-	body.WriteString(boardHTML(issues, boardCtx))
+	body.WriteString(`<div class="repo-content repo-content-single"><div class="repo-primary"><section class="panel board-panel" data-board-panel><div class="panel-title board-title"><span>Task board</span><span class="story-tabs"><a class="button-link story-chip`)
+	if !archived {
+		body.WriteString(` active`)
+	}
+	body.WriteString(`" href="/board">Active</a><a class="button-link story-chip`)
+	if archived {
+		body.WriteString(` active`)
+	}
+	body.WriteString(`" href="/board?view=archived">Archived</a></span><button class="button-link story-chip" type="button" data-board-only-me aria-pressed="false">Only me</button></div>`)
+	body.WriteString(boardHTML(issues, boardCtx, archived))
 	if err != nil {
 		body.WriteString(`<div class="settings-error">` + html.EscapeString(err.Error()) + `</div>`)
 	}
@@ -2825,9 +2878,18 @@ func (s *webServer) handleStory(ctx context.Context, w http.ResponseWriter, r *h
 	body.WriteString(s.headerHTML(ref, "board"))
 	body.WriteString(`<div class="repo-content repo-content-single"><div class="repo-primary"><section class="panel story-detail" data-story-id="` + strconv.Itoa(story.ID) + `">`)
 	body.WriteString(`<div class="issue-heading story-heading"><span class="issue-state">` + html.EscapeString(kanbanLaneLabel(lane)) + `</span><h1>Story ` + html.EscapeString(storyDisplayID(boardCtx.Monogram, story.ID)) + `</h1></div>`)
+	body.WriteString(`<div class="story-meta"><span>Created by ` + html.EscapeString(firstNonEmpty(story.Author, "anonymous")) + `</span><span>` + html.EscapeString(relativeTime(parseTime(story.CreatedAt))) + `</span>`)
+	if story.UpdatedAt != "" {
+		body.WriteString(`<span>Updated ` + html.EscapeString(relativeTime(parseTime(story.UpdatedAt))) + `</span>`)
+	}
+	if story.Archived {
+		body.WriteString(`<span>Archived</span>`)
+	}
+	body.WriteString(`</div>`)
 	body.WriteString(`<div class="story-body">` + html.EscapeString(storyText(story)) + `</div>`)
 	body.WriteString(`<div class="story-detail-actions" data-capability="push">`)
 	body.WriteString(storyAssignmentControlsHTML(story, boardCtx))
+	body.WriteString(`<button class="button-link story-chip" type="button" data-board-action="edit">Edit</button>`)
 	body.WriteString(`<select data-board-lane aria-label="Move story">`)
 	for _, option := range kanbanLanes() {
 		selected := ""
@@ -2840,13 +2902,54 @@ func (s *webServer) handleStory(ctx context.Context, w http.ResponseWriter, r *h
 	if story.Assignee != "" {
 		body.WriteString(`<span class="muted">Assigned to ` + html.EscapeString(story.Assignee) + `</span>`)
 	}
+	if story.Archived {
+		body.WriteString(`<button class="button-link story-chip" type="button" data-board-action="unarchive">Unarchive</button>`)
+	} else {
+		body.WriteString(`<button class="button-link story-chip" type="button" data-board-action="archive">Archive</button>`)
+	}
 	body.WriteString(`</div>`)
+	if len(story.History) > 0 {
+		body.WriteString(`<div class="story-history"><h2>Activity</h2>`)
+		for _, event := range story.History {
+			body.WriteString(`<div><strong>` + html.EscapeString(firstNonEmpty(event.User, "anonymous")) + `</strong> ` + html.EscapeString(storyEventText(event)) + ` <span>` + html.EscapeString(relativeTime(parseTime(event.At))) + `</span></div>`)
+		}
+		body.WriteString(`</div>`)
+	}
 	for _, comment := range story.Comments {
 		body.WriteString(`<div class="issue-comment"><strong>` + html.EscapeString(firstNonEmpty(comment.User, "anonymous")) + ` commented ` + html.EscapeString(relativeTime(parseTime(comment.At))) + `</strong><p>` + html.EscapeString(comment.Body) + `</p></div>`)
 	}
 	body.WriteString(`<form class="issue-form" data-board-form="comment" data-capability="push"><label>Comment<textarea name="comment" rows="4" required></textarea></label><div class="settings-actions"><button class="button-link primary" type="submit">Comment</button></div></form>`)
 	body.WriteString(`</section></div></div></main>`)
 	s.renderPage(w, webPageTitle(s.title, "story"), body.String())
+}
+
+func storyEventText(event brokerIssueEvent) string {
+	switch event.Action {
+	case "created":
+		return "created the story"
+	case "edited":
+		return "edited the story"
+	case "commented":
+		return "commented"
+	case "archived":
+		return "archived the story"
+	case "unarchived":
+		return "unarchived the story"
+	case "moved":
+		if event.From != "" || event.To != "" {
+			return "moved from " + kanbanLaneLabel(normalizeKanbanLane(event.From)) + " to " + kanbanLaneLabel(normalizeKanbanLane(event.To))
+		}
+		return "moved the story"
+	case "reordered":
+		return "reordered the story"
+	case "assigned":
+		if event.To == "" {
+			return "unassigned the story"
+		}
+		return "assigned the story to " + event.To
+	default:
+		return firstNonEmpty(event.Action, "updated the story")
+	}
 }
 
 func (s *webServer) boardRenderContext(ctx context.Context) boardRenderContext {
@@ -3725,7 +3828,7 @@ func (s *webServer) headerHTML(ref, repoPath string) string {
 		hidden := ""
 		count := 0
 		if cached, err := s.readPullRequestCache(); err == nil && len(cached.PRs) > 0 {
-			count = len(cached.PRs)
+			count = openPullRequestCount(cached.PRs)
 		} else {
 			hidden = ` hidden`
 		}
@@ -4359,6 +4462,20 @@ func webAPIPullRequests(prs []brokerPullRequest) []map[string]any {
 	return out
 }
 
+func openPullRequestCount(prs []brokerPullRequest) int {
+	count := 0
+	for _, pr := range prs {
+		if pullRequestIsOpen(pr) {
+			count++
+		}
+	}
+	return count
+}
+
+func pullRequestIsOpen(pr brokerPullRequest) bool {
+	return strings.EqualFold(firstNonEmpty(pr.Status, "open"), "open")
+}
+
 func pullRequestListHTML(prs []brokerPullRequest) string {
 	if len(prs) == 0 {
 		return `<div class="empty">No pull requests found.</div>`
@@ -4450,13 +4567,14 @@ func ciRunListHTML(runs []brokerCIRun) string {
 	return b.String()
 }
 
-func boardHTML(issues []brokerIssue, ctx boardRenderContext) string {
+func boardHTML(issues []brokerIssue, ctx boardRenderContext, archived bool) string {
 	var stories []brokerIssue
 	for _, issue := range issues {
-		if issue.Type == "story" {
+		if issue.Type == "story" && issue.Archived == archived {
 			stories = append(stories, issue)
 		}
 	}
+	sortBoardStories(stories)
 	assigneeNames := append([]string{}, ctx.Assignees...)
 	for _, story := range stories {
 		if strings.TrimSpace(story.Assignee) != "" {
@@ -4465,6 +4583,22 @@ func boardHTML(issues []brokerIssue, ctx boardRenderContext) string {
 	}
 	assigneeMonograms := uniqueUserMonograms(assigneeNames)
 	var b strings.Builder
+	if archived {
+		b.WriteString(`<div class="archived-stories">`)
+		if len(stories) == 0 {
+			b.WriteString(`<div class="empty">No archived stories.</div>`)
+		}
+		for _, story := range stories {
+			storyKey := storyDisplayID(ctx.Monogram, story.ID)
+			b.WriteString(`<article class="story-card archived-story" data-story-id="` + strconv.Itoa(story.ID) + `" data-story-lane="` + html.EscapeString(normalizeKanbanLane(story.Lane)) + `" data-story-assignee="` + html.EscapeString(story.Assignee) + `"><div class="story-card-title"><a href="/board/` + url.PathEscape(storyKey) + `">` + html.EscapeString(storyKey) + `</a><div class="story-actions" data-capability="push">`)
+			if story.Assignee != "" {
+				b.WriteString(`<span class="story-assignee-mark" title="Assigned to ` + html.EscapeString(story.Assignee) + `" aria-label="Assigned to ` + html.EscapeString(story.Assignee) + `">` + html.EscapeString(assigneeMonogram(story.Assignee, assigneeMonograms)) + `</span>`)
+			}
+			b.WriteString(`<button class="button-link story-chip" type="button" data-board-action="unarchive">Unarchive</button></div></div><p>` + html.EscapeString(storyText(story)) + `</p></article>`)
+		}
+		b.WriteString(`</div>`)
+		return b.String()
+	}
 	b.WriteString(`<div class="kanban-board">`)
 	for _, lane := range kanbanLanes() {
 		b.WriteString(`<section class="kanban-lane" data-board-drop-lane="` + html.EscapeString(lane) + `"><h3>` + html.EscapeString(kanbanLaneLabel(lane)) + `</h3>`)
@@ -4481,6 +4615,8 @@ func boardHTML(issues []brokerIssue, ctx boardRenderContext) string {
 				b.WriteString(`<span class="story-assignee-mark" title="Assigned to ` + html.EscapeString(story.Assignee) + `" aria-label="Assigned to ` + html.EscapeString(story.Assignee) + `">` + html.EscapeString(assigneeMonogram(story.Assignee, assigneeMonograms)) + `</span>`)
 			}
 			b.WriteString(storyAssignmentControlsHTML(story, ctx))
+			b.WriteString(`<button class="button-link story-chip story-icon-chip" type="button" data-board-action="edit" aria-label="Edit story" title="Edit story">` + editStoryIconHTML() + `</button>`)
+			b.WriteString(`<button class="button-link story-chip story-icon-chip" type="button" data-board-action="archive" aria-label="Archive story" title="Archive story">` + archiveStoryIconHTML() + `</button>`)
 			b.WriteString(`<button class="button-link story-chip story-icon-chip" type="button" data-board-move-toggle aria-label="Move story" title="Move story">` + moveStoryIconHTML() + `</button>`)
 			b.WriteString(`<select data-board-lane aria-label="Move story" hidden>`)
 			for _, option := range kanbanLanes() {
@@ -4496,6 +4632,14 @@ func boardHTML(issues []brokerIssue, ctx boardRenderContext) string {
 	}
 	b.WriteString(`</div>`)
 	return b.String()
+}
+
+func editStoryIconHTML() string {
+	return `<svg viewBox="0 0 24 24" fill="none" aria-hidden="true" focusable="false"><path d="M4 20h4l11-11a2.5 2.5 0 0 0-4-4L4 16v4Z" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/><path d="m13 6 5 5" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>`
+}
+
+func archiveStoryIconHTML() string {
+	return `<svg viewBox="0 0 24 24" fill="none" aria-hidden="true" focusable="false"><path d="M4 7h16v13H4V7Z" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/><path d="M3 4h18v3H3V4Z" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/><path d="M9 11h6" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>`
 }
 
 func storyAssignmentControlsHTML(story brokerIssue, ctx boardRenderContext) string {

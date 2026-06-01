@@ -358,9 +358,9 @@ func (r *nativeGitRepo) fetchRefsIntoWorktree(ctx context.Context, worktree stri
 		hash := refs[name]
 		switch {
 		case strings.HasPrefix(name, "refs/heads/"):
-			localRef := filepath.Join(gitDir, filepath.FromSlash("refs/remotes/bucketgit/"+strings.TrimPrefix(name, "refs/heads/")))
+			localRef := localRemoteTrackingRefPath(gitDir, "bucketgit", name)
 			oldHash := readRefFile(localRef)
-			if err := writeRefFile(localRef, hash); err != nil {
+			if err := updateLocalRemoteTrackingRef(gitDir, name, hash); err != nil {
 				return err
 			}
 			short := strings.TrimPrefix(name, "refs/heads/")
@@ -698,30 +698,40 @@ func localRemoteTrackingHash(gitDir, ref string) string {
 	if !strings.HasPrefix(ref, "refs/heads/") {
 		return ""
 	}
-	path := filepath.Join(gitDir, filepath.FromSlash("refs/remotes/bucketgit/"+strings.TrimPrefix(ref, "refs/heads/")))
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return ""
+	for _, remote := range []string{"bucketgit", "origin"} {
+		data, err := os.ReadFile(localRemoteTrackingRefPath(gitDir, remote, ref))
+		if err != nil {
+			continue
+		}
+		hash := strings.TrimSpace(string(data))
+		if isHexHash(hash) {
+			return hash
+		}
 	}
-	hash := strings.TrimSpace(string(data))
-	if !isHexHash(hash) {
-		return ""
-	}
-	return hash
+	return ""
 }
 
 func updateLocalRemoteTrackingRef(gitDir, ref, hash string) error {
 	if !strings.HasPrefix(ref, "refs/heads/") {
 		return nil
 	}
-	path := filepath.Join(gitDir, filepath.FromSlash("refs/remotes/bucketgit/"+strings.TrimPrefix(ref, "refs/heads/")))
-	if hash == zeroObjectID() {
-		if err := os.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
+	for _, remote := range []string{"bucketgit", "origin"} {
+		path := localRemoteTrackingRefPath(gitDir, remote, ref)
+		if hash == zeroObjectID() {
+			if err := os.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
+				return err
+			}
+			continue
+		}
+		if err := writeRefFile(path, hash); err != nil {
 			return err
 		}
-		return nil
 	}
-	return writeRefFile(path, hash)
+	return nil
+}
+
+func localRemoteTrackingRefPath(gitDir, remote, ref string) string {
+	return filepath.Join(gitDir, filepath.FromSlash("refs/remotes/"+remote+"/"+strings.TrimPrefix(ref, "refs/heads/")))
 }
 
 func (r *nativeGitRepo) putFile(ctx context.Context, args []string, stdin io.Reader, stdout io.Writer) error {

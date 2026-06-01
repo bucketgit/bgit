@@ -1078,6 +1078,60 @@ async function listIssues(entry) {
   return snap.docs.map((doc) => doc.data() || {});
 }
 
+function issueHistory(issue, user, action, fields = {}) {
+  issue.history = Array.isArray(issue.history) ? issue.history : [];
+  issue.history.push({user: user || 'anonymous', action, at: new Date().toISOString(), ...fields});
+  if (issue.history.length > 100) issue.history = issue.history.slice(-100);
+}
+
+function storyPosition(issue) {
+  const value = Number(issue && issue.position || 0);
+  return Number.isFinite(value) && value > 0 ? value : 0;
+}
+
+function sortStoriesForLane(stories) {
+  return stories.sort((a, b) => {
+    const ap = storyPosition(a);
+    const bp = storyPosition(b);
+    if (ap && bp && ap !== bp) return ap - bp;
+    if (ap && !bp) return -1;
+    if (!ap && bp) return 1;
+    return Number(a.id || 0) - Number(b.id || 0);
+  });
+}
+
+async function nextStoryPosition(entry, lane, excludeID = 0) {
+  const stories = (await listIssues(entry)).filter((issue) =>
+    issue.type === 'story' &&
+    !issue.archived &&
+    Number(issue.id || 0) !== Number(excludeID || 0) &&
+    normalizeBoardLane(issue.lane) === lane
+  );
+  const max = stories.reduce((value, issue) => Math.max(value, storyPosition(issue)), 0);
+  return max + 1000;
+}
+
+async function storyPositionAfter(entry, lane, afterID, selfID) {
+  const stories = sortStoriesForLane((await listIssues(entry)).filter((issue) =>
+    issue.type === 'story' &&
+    !issue.archived &&
+    Number(issue.id || 0) !== Number(selfID || 0) &&
+    normalizeBoardLane(issue.lane) === lane
+  ));
+  if (!stories.length) return 1000;
+  const after = Number(afterID || 0);
+  if (!after) {
+    const first = storyPosition(stories[0]);
+    return first > 1 ? first / 2 : 500;
+  }
+  const index = stories.findIndex((issue) => Number(issue.id || 0) === after);
+  if (index < 0) return nextStoryPosition(entry, lane, selfID);
+  const current = storyPosition(stories[index]) || ((index + 1) * 1000);
+  const next = stories[index + 1] ? storyPosition(stories[index + 1]) : 0;
+  if (!next) return current + 1000;
+  return current + ((next - current) / 2);
+}
+
 function nextCIID(data) {
   data.next_ci_id = Number(data.next_ci_id || 1);
   return data.next_ci_id++;
@@ -2157,7 +2211,10 @@ exports.broker = async (req, res) => {
       const entry = await ensureRepo(body.repo);
       await requireRead(req, entry);
       if (entry.data.issues_enabled === false) throw Object.assign(new Error('issues are disabled'), {status: 403});
-      const issues = await listIssues(entry);
+      let issues = await listIssues(entry);
+      const type = String(body.type || '').trim().toLowerCase();
+      if (type) issues = issues.filter((issue) => String(issue.type || '').toLowerCase() === type);
+      if (type === 'story' && !body.include_archived) issues = issues.filter((issue) => !issue.archived);
       res.status(200).send(JSON.stringify({issues}));
       return;
     }
@@ -2178,7 +2235,9 @@ exports.broker = async (req, res) => {
       const issueBody = String(body.body || '').trim();
       const title = String(body.title || '').trim() || (story ? issueBody.replace(/\s+/g, ' ').slice(0, 80) : '');
       if (!title) throw new Error(story ? 'story is required' : 'issue title is required');
-      const issue = {id: nextIssueID(entry.data), type: story ? 'story' : 'issue', title, body: issueBody, status: 'open', lane: story ? normalizeBoardLane(body.lane) : '', assignee: '', author: key.user || 'anonymous', comments: [], created_at: new Date().toISOString(), updated_at: new Date().toISOString()};
+      const lane = story ? normalizeBoardLane(body.lane) : '';
+      const issue = {id: nextIssueID(entry.data), type: story ? 'story' : 'issue', title, body: issueBody, status: 'open', lane, assignee: '', position: story ? await nextStoryPosition(entry, lane) : 0, archived: false, author: key.user || 'anonymous', comments: [], history: [], created_at: new Date().toISOString(), updated_at: new Date().toISOString()};
+      if (story) issueHistory(issue, key.user, 'created', {to: lane});
       await saveRepo(entry);
       await saveIssue(entry, issue);
       res.status(200).send(JSON.stringify({ok: true, issue}));
@@ -2194,6 +2253,7 @@ exports.broker = async (req, res) => {
       if (!comment) throw new Error('comment is required');
       issue.comments = issue.comments || [];
       issue.comments.push({user: key.user || 'anonymous', body: comment, at: new Date().toISOString()});
+      if (issue.type === 'story') issueHistory(issue, key.user, 'commented');
       issue.updated_at = new Date().toISOString();
       await saveIssue(entry, issue);
       res.status(200).send(JSON.stringify({ok: true, issue}));
@@ -2205,16 +2265,71 @@ exports.broker = async (req, res) => {
       res.status(200).send(JSON.stringify({users: await boardAssignableUsers(entry)}));
       return;
     }
+    if (req.path === '/issues/update' && req.method === 'POST') {
+      const entry = await ensureRepo(body.repo);
+      if (entry.data.issues_enabled === false) throw Object.assign(new Error('issues are disabled'), {status: 403});
+      const key = await requireBoardMutation(req, entry);
+      const issue = await loadIssue(entry, body.id);
+      if (!issue || issue.type !== 'story') throw Object.assign(new Error('story not found'), {status: 404});
+      const issueBody = String(body.body || '').trim();
+      const title = String(body.title || '').trim() || issueBody.replace(/\s+/g, ' ').slice(0, 80);
+      if (!title) throw new Error('story is required');
+      issue.title = title;
+      issue.body = issueBody;
+      issue.updated_at = new Date().toISOString();
+      issueHistory(issue, key.user, 'edited');
+      await saveIssue(entry, issue);
+      res.status(200).send(JSON.stringify({ok: true, issue}));
+      return;
+    }
+    if (req.path === '/issues/archive' && req.method === 'POST') {
+      const entry = await ensureRepo(body.repo);
+      const key = await requireBoardMutation(req, entry);
+      const issue = await loadIssue(entry, body.id);
+      if (!issue || issue.type !== 'story') throw Object.assign(new Error('story not found'), {status: 404});
+      const archived = !!body.archived;
+      issue.archived = archived;
+      issue.updated_at = new Date().toISOString();
+      issueHistory(issue, key.user, archived ? 'archived' : 'unarchived');
+      await saveIssue(entry, issue);
+      res.status(200).send(JSON.stringify({ok: true, issue}));
+      return;
+    }
+    if (req.path === '/issues/reorder' && req.method === 'POST') {
+      const entry = await ensureRepo(body.repo);
+      const key = await requireBoardMutation(req, entry);
+      const issue = await loadIssue(entry, body.id);
+      if (!issue || issue.type !== 'story') throw Object.assign(new Error('story not found'), {status: 404});
+      const fromLane = normalizeBoardLane(issue.lane);
+      const lane = normalizeBoardLane(body.lane || issue.lane);
+      issue.lane = lane;
+      issue.position = await storyPositionAfter(entry, lane, body.after_id, issue.id);
+      issue.updated_at = new Date().toISOString();
+      issueHistory(issue, key.user, 'reordered', {from: fromLane, to: lane, position: String(issue.position)});
+      await saveIssue(entry, issue);
+      res.status(200).send(JSON.stringify({ok: true, issue}));
+      return;
+    }
     if (req.path === '/issues/move' || req.path === '/issues/take' || req.path === '/issues/assign') {
       const entry = await ensureRepo(body.repo);
       const key = await requireBoardMutation(req, entry);
       const issue = await loadIssue(entry, body.id);
       if (!issue) throw Object.assign(new Error('issue not found'), {status: 404});
       if (issue.type !== 'story') throw Object.assign(new Error('story not found'), {status: 404});
-      if (req.path === '/issues/move') issue.lane = normalizeBoardLane(body.lane);
+      const fromLane = normalizeBoardLane(issue.lane);
+      const fromAssignee = issue.assignee || '';
+      if (req.path === '/issues/move') {
+        const lane = normalizeBoardLane(body.lane);
+        issue.lane = lane;
+        if (Object.prototype.hasOwnProperty.call(body, 'after_id')) issue.position = await storyPositionAfter(entry, lane, body.after_id, issue.id);
+        else if (fromLane !== lane || !storyPosition(issue)) issue.position = await nextStoryPosition(entry, lane, issue.id);
+        issueHistory(issue, key.user, 'moved', {from: fromLane, to: lane});
+      }
       else if (req.path === '/issues/take') {
         issue.assignee = key.user || '';
         if (normalizeBoardLane(issue.lane) === 'backlog') issue.lane = 'doing';
+        if (fromLane !== normalizeBoardLane(issue.lane) || !storyPosition(issue)) issue.position = await nextStoryPosition(entry, normalizeBoardLane(issue.lane), issue.id);
+        issueHistory(issue, key.user, 'assigned', {from: fromAssignee, to: issue.assignee || ''});
       } else {
         const assignee = String(body.assignee || '').trim();
         if (assignee) {
@@ -2225,6 +2340,7 @@ exports.broker = async (req, res) => {
         } else {
           issue.assignee = '';
         }
+        issueHistory(issue, key.user, 'assigned', {from: fromAssignee, to: issue.assignee || ''});
       }
       issue.updated_at = new Date().toISOString();
       await saveIssue(entry, issue);

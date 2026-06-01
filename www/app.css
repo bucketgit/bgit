@@ -2608,6 +2608,11 @@ h2 {
   padding: 14px;
   overflow-x: auto;
 }
+.archived-stories {
+  display: grid;
+  gap: 10px;
+  padding: 14px;
+}
 .kanban-lane {
   min-width: 150px;
   border: 1px solid var(--repo-border);
@@ -2787,6 +2792,41 @@ h2 {
   color: var(--text);
   line-height: 1.5;
   white-space: pre-wrap;
+}
+.story-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 14px 16px 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+.story-meta span {
+  padding: 3px 8px;
+  border: 1px solid var(--repo-border);
+  border-radius: 999px;
+  background: var(--surface);
+}
+.story-history {
+  display: grid;
+  gap: 8px;
+  margin: 14px 16px;
+  padding: 12px;
+  border: 1px solid var(--repo-border);
+  border-radius: 8px;
+  background: var(--surface);
+}
+.story-history h2 {
+  margin: 0;
+  color: var(--heading);
+  font-size: 13px;
+}
+.story-history div {
+  color: var(--text);
+  font-size: 13px;
+}
+.story-history span {
+  color: var(--muted);
 }
 .story-detail-actions {
   display: flex;

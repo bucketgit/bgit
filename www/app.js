@@ -347,8 +347,10 @@ document.addEventListener('drop', function (event) {
   const id = Number(event.dataTransfer.getData('text/plain') || 0);
   const fromLane = event.dataTransfer.getData('application/x-bgit-story-lane') || '';
   const toLane = lane.getAttribute('data-board-drop-lane') || '';
-  if (!id || !toLane || fromLane === toLane) return;
-  moveBoardStory(id, toLane);
+  if (!id || !toLane) return;
+  const afterID = boardDropAfterID(lane, event.clientY, id);
+  if (fromLane === toLane) reorderBoardStory(id, toLane, afterID);
+  else moveBoardStory(id, toLane, afterID);
 });
 
 document.addEventListener('submit', function (event) {
@@ -1177,6 +1179,12 @@ async function handleBoardForm(form) {
       setSyncStatus('Story comment is required.', 'is-stale');
       return;
     }
+  } else if (action === 'edit') {
+    payload.body = formValue(form, 'body');
+    if (!payload.id || !payload.body) {
+      setSyncStatus('Story is required.', 'is-stale');
+      return;
+    }
   } else {
     payload.body = formValue(form, 'body');
     payload.lane = 'backlog';
@@ -1267,8 +1275,41 @@ async function handleBoardAction(button) {
   const card = button.closest('[data-story-id]');
   const id = Number(card?.getAttribute('data-story-id') || 0);
   if (!id || !action) return;
+  if (action === 'edit') {
+    await editBoardStory(card, id);
+    return;
+  }
   try {
     await postJSON('/api/actions/board', {action, id});
+    window.location.reload();
+  } catch (err) {
+    setSyncStatus(compactError(err), 'is-stale');
+  }
+}
+
+async function editBoardStory(card, id) {
+  if (!hasCapability('push')) {
+    setSyncStatus('Your current broker role does not allow this action.', 'is-stale');
+    return;
+  }
+  const current = (card.querySelector('.story-body') || card.querySelector('p'))?.textContent || '';
+  const body = await promptModal({
+    cardClass: 'story-modal-card',
+    confirm: 'Save story',
+    inputLabel: 'Story',
+    multiline: true,
+    placeholder: 'As a contributor, I want to describe the work in one clear sentence, so that the team understands the value.',
+    rows: 6,
+    value: current,
+  });
+  if (body === false) return;
+  const story = String(body || '').trim();
+  if (!story) {
+    setSyncStatus('Story is required.', 'is-stale');
+    return;
+  }
+  try {
+    await postJSON('/api/actions/board', {action: 'edit', id, body: story});
     window.location.reload();
   } catch (err) {
     setSyncStatus(compactError(err), 'is-stale');
@@ -1311,18 +1352,20 @@ async function handleBoardLaneChange(select) {
     return;
   }
   if (!id || !lane) return;
-  const moved = await moveBoardStory(id, lane);
+  const moved = await moveBoardStory(id, lane, null);
   if (moved) hideBoardLaneSelect(select);
 }
 
-async function moveBoardStory(id, lane) {
+async function moveBoardStory(id, lane, afterID) {
   const card = findBoardStoryCard(id);
   const targetLane = findBoardLane(lane);
   if (card && targetLane) {
-    return await moveBoardStoryOptimistically(card, targetLane, lane);
+    return await moveBoardStoryOptimistically(card, targetLane, lane, afterID);
   }
   try {
-    await postJSON('/api/actions/board', {action: 'move', id, lane});
+    const payload = {action: 'move', id, lane};
+    if (Number.isInteger(afterID)) payload.after_id = afterID;
+    await postJSON('/api/actions/board', payload);
     window.location.reload();
     return true;
   } catch (err) {
@@ -1331,7 +1374,7 @@ async function moveBoardStory(id, lane) {
   }
 }
 
-async function moveBoardStoryOptimistically(card, targetLane, lane) {
+async function moveBoardStoryOptimistically(card, targetLane, lane, afterID) {
   const id = Number(card.getAttribute('data-story-id') || 0);
   const fromLane = card.getAttribute('data-story-lane') || '';
   if (!id || !lane || fromLane === lane || card.classList.contains('is-committing')) return true;
@@ -1339,12 +1382,14 @@ async function moveBoardStoryOptimistically(card, targetLane, lane) {
   const originalNextSibling = card.nextElementSibling;
   const laneSelect = card.querySelector('[data-board-lane]');
 
-  targetLane.appendChild(card);
+  insertBoardCardAfter(targetLane, card, afterID);
   card.setAttribute('data-story-lane', lane);
   if (laneSelect) laneSelect.value = lane;
   setBoardStoryCommitting(card, true);
   try {
-    await postJSON('/api/actions/board', {action: 'move', id, lane});
+    const payload = {action: 'move', id, lane};
+    if (Number.isInteger(afterID)) payload.after_id = afterID;
+    await postJSON('/api/actions/board', payload);
     setBoardStoryCommitting(card, false);
     return true;
   } catch (err) {
@@ -1357,6 +1402,63 @@ async function moveBoardStoryOptimistically(card, targetLane, lane) {
     setSyncStatus(compactError(err), 'is-stale');
     return false;
   }
+}
+
+async function reorderBoardStory(id, lane, afterID) {
+  const card = findBoardStoryCard(id);
+  const targetLane = findBoardLane(lane);
+  if (!card || !targetLane || card.classList.contains('is-committing')) return false;
+  const originalParent = card.parentElement;
+  const originalNextSibling = card.nextElementSibling;
+  insertBoardCardAfter(targetLane, card, afterID);
+  setBoardStoryCommitting(card, true);
+  try {
+    await postJSON('/api/actions/board', {action: 'reorder', id, lane, after_id: afterID || 0});
+    setBoardStoryCommitting(card, false);
+    return true;
+  } catch (err) {
+    if (originalParent) {
+      originalParent.insertBefore(card, originalNextSibling && originalNextSibling.parentElement === originalParent ? originalNextSibling : null);
+    }
+    setBoardStoryCommitting(card, false);
+    setSyncStatus(compactError(err), 'is-stale');
+    return false;
+  }
+}
+
+function insertBoardCardAfter(lane, card, afterID) {
+  if (!Number.isInteger(afterID)) {
+    lane.appendChild(card);
+    return;
+  }
+  if (!afterID) {
+    const first = firstBoardStoryCard(lane, card);
+    lane.insertBefore(card, first);
+    return;
+  }
+  const after = Array.from(lane.querySelectorAll('[data-story-id]')).find((candidate) =>
+    Number(candidate.getAttribute('data-story-id') || 0) === Number(afterID || 0)
+  );
+  lane.insertBefore(card, after ? after.nextElementSibling : null);
+}
+
+function firstBoardStoryCard(lane, except) {
+  for (const candidate of lane.querySelectorAll('[data-story-id]')) {
+    if (candidate !== except) return candidate;
+  }
+  return null;
+}
+
+function boardDropAfterID(lane, clientY, draggedID) {
+  let afterID = 0;
+  for (const card of lane.querySelectorAll('[data-story-id]')) {
+    const id = Number(card.getAttribute('data-story-id') || 0);
+    if (!id || id === Number(draggedID || 0)) continue;
+    const rect = card.getBoundingClientRect();
+    if (clientY < rect.top + rect.height / 2) return afterID;
+    afterID = id;
+  }
+  return afterID;
 }
 
 function hideBoardLaneSelect(select) {
@@ -2341,6 +2443,9 @@ function modalDialog(options) {
     document.body.appendChild(overlay);
     const input = overlay.querySelector('[data-modal-input]');
     const error = overlay.querySelector('[data-modal-error]');
+    if (input && Object.prototype.hasOwnProperty.call(options, 'value')) {
+      input.value = String(options.value || '');
+    }
     const close = function (value) {
       overlay.remove();
       resolve(value);
@@ -2453,12 +2558,18 @@ function updatePullRequestUI(prs) {
   if (tab) tab.hidden = prs.length === 0;
   const count = document.querySelector('[data-pr-tab-count]');
   if (count) {
-    count.textContent = String(prs.length);
+    count.textContent = String(openPullRequestCount(prs));
   }
   const list = document.querySelector('[data-pr-list]');
   if (list) {
     list.innerHTML = pullRequestListHTML(prs);
   }
+}
+
+function openPullRequestCount(prs) {
+  return prs.filter(function (pr) {
+    return String((pr && pr.status) || 'open').toLowerCase() === 'open';
+  }).length;
 }
 
 function pullRequestListHTML(prs) {

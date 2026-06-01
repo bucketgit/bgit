@@ -3375,6 +3375,15 @@ func TestNativeGitRepoPushWritesObjectsAndRefsWithoutBareSync(t *testing.T) {
 	if !isHexHash(strings.TrimSpace(string(refData))) {
 		t.Fatalf("remote ref = %q", string(refData))
 	}
+	for _, ref := range []string{"refs/remotes/bucketgit/main", "refs/remotes/origin/main"} {
+		out, err := runGit(worktree, "rev-parse", "--verify", ref)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.TrimSpace(string(out)) != strings.TrimSpace(string(refData)) {
+			t.Fatalf("%s = %q, want %q", ref, strings.TrimSpace(string(out)), strings.TrimSpace(string(refData)))
+		}
+	}
 
 	stdout.Reset()
 	readRepo := newNativeGitRepoForStore(config{branch: "main"}, &localGitStore{root: remoteRoot})
@@ -3560,7 +3569,14 @@ func TestNativeGitRepoFetchCopiesObjectsAndRemoteRefs(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !isHexHash(strings.TrimSpace(string(out))) {
-		t.Fatalf("remote tracking ref = %q", string(out))
+		t.Fatalf("bucketgit remote tracking ref = %q", string(out))
+	}
+	out, err = runGit(worktree, "rev-parse", "--verify", "refs/remotes/origin/main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !isHexHash(strings.TrimSpace(string(out))) {
+		t.Fatalf("origin remote tracking ref = %q", string(out))
 	}
 }
 
@@ -3662,6 +3678,16 @@ func TestNativeGitRepoPushDefaultsToCurrentBranch(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(remoteRoot, "refs", "heads", "barfoo")); err != nil {
 		t.Fatal(err)
+	}
+	barfooHash := strings.TrimSpace(string(mustReadFile(t, filepath.Join(remoteRoot, "refs", "heads", "barfoo"))))
+	for _, ref := range []string{"refs/remotes/bucketgit/barfoo", "refs/remotes/origin/barfoo"} {
+		out, err := runGit(worktree, "rev-parse", "--verify", ref)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.TrimSpace(string(out)) != barfooHash {
+			t.Fatalf("%s = %q, want %q", ref, strings.TrimSpace(string(out)), barfooHash)
+		}
 	}
 	if _, err := os.Stat(filepath.Join(remoteRoot, "refs", "heads", "main")); !errors.Is(err, fs.ErrNotExist) {
 		t.Fatalf("main ref err = %v", err)

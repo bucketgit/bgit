@@ -995,6 +995,19 @@ function formChecked(form, name) {
   return !!(field && field.checked);
 }
 
+function formDataObject(form) {
+  const payload = {};
+  for (const [key, value] of new FormData(form).entries()) {
+    if (Object.prototype.hasOwnProperty.call(payload, key)) {
+      if (!Array.isArray(payload[key])) payload[key] = [payload[key]];
+      payload[key].push(value);
+    } else {
+      payload[key] = value;
+    }
+  }
+  return payload;
+}
+
 async function handleSettingsForm(form) {
   const action = form.getAttribute('data-settings-form') || '';
   if (!hasCapability(form.getAttribute('data-capability') || '')) {

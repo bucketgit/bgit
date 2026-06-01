@@ -4,6 +4,15 @@ All notable changes to `bgit` are documented in this file.
 
 This project follows semantic versioning.
 
+## 1.3.3
+
+Fixed
+
+- Fixed the `bgit web` CI run form by restoring the shared form serialization
+  helper used by the Run CI action.
+- Fixed AWS and GCP CI materializers so they can read normal packed Git objects,
+  not only loose objects, when creating provider build source archives.
+
 ## 1.3.2
 
 Added

@@ -186,9 +186,13 @@ bgit pr merge 1
 
 bgit board list
 bgit board create "As a maintainer, I want clear setup docs so that new users can bootstrap quickly."
+bgit board edit BG-1 "As a maintainer, I want clear setup docs so that new users can bootstrap quickly."
 bgit board take BG-1
+bgit board assign BG-1 ada
 bgit board move BG-1 doing
 bgit board comment BG-1 "Opened PR #2."
+bgit board archive BG-1
+bgit board list --archived
 
 bgit issue create "Bug report" --body "Details"
 bgit issue list
@@ -416,20 +420,27 @@ PR.
 Broker-backed repositories have a task board immediately; no board creation is
 required. Stories are stored in repository metadata and move through
 `backlog`, `ready`, `doing`, `review`, and `done`. Viewers can read the board;
-developers and higher can create stories, take or reassign work, move cards, and
-comment.
+developers and higher can create and edit stories, take or reassign work, move
+and reorder cards, archive completed stories, and comment.
 
 ```bash
 bgit board list
 bgit board create "As a developer, I want CI logs on each run so that failures are easy to diagnose."
+bgit board edit BG-1 "As a developer, I want CI logs and status on each run so that failures are easy to diagnose."
 bgit board take BG-1
+bgit board assign BG-1 ada
 bgit board move BG-1 review
 bgit board comment BG-1 "PR #4 is ready for review."
+bgit board archive BG-1
+bgit board list --archived
 ```
 
 Story IDs are prefixed with a repository monogram. The web board supports
-drag-and-drop lane moves, assignment controls, comments, optimistic committing
-state, and an "Only me" filter for assigned work.
+drag-and-drop lane moves and same-lane reordering, assignment controls,
+comments, archived-story browsing, story activity history, optimistic committing
+state, and an "Only me" filter for assigned work. Older brokers can still list
+and move existing stories; edit, archive, and ordering operations require a
+broker upgrade.
 
 ## CI/CD
 
@@ -508,7 +519,9 @@ git push
 
 Native Git transport is authorized through the broker. Ref updates use
 compare-and-swap checks so stale writers are rejected instead of silently
-overwriting refs.
+overwriting refs. `bgit fetch` and `bgit push` keep both `bucketgit/*` and
+matching `origin/*` remote-tracking refs current for branch refs, so native
+`git status` reports the same ahead/behind state after bgit operations.
 
 ## Direct Bucket Mode
 

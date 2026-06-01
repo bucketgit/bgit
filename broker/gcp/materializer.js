@@ -59,15 +59,229 @@ async function readObject(repo, path) {
   return data;
 }
 
+async function listObjects(repo, path) {
+  const bucket = String(repo.bucket || '').trim();
+  const prefix = String(repo.prefix || '').replace(/^\/+|\/+$/g, '');
+  if (!bucket || !prefix) throw new Error('repo bucket/prefix is required');
+  const base = prefix + '/' + cleanPath(path).replace(/\/?$/, '/');
+  const [files] = await storage.bucket(bucket).getFiles({prefix: base});
+  return files.map((file) => file.name.slice(prefix.length + 1));
+}
+
+const packIndexCache = new Map();
+const packDataCache = new Map();
+const packObjectCache = new Map();
+
 async function readLooseGitObject(repo, hash) {
   if (!/^[0-9a-f]{40}$/i.test(hash)) throw new Error('invalid git object hash');
-  const compressed = await readObject(repo, 'objects/' + hash.slice(0, 2) + '/' + hash.slice(2));
+  let compressed;
+  try {
+    compressed = await readObject(repo, 'objects/' + hash.slice(0, 2) + '/' + hash.slice(2));
+  } catch (err) {
+    return readPackedGitObject(repo, hash);
+  }
   const raw = zlib.inflateSync(compressed);
   const nul = raw.indexOf(0);
   if (nul < 0) throw new Error('invalid git object');
   const header = raw.subarray(0, nul).toString('utf8');
   const space = header.indexOf(' ');
   return {type: header.slice(0, space), data: raw.subarray(nul + 1)};
+}
+
+function repoCacheKey(repo) {
+  return String(repo.bucket || '') + '/' + String(repo.prefix || '').replace(/^\/+|\/+$/g, '');
+}
+
+async function readPackedGitObject(repo, hash) {
+  const indexes = await loadPackIndexes(repo);
+  for (const index of indexes) {
+    const pos = binarySearch(index.hashes, hash);
+    if (pos >= 0) return objectAtPackOffset(repo, index, index.offsets[pos]);
+  }
+  throw new Error('git object not found: ' + hash);
+}
+
+async function loadPackIndexes(repo) {
+  const key = repoCacheKey(repo);
+  if (packIndexCache.has(key)) return packIndexCache.get(key);
+  const paths = (await listObjects(repo, 'objects/pack')).filter((path) => path.endsWith('.idx')).sort();
+  const indexes = [];
+  for (const path of paths) {
+    const data = await readObject(repo, path);
+    indexes.push(parsePackIndex(path, data));
+  }
+  packIndexCache.set(key, indexes);
+  return indexes;
+}
+
+function parsePackIndex(path, data) {
+  if (data.length < 8 || data.readUInt32BE(0) !== 0xff744f63) throw new Error('unsupported pack index format');
+  const version = data.readUInt32BE(4);
+  if (version !== 2) throw new Error('unsupported pack index version ' + version);
+  const fanoutStart = 8;
+  const total = data.readUInt32BE(fanoutStart + 255 * 4);
+  const hashStart = fanoutStart + 256 * 4;
+  const crcStart = hashStart + total * 20;
+  const offsetStart = crcStart + total * 4;
+  if (data.length < offsetStart + total * 4) throw new Error('truncated pack index');
+  const hashes = [];
+  const offsets = [];
+  const largeRefs = [];
+  for (let i = 0; i < total; i++) hashes.push(data.subarray(hashStart + i * 20, hashStart + (i + 1) * 20).toString('hex'));
+  for (let i = 0; i < total; i++) {
+    const raw = data.readUInt32BE(offsetStart + i * 4);
+    if (raw & 0x80000000) {
+      largeRefs.push({entry: i, index: raw & 0x7fffffff});
+      offsets[i] = 0;
+    } else {
+      offsets[i] = raw;
+    }
+  }
+  const largeStart = offsetStart + total * 4;
+  for (const ref of largeRefs) {
+    const pos = largeStart + ref.index * 8;
+    if (data.length < pos + 8) throw new Error('truncated large pack index offsets');
+    offsets[ref.entry] = Number(data.readBigUInt64BE(pos));
+  }
+  return {idxPath: path, packPath: path.replace(/\.idx$/, '.pack'), hashes, offsets};
+}
+
+function binarySearch(values, target) {
+  let low = 0;
+  let high = values.length - 1;
+  while (low <= high) {
+    const mid = (low + high) >> 1;
+    if (values[mid] === target) return mid;
+    if (values[mid] < target) low = mid + 1;
+    else high = mid - 1;
+  }
+  return -1;
+}
+
+async function packData(repo, path) {
+  const key = repoCacheKey(repo) + '/' + path;
+  if (!packDataCache.has(key)) packDataCache.set(key, await readObject(repo, path));
+  return packDataCache.get(key);
+}
+
+async function objectAtPackOffset(repo, index, offset) {
+  const key = repoCacheKey(repo) + '/' + index.packPath + ':' + offset;
+  if (packObjectCache.has(key)) return packObjectCache.get(key);
+  const pack = await packData(repo, index.packPath);
+  const obj = await decodePackedObject(repo, index, pack, offset);
+  packObjectCache.set(key, obj);
+  return obj;
+}
+
+async function decodePackedObject(repo, index, pack, offset) {
+  if (pack.length < 12 || !pack.subarray(0, 4).equals(Buffer.from('PACK'))) throw new Error('invalid pack file');
+  let pos = Number(offset);
+  const header = parsePackObjectHeader(pack, pos);
+  pos += header.bytes;
+  if (header.type >= 1 && header.type <= 4) {
+    return {type: packTypeName(header.type), data: zlib.inflateSync(pack.subarray(pos))};
+  }
+  if (header.type === 6) {
+    const parsed = parseOFSDeltaBase(pack, pos, offset);
+    pos += parsed.bytes;
+    const delta = zlib.inflateSync(pack.subarray(pos));
+    const base = await objectAtPackOffset(repo, index, parsed.baseOffset);
+    return {type: base.type, data: applyPackDelta(base.data, delta)};
+  }
+  if (header.type === 7) {
+    if (pack.length < pos + 20) throw new Error('truncated ref delta object');
+    const baseHash = pack.subarray(pos, pos + 20).toString('hex');
+    const delta = zlib.inflateSync(pack.subarray(pos + 20));
+    const base = await readLooseGitObject(repo, baseHash);
+    return {type: base.type, data: applyPackDelta(base.data, delta)};
+  }
+  throw new Error('unsupported pack object type ' + header.type);
+}
+
+function parsePackObjectHeader(pack, pos) {
+  let byte = pack[pos++];
+  if (byte === undefined) throw new Error('truncated pack object header');
+  const type = (byte >> 4) & 7;
+  let size = byte & 0x0f;
+  let shift = 4;
+  let bytes = 1;
+  while (byte & 0x80) {
+    byte = pack[pos++];
+    if (byte === undefined) throw new Error('truncated pack object header');
+    size |= (byte & 0x7f) << shift;
+    shift += 7;
+    bytes++;
+  }
+  return {type, size, bytes};
+}
+
+function parseOFSDeltaBase(pack, pos, currentOffset) {
+  let byte = pack[pos++];
+  if (byte === undefined) throw new Error('truncated ofs-delta header');
+  let value = byte & 0x7f;
+  let bytes = 1;
+  while (byte & 0x80) {
+    byte = pack[pos++];
+    if (byte === undefined) throw new Error('truncated ofs-delta header');
+    value = ((value + 1) << 7) | (byte & 0x7f);
+    bytes++;
+  }
+  return {baseOffset: Number(currentOffset) - value, bytes};
+}
+
+function packTypeName(type) {
+  if (type === 1) return 'commit';
+  if (type === 2) return 'tree';
+  if (type === 3) return 'blob';
+  if (type === 4) return 'tag';
+  return 'unknown';
+}
+
+function readDeltaSize(delta, state) {
+  let size = 0;
+  let shift = 0;
+  while (state.pos < delta.length) {
+    const byte = delta[state.pos++];
+    size |= (byte & 0x7f) << shift;
+    if (!(byte & 0x80)) return size;
+    shift += 7;
+  }
+  throw new Error('truncated delta size');
+}
+
+function applyPackDelta(base, delta) {
+  const state = {pos: 0};
+  readDeltaSize(delta, state);
+  const targetSize = readDeltaSize(delta, state);
+  const out = [];
+  let written = 0;
+  while (state.pos < delta.length) {
+    const op = delta[state.pos++];
+    if (op & 0x80) {
+      let offset = 0;
+      let size = 0;
+      if (op & 0x01) offset |= delta[state.pos++];
+      if (op & 0x02) offset |= delta[state.pos++] << 8;
+      if (op & 0x04) offset |= delta[state.pos++] << 16;
+      if (op & 0x08) offset |= delta[state.pos++] << 24;
+      if (op & 0x10) size |= delta[state.pos++];
+      if (op & 0x20) size |= delta[state.pos++] << 8;
+      if (op & 0x40) size |= delta[state.pos++] << 16;
+      if (size === 0) size = 0x10000;
+      if (offset < 0 || size < 0 || offset + size > base.length) throw new Error('invalid delta copy');
+      out.push(base.subarray(offset, offset + size));
+      written += size;
+    } else if (op) {
+      if (state.pos + op > delta.length) throw new Error('invalid delta insert');
+      out.push(delta.subarray(state.pos, state.pos + op));
+      state.pos += op;
+      written += op;
+    } else {
+      throw new Error('invalid delta opcode');
+    }
+  }
+  if (written !== targetSize) throw new Error('delta target size mismatch');
+  return Buffer.concat(out, written);
 }
 
 async function treeForCommit(repo, commitHash) {

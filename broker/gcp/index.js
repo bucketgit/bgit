@@ -1107,29 +1107,67 @@ async function nextStoryPosition(entry, lane, excludeID = 0) {
     Number(issue.id || 0) !== Number(excludeID || 0) &&
     normalizeBoardLane(issue.lane) === lane
   );
-  const max = stories.reduce((value, issue) => Math.max(value, storyPosition(issue)), 0);
-  return max + 1000;
+  return stories.length + 1;
 }
 
-async function storyPositionAfter(entry, lane, afterID, selfID) {
-  const stories = sortStoriesForLane((await listIssues(entry)).filter((issue) =>
-    issue.type === 'story' &&
-    !issue.archived &&
-    Number(issue.id || 0) !== Number(selfID || 0) &&
-    normalizeBoardLane(issue.lane) === lane
-  ));
-  if (!stories.length) return 1000;
-  const after = Number(afterID || 0);
-  if (!after) {
-    const first = storyPosition(stories[0]);
-    return first > 1 ? first / 2 : 500;
+function insertStoryIndex(stories, afterID, order) {
+  const requestedOrder = Number(order || 0);
+  if (Number.isFinite(requestedOrder) && requestedOrder > 0) {
+    return Math.max(0, Math.min(stories.length, Math.floor(requestedOrder) - 1));
   }
+  const after = Number(afterID || 0);
+  if (!after) return 0;
   const index = stories.findIndex((issue) => Number(issue.id || 0) === after);
-  if (index < 0) return nextStoryPosition(entry, lane, selfID);
-  const current = storyPosition(stories[index]) || ((index + 1) * 1000);
-  const next = stories[index + 1] ? storyPosition(stories[index + 1]) : 0;
-  if (!next) return current + 1000;
-  return current + ((next - current) / 2);
+  return index < 0 ? stories.length : index + 1;
+}
+
+async function reorderStory(entry, issue, lane, afterID, order) {
+  const oldLane = normalizeBoardLane(issue.lane);
+  const all = await listIssues(entry);
+  const changed = [];
+  const targetStories = sortStoriesForLane(all.filter((candidate) =>
+    candidate.type === 'story' &&
+    !candidate.archived &&
+    Number(candidate.id || 0) !== Number(issue.id || 0) &&
+    normalizeBoardLane(candidate.lane) === lane
+  ));
+  const index = insertStoryIndex(targetStories, afterID, order);
+  issue.lane = lane;
+  targetStories.splice(index, 0, issue);
+  for (let i = 0; i < targetStories.length; i++) {
+    const story = targetStories[i];
+    const position = i + 1;
+    if (normalizeBoardLane(story.lane) !== lane || storyPosition(story) !== position) {
+      story.lane = lane;
+      story.position = position;
+      story.updated_at = new Date().toISOString();
+      changed.push(story);
+    }
+  }
+  if (oldLane !== lane) {
+    const oldStories = sortStoriesForLane(all.filter((candidate) =>
+      candidate.type === 'story' &&
+      !candidate.archived &&
+      Number(candidate.id || 0) !== Number(issue.id || 0) &&
+      normalizeBoardLane(candidate.lane) === oldLane
+    ));
+    for (let i = 0; i < oldStories.length; i++) {
+      const story = oldStories[i];
+      const position = i + 1;
+      if (storyPosition(story) !== position) {
+        story.position = position;
+        story.updated_at = new Date().toISOString();
+        changed.push(story);
+      }
+    }
+  }
+  return changed;
+}
+
+async function saveIssues(entry, issues) {
+  const unique = new Map();
+  for (const issue of issues) unique.set(Number(issue.id || 0), issue);
+  await Promise.all([...unique.values()].map((issue) => saveIssue(entry, issue)));
 }
 
 function nextCIID(data) {
@@ -2239,7 +2277,12 @@ exports.broker = async (req, res) => {
       const issue = {id: nextIssueID(entry.data), type: story ? 'story' : 'issue', title, body: issueBody, status: 'open', lane, assignee: '', position: story ? await nextStoryPosition(entry, lane) : 0, archived: false, author: key.user || 'anonymous', comments: [], history: [], created_at: new Date().toISOString(), updated_at: new Date().toISOString()};
       if (story) issueHistory(issue, key.user, 'created', {to: lane});
       await saveRepo(entry);
-      await saveIssue(entry, issue);
+      if (story) {
+        const changed = await reorderStory(entry, issue, lane, undefined, 0);
+        await saveIssues(entry, changed.concat([issue]));
+      } else {
+        await saveIssue(entry, issue);
+      }
       res.status(200).send(JSON.stringify({ok: true, issue}));
       return;
     }
@@ -2302,11 +2345,9 @@ exports.broker = async (req, res) => {
       if (!issue || issue.type !== 'story') throw Object.assign(new Error('story not found'), {status: 404});
       const fromLane = normalizeBoardLane(issue.lane);
       const lane = normalizeBoardLane(body.lane || issue.lane);
-      issue.lane = lane;
-      issue.position = await storyPositionAfter(entry, lane, body.after_id, issue.id);
-      issue.updated_at = new Date().toISOString();
+      const changed = await reorderStory(entry, issue, lane, body.after_id, body.order);
       issueHistory(issue, key.user, 'reordered', {from: fromLane, to: lane, position: String(issue.position)});
-      await saveIssue(entry, issue);
+      await saveIssues(entry, changed.concat([issue]));
       res.status(200).send(JSON.stringify({ok: true, issue}));
       return;
     }
@@ -2320,16 +2361,24 @@ exports.broker = async (req, res) => {
       const fromAssignee = issue.assignee || '';
       if (req.path === '/issues/move') {
         const lane = normalizeBoardLane(body.lane);
-        issue.lane = lane;
-        if (Object.prototype.hasOwnProperty.call(body, 'after_id')) issue.position = await storyPositionAfter(entry, lane, body.after_id, issue.id);
-        else if (fromLane !== lane || !storyPosition(issue)) issue.position = await nextStoryPosition(entry, lane, issue.id);
+        const changed = Object.prototype.hasOwnProperty.call(body, 'after_id')
+          ? await reorderStory(entry, issue, lane, body.after_id, body.order)
+          : await reorderStory(entry, issue, lane, undefined, 0);
         issueHistory(issue, key.user, 'moved', {from: fromLane, to: lane});
+        await saveIssues(entry, changed.concat([issue]));
+        res.status(200).send(JSON.stringify({ok: true, issue}));
+        return;
       }
       else if (req.path === '/issues/take') {
         issue.assignee = key.user || '';
         if (normalizeBoardLane(issue.lane) === 'backlog') issue.lane = 'doing';
-        if (fromLane !== normalizeBoardLane(issue.lane) || !storyPosition(issue)) issue.position = await nextStoryPosition(entry, normalizeBoardLane(issue.lane), issue.id);
+        const lane = normalizeBoardLane(issue.lane);
+        const changed = (fromLane !== lane || !storyPosition(issue)) ? await reorderStory(entry, issue, lane, undefined, 0) : [];
         issueHistory(issue, key.user, 'assigned', {from: fromAssignee, to: issue.assignee || ''});
+        issue.updated_at = new Date().toISOString();
+        await saveIssues(changed.concat([issue]));
+        res.status(200).send(JSON.stringify({ok: true, issue}));
+        return;
       } else {
         const assignee = String(body.assignee || '').trim();
         if (assignee) {

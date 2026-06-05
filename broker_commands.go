@@ -2870,7 +2870,7 @@ func issueCommand(args []string, stdin io.Reader, stdout io.Writer) error {
 func boardCommand(args []string, stdin io.Reader, stdout io.Writer) error {
 	_ = stdin
 	if len(args) == 0 {
-		return errors.New("usage: bgit board list|create|edit|move|take|assign|archive|unarchive|comment [args]")
+		return errors.New("usage: bgit board list|create|edit|move|priority|take|assign|archive|unarchive|comment [args]")
 	}
 	cfg, err := configForBrokerCommand(config{})
 	if err != nil {
@@ -2990,6 +2990,20 @@ func boardCommand(args []string, stdin io.Reader, stdout io.Writer) error {
 		}
 		fmt.Fprintf(stdout, "moved story %s to %s\n", storyDisplayID(monogram, id), lane)
 		return nil
+	case "priority", "order", "reorder":
+		id, order, lane, err := parseBoardPriorityArgs(args[1:], monogram)
+		if err != nil {
+			return err
+		}
+		if err := brokerPost(cfg.brokerURL, "/issues/reorder", brokerIssueRequest{Repo: repoForBroker(cfg), ID: id, Lane: lane, Order: order}, nil); err != nil {
+			return boardUpgradeError(err)
+		}
+		if lane == "" {
+			fmt.Fprintf(stdout, "set story %s to priority %d\n", storyDisplayID(monogram, id), order)
+		} else {
+			fmt.Fprintf(stdout, "set story %s to priority %d in %s\n", storyDisplayID(monogram, id), order, lane)
+		}
+		return nil
 	case "take":
 		id, err := parseBoardStoryIDArg(args, monogram)
 		if err != nil {
@@ -3060,6 +3074,39 @@ func parseBoardStoryIDArg(args []string, monogram string) (int, error) {
 		return 0, errors.New("story id is required")
 	}
 	return parseStoryDisplayID(args[1], monogram)
+}
+
+func parseBoardPriorityArgs(args []string, monogram string) (int, int, string, error) {
+	if len(args) < 2 {
+		return 0, 0, "", errors.New("usage: bgit board priority STORY_ID ORDER [--lane backlog|ready|doing|review|done]")
+	}
+	id, err := parseStoryDisplayID(args[0], monogram)
+	if err != nil {
+		return 0, 0, "", err
+	}
+	order, err := strconv.Atoi(args[1])
+	if err != nil || order <= 0 {
+		return 0, 0, "", errors.New("priority order must be a positive number")
+	}
+	lane := ""
+	for i := 2; i < len(args); i++ {
+		arg := args[i]
+		name, value, hasValue := strings.Cut(arg, "=")
+		switch name {
+		case "--lane":
+			value, i, err = optionValue(args, i, hasValue, value, name)
+			if err != nil {
+				return 0, 0, "", err
+			}
+			lane, err = parseKanbanLane(value)
+			if err != nil {
+				return 0, 0, "", err
+			}
+		default:
+			return 0, 0, "", fmt.Errorf("unsupported board priority option %s", arg)
+		}
+	}
+	return id, order, lane, nil
 }
 
 func boardUpgradeError(err error) error {

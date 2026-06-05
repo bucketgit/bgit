@@ -1351,6 +1351,120 @@ func TestLocalBrokerRelativeFileRepoUsesBrokerRoot(t *testing.T) {
 	}
 }
 
+func TestLocalBrokerIssuesSupportBoardOperations(t *testing.T) {
+	root := t.TempDir()
+	server := &localBrokerServer{root: root, objectRoot: filepath.Join(root, "objects")}
+	repo := server.physicalRepo(brokerRepo{Provider: "file", Bucket: "file://demo.git", Prefix: "demo.git", Logical: "demo.git"})
+	state := localBrokerRepoState{
+		Repo: repo,
+		Keys: []brokerKey{{User: "owner", Role: "owner", PublicKey: "test-key"}},
+		Refs: map[string]string{},
+	}
+	if err := server.saveRepo(state); err != nil {
+		t.Fatal(err)
+	}
+	out, status, err := server.localPost("/issues/list", brokerIssueRequest{Repo: repo, Type: "story"})
+	if err != nil || status != 200 {
+		t.Fatalf("initial list status=%d err=%v body=%s", status, err, out)
+	}
+	var listResp struct {
+		Issues []brokerIssue `json:"issues"`
+	}
+	if err := json.Unmarshal(out, &listResp); err != nil {
+		t.Fatal(err)
+	}
+	if len(listResp.Issues) != 0 {
+		t.Fatalf("initial issues = %#v", listResp.Issues)
+	}
+
+	out, status, err = server.localPost("/issues/create", brokerIssueRequest{Repo: repo, Type: "story", Title: "Local board works", Body: "Local board works", Lane: "backlog"})
+	if err != nil || status != 200 {
+		t.Fatalf("create status=%d err=%v body=%s", status, err, out)
+	}
+	var createResp struct {
+		Issue brokerIssue `json:"issue"`
+	}
+	if err := json.Unmarshal(out, &createResp); err != nil {
+		t.Fatal(err)
+	}
+	if createResp.Issue.ID != 1 || createResp.Issue.Lane != "backlog" || createResp.Issue.Position == 0 {
+		t.Fatalf("created issue = %#v", createResp.Issue)
+	}
+	if _, status, err = server.localPost("/issues/move", brokerIssueRequest{Repo: repo, ID: createResp.Issue.ID, Lane: "doing"}); err != nil || status != 200 {
+		t.Fatalf("move status=%d err=%v", status, err)
+	}
+	if _, status, err = server.localPost("/issues/assign", brokerIssueRequest{Repo: repo, ID: createResp.Issue.ID, Assignee: "owner"}); err != nil || status != 200 {
+		t.Fatalf("assign status=%d err=%v", status, err)
+	}
+	if _, status, err = server.localPost("/issues/archive", brokerIssueRequest{Repo: repo, ID: createResp.Issue.ID, Archived: true}); err != nil || status != 200 {
+		t.Fatalf("archive status=%d err=%v", status, err)
+	}
+
+	out, status, err = server.localPost("/issues/list", brokerIssueRequest{Repo: repo, Type: "story"})
+	if err != nil || status != 200 {
+		t.Fatalf("list status=%d err=%v body=%s", status, err, out)
+	}
+	if err := json.Unmarshal(out, &listResp); err != nil {
+		t.Fatal(err)
+	}
+	if len(listResp.Issues) != 0 {
+		t.Fatalf("non-archived list = %#v", listResp.Issues)
+	}
+	out, status, err = server.localPost("/issues/list", brokerIssueRequest{Repo: repo, Type: "story", IncludeArchived: true})
+	if err != nil || status != 200 {
+		t.Fatalf("archived list status=%d err=%v body=%s", status, err, out)
+	}
+	if err := json.Unmarshal(out, &listResp); err != nil {
+		t.Fatal(err)
+	}
+	if len(listResp.Issues) != 1 || !listResp.Issues[0].Archived || listResp.Issues[0].Lane != "doing" || listResp.Issues[0].Assignee != "owner" {
+		t.Fatalf("archived list = %#v", listResp.Issues)
+	}
+	if _, err := os.Stat(filepath.Join(root, "objects", "demo.git", localBrokerIssuesPath())); err != nil {
+		t.Fatalf("issues were not persisted with broker state: %v", err)
+	}
+}
+
+func TestLocalBrokerReorderNormalizesDenseStoryOrder(t *testing.T) {
+	root := t.TempDir()
+	server := &localBrokerServer{root: root, objectRoot: filepath.Join(root, "objects")}
+	repo := server.physicalRepo(brokerRepo{Provider: "file", Bucket: "file://ordered.git", Prefix: "ordered.git", Logical: "ordered.git"})
+	state := localBrokerRepoState{
+		Repo: repo,
+		Keys: []brokerKey{{User: "owner", Role: "owner", PublicKey: "test-key"}},
+		Refs: map[string]string{},
+	}
+	if err := server.saveRepo(state); err != nil {
+		t.Fatal(err)
+	}
+	store := localBrokerIssueStore{NextID: 5, Issues: []brokerIssue{
+		{ID: 1, Type: "story", Title: "one", Lane: "doing", Position: 10},
+		{ID: 2, Type: "story", Title: "two", Lane: "doing", Position: 20},
+		{ID: 3, Type: "story", Title: "three", Lane: "doing", Position: 30},
+		{ID: 4, Type: "story", Title: "four", Lane: "doing", Position: 40},
+	}}
+	if err := server.saveIssueStore(repo, store); err != nil {
+		t.Fatal(err)
+	}
+	out, status, err := server.localPost("/issues/reorder", brokerIssueRequest{Repo: repo, ID: 4, Lane: "doing", Order: 3})
+	if err != nil || status != 200 {
+		t.Fatalf("reorder status=%d err=%v body=%s", status, err, out)
+	}
+	store, err = server.loadIssueStore(repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sortBoardStories(store.Issues)
+	got := []string{}
+	for _, issue := range store.Issues {
+		got = append(got, fmt.Sprintf("%d:%.0f", issue.ID, issue.Position))
+	}
+	want := []string{"1:1", "2:2", "4:3", "3:4"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("order = %v, want %v", got, want)
+	}
+}
+
 func TestEnsureCloneDestinationAvailableRejectsNonEmptyDirectory(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(dir, "README.md"), []byte("content\n"), 0o644); err != nil {
@@ -1839,6 +1953,18 @@ func TestMergeConfigUsesRepoRegion(t *testing.T) {
 	merged = mergeConfig(config{region: "us-west-2"}, local)
 	if merged.region != "us-west-2" {
 		t.Fatalf("explicit region = %q", merged.region)
+	}
+}
+
+func TestMergeConfigUsesLocalBrokerStorageTarget(t *testing.T) {
+	local := config{storageProvider: "s3", storageProfile: "default", storageRegion: "eu-west-1"}
+	merged := mergeConfig(config{}, local)
+	if merged.storageProvider != "s3" || merged.storageProfile != "default" || merged.storageRegion != "eu-west-1" {
+		t.Fatalf("merged storage = %#v", merged)
+	}
+	merged = mergeConfig(config{storageProvider: "gcs", storageProfile: "prod", storageRegion: "europe-west1"}, local)
+	if merged.storageProvider != "gcs" || merged.storageProfile != "prod" || merged.storageRegion != "europe-west1" {
+		t.Fatalf("explicit storage = %#v", merged)
 	}
 }
 

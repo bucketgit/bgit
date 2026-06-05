@@ -4,6 +4,18 @@ All notable changes to `bgit` are documented in this file.
 
 This project follows semantic versioning.
 
+## 1.3.4
+
+Fixed
+
+- Local broker repositories now support issue and task-board endpoints, so
+  `bgit issue` and `bgit board` commands work for local broker clones.
+- Broker commands now preserve local broker S3/GCS storage settings from
+  `.git/config` when resolving the backing repository.
+- Added `bgit board priority STORY_ID ORDER [--lane LANE]`; board reordering now
+  normalizes lane order to dense story positions so setting a story to priority
+  3 shifts the existing 3+ stories down in one broker mutation.
+
 ## 1.3.3
 
 Fixed

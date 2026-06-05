@@ -46,6 +46,11 @@ type localBrokerRepoIndex struct {
 	Repos []brokerRepo `json:"repos"`
 }
 
+type localBrokerIssueStore struct {
+	NextID int           `json:"next_id"`
+	Issues []brokerIssue `json:"issues"`
+}
+
 func isLocalBrokerURL(value string) bool {
 	return strings.HasPrefix(strings.TrimSpace(value), "local://")
 }
@@ -250,6 +255,13 @@ func (s *localBrokerServer) localPost(path string, req any) ([]byte, int, error)
 			return nil, 500, err
 		}
 		return mustJSON(brokerObjectResponse{Paths: paths}), 200, nil
+	case "/issues/list", "/issues/view", "/issues/create", "/issues/update", "/issues/comment", "/issues/close", "/issues/reopen", "/issues/move", "/issues/take", "/issues/assign", "/issues/archive", "/issues/reorder":
+		r := req.(brokerIssueRequest)
+		state, err := s.loadRepoForRequest(r.Repo)
+		if err != nil {
+			return mustJSON(map[string]string{"error": "repository not found"}), http.StatusNotFound, nil
+		}
+		return s.localIssueEndpoint(path, r, state, "owner")
 	case "/refs/update":
 		r := req.(brokerRefUpdateRequest)
 		state, err := s.loadRepoForRequest(r.Repo)
@@ -327,6 +339,8 @@ func (s *localBrokerServer) handle(w http.ResponseWriter, r *http.Request) {
 		s.handleObjectsRead(w, r, body)
 	case "/objects/list":
 		s.handleObjectsList(w, r, body)
+	case "/issues/list", "/issues/view", "/issues/create", "/issues/update", "/issues/comment", "/issues/close", "/issues/reopen", "/issues/move", "/issues/take", "/issues/assign", "/issues/archive", "/issues/reorder":
+		s.handleIssues(w, r, body)
 	case "/refs/update":
 		s.handleRefsUpdate(w, r, body)
 	default:
@@ -576,6 +590,243 @@ func (s *localBrokerServer) handleObjectsList(w http.ResponseWriter, r *http.Req
 	localBrokerJSON(w, 200, brokerObjectResponse{Paths: paths})
 }
 
+func (s *localBrokerServer) handleIssues(w http.ResponseWriter, r *http.Request, body []byte) {
+	var req brokerIssueRequest
+	if !localBrokerDecode(w, body, &req) {
+		return
+	}
+	state, err := s.loadRepoForRequest(req.Repo)
+	if err != nil {
+		localBrokerJSON(w, http.StatusNotFound, map[string]string{"error": "repository not found"})
+		return
+	}
+	operation := "write"
+	if r.URL.Path == "/issues/list" || r.URL.Path == "/issues/view" {
+		operation = "read"
+	}
+	key, ok := s.signedRepoKey(r, body, state, operation)
+	if !ok {
+		localBrokerJSON(w, http.StatusForbidden, map[string]string{"error": operation + " SSH signature required"})
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	data, status, err := s.localIssueEndpoint(r.URL.Path, req, state, firstNonEmpty(key.User, "owner"))
+	if err != nil {
+		localBrokerJSON(w, status, map[string]string{"error": err.Error()})
+		return
+	}
+	if len(data) == 0 {
+		localBrokerJSON(w, status, map[string]bool{"ok": true})
+		return
+	}
+	w.Header().Set("content-type", "application/json")
+	w.WriteHeader(status)
+	_, _ = w.Write(data)
+}
+
+func (s *localBrokerServer) localIssueEndpoint(path string, req brokerIssueRequest, state localBrokerRepoState, user string) ([]byte, int, error) {
+	store, err := s.loadIssueStore(state.Repo)
+	if err != nil {
+		return nil, 500, err
+	}
+	user = firstNonEmpty(strings.TrimSpace(user), "owner")
+	switch path {
+	case "/issues/list":
+		issues := make([]brokerIssue, 0, len(store.Issues))
+		for _, issue := range store.Issues {
+			if req.Type != "" && issue.Type != req.Type {
+				continue
+			}
+			if issue.Archived && !req.IncludeArchived {
+				continue
+			}
+			issues = append(issues, issue)
+		}
+		sortBoardStories(issues)
+		return mustJSON(map[string]any{"issues": issues}), 200, nil
+	case "/issues/view":
+		issue, err := localBrokerFindIssue(&store, req.ID)
+		if err != nil {
+			return nil, http.StatusNotFound, err
+		}
+		return mustJSON(map[string]any{"issue": *issue}), 200, nil
+	case "/issues/create":
+		title := strings.TrimSpace(req.Title)
+		body := strings.TrimSpace(req.Body)
+		if title == "" {
+			title = storySummary(body)
+		}
+		if title == "" {
+			return nil, http.StatusBadRequest, errors.New("issue title is required")
+		}
+		now := time.Now().UTC().Format(time.RFC3339)
+		if store.NextID <= 0 {
+			store.NextID = localBrokerNextIssueID(store.Issues)
+		}
+		issueType := firstNonEmpty(strings.TrimSpace(req.Type), "issue")
+		lane := strings.TrimSpace(req.Lane)
+		position := 0.0
+		if issueType == "story" {
+			lane = normalizeKanbanLane(lane)
+			position = localBrokerNextStoryPosition(store.Issues, lane)
+		}
+		issue := brokerIssue{
+			ID:        store.NextID,
+			Type:      issueType,
+			Title:     title,
+			Body:      body,
+			Status:    "open",
+			Lane:      lane,
+			Assignee:  strings.TrimSpace(req.Assignee),
+			Position:  position,
+			Author:    user,
+			CreatedAt: now,
+			UpdatedAt: now,
+			History:   []brokerIssueEvent{{User: user, Action: "created", At: now}},
+		}
+		store.NextID++
+		store.Issues = append(store.Issues, issue)
+		if issueType == "story" {
+			localBrokerNormalizeLaneOrder(&store, lane, 0)
+			if created, err := localBrokerFindIssue(&store, issue.ID); err == nil {
+				issue = *created
+			}
+		}
+		if err := s.saveIssueStore(state.Repo, store); err != nil {
+			return nil, 500, err
+		}
+		return mustJSON(map[string]any{"issue": issue}), 200, nil
+	case "/issues/update":
+		issue, err := localBrokerFindIssue(&store, req.ID)
+		if err != nil {
+			return nil, http.StatusNotFound, err
+		}
+		if req.Type != "" {
+			issue.Type = req.Type
+		}
+		if strings.TrimSpace(req.Title) != "" {
+			issue.Title = strings.TrimSpace(req.Title)
+		}
+		if req.Body != "" {
+			issue.Body = strings.TrimSpace(req.Body)
+		}
+		if issue.Title == "" && issue.Type == "story" {
+			issue.Title = storySummary(issue.Body)
+		}
+		localBrokerIssueEvent(issue, user, "edited", "", "", "")
+	case "/issues/comment":
+		issue, err := localBrokerFindIssue(&store, req.ID)
+		if err != nil {
+			return nil, http.StatusNotFound, err
+		}
+		comment := strings.TrimSpace(req.Comment)
+		if comment == "" {
+			return nil, http.StatusBadRequest, errors.New("comment is required")
+		}
+		now := time.Now().UTC().Format(time.RFC3339)
+		issue.Comments = append(issue.Comments, brokerIssueReply{User: user, Body: comment, At: now})
+		localBrokerIssueEvent(issue, user, "commented", "", "", "")
+	case "/issues/close", "/issues/reopen":
+		issue, err := localBrokerFindIssue(&store, req.ID)
+		if err != nil {
+			return nil, http.StatusNotFound, err
+		}
+		status := "closed"
+		action := "closed"
+		if path == "/issues/reopen" {
+			status = "open"
+			action = "reopened"
+		}
+		if issue.Status != status {
+			issue.Status = status
+			localBrokerIssueEvent(issue, user, action, "", "", "")
+		}
+	case "/issues/move", "/issues/reorder":
+		issue, err := localBrokerFindIssue(&store, req.ID)
+		if err != nil {
+			return nil, http.StatusNotFound, err
+		}
+		lane, err := parseKanbanLane(firstNonEmpty(req.Lane, issue.Lane))
+		if err != nil {
+			return nil, http.StatusBadRequest, err
+		}
+		from := normalizeKanbanLane(issue.Lane)
+		order := localBrokerStoryOrderFromRequest(req.Order)
+		if path == "/issues/reorder" {
+			localBrokerApplyStoryOrder(&store, issue.ID, lane, req.AfterID, order)
+			if from != lane {
+				localBrokerNormalizeLaneOrder(&store, from, issue.ID)
+			}
+		} else if req.AfterID != nil {
+			localBrokerApplyStoryOrder(&store, issue.ID, lane, req.AfterID, 0)
+			if from != lane {
+				localBrokerNormalizeLaneOrder(&store, from, issue.ID)
+			}
+		} else {
+			issue.Lane = lane
+			issue.Position = localBrokerNextStoryPosition(store.Issues, lane)
+			if from != lane {
+				localBrokerNormalizeLaneOrder(&store, from, issue.ID)
+			}
+			localBrokerNormalizeLaneOrder(&store, lane, 0)
+		}
+		issue, _ = localBrokerFindIssue(&store, req.ID)
+		action := "moved"
+		if path == "/issues/reorder" {
+			action = "reordered"
+		}
+		localBrokerIssueEvent(issue, user, action, from, lane, fmt.Sprintf("%.6f", issue.Position))
+	case "/issues/take":
+		issue, err := localBrokerFindIssue(&store, req.ID)
+		if err != nil {
+			return nil, http.StatusNotFound, err
+		}
+		fromAssignee := issue.Assignee
+		fromLane := normalizeKanbanLane(issue.Lane)
+		issue.Assignee = user
+		lane := normalizeKanbanLane(issue.Lane)
+		if lane == "backlog" {
+			lane = "doing"
+			localBrokerApplyStoryOrder(&store, issue.ID, lane, nil, 0)
+			localBrokerNormalizeLaneOrder(&store, fromLane, issue.ID)
+			issue, _ = localBrokerFindIssue(&store, req.ID)
+		} else if issue.Position == 0 {
+			localBrokerNormalizeLaneOrder(&store, lane, 0)
+			issue, _ = localBrokerFindIssue(&store, req.ID)
+		}
+		localBrokerIssueEvent(issue, user, "assigned", fromAssignee, user, "")
+	case "/issues/assign":
+		issue, err := localBrokerFindIssue(&store, req.ID)
+		if err != nil {
+			return nil, http.StatusNotFound, err
+		}
+		from := issue.Assignee
+		to := strings.TrimSpace(req.Assignee)
+		issue.Assignee = to
+		localBrokerIssueEvent(issue, user, "assigned", from, to, "")
+	case "/issues/archive":
+		issue, err := localBrokerFindIssue(&store, req.ID)
+		if err != nil {
+			return nil, http.StatusNotFound, err
+		}
+		issue.Archived = req.Archived
+		action := "unarchived"
+		if req.Archived {
+			action = "archived"
+		}
+		localBrokerIssueEvent(issue, user, action, "", "", "")
+	default:
+		return mustJSON(map[string]string{"error": "unknown broker endpoint"}), http.StatusNotFound, nil
+	}
+	if path != "/issues/list" && path != "/issues/view" && path != "/issues/create" {
+		if err := s.saveIssueStore(state.Repo, store); err != nil {
+			return nil, 500, err
+		}
+	}
+	return mustJSON(map[string]bool{"ok": true}), 200, nil
+}
+
 func (s *localBrokerServer) handleRefsUpdate(w http.ResponseWriter, r *http.Request, body []byte) {
 	var req brokerRefUpdateRequest
 	if !localBrokerDecode(w, body, &req) {
@@ -811,6 +1062,34 @@ func (s *localBrokerServer) saveRepo(state localBrokerRepoState) error {
 		return err
 	}
 	return s.upsertRepoIndex(state.Repo)
+}
+
+func (s *localBrokerServer) loadIssueStore(repo brokerRepo) (localBrokerIssueStore, error) {
+	var store localBrokerIssueStore
+	data, err := s.readObject(repo, localBrokerIssuesPath())
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) || errors.Is(err, os.ErrNotExist) {
+			return localBrokerIssueStore{NextID: 1}, nil
+		}
+		return store, err
+	}
+	if len(bytes.TrimSpace(data)) == 0 {
+		return localBrokerIssueStore{NextID: 1}, nil
+	}
+	if err := json.Unmarshal(data, &store); err != nil {
+		return store, err
+	}
+	if store.NextID <= 0 {
+		store.NextID = localBrokerNextIssueID(store.Issues)
+	}
+	return store, nil
+}
+
+func (s *localBrokerServer) saveIssueStore(repo brokerRepo, store localBrokerIssueStore) error {
+	if store.NextID <= 0 {
+		store.NextID = localBrokerNextIssueID(store.Issues)
+	}
+	return s.writeObject(repo, localBrokerIssuesPath(), mustJSON(store))
 }
 
 func (s *localBrokerServer) repoIndexPath() string {
@@ -1280,6 +1559,125 @@ func localBrokerObjectName(repo brokerRepo, objectPath string) string {
 
 func localBrokerRefRecordPath(ref string) string {
 	return ".bucketgit/broker-state/v1/refs/" + base64.RawURLEncoding.EncodeToString([]byte(ref)) + ".json"
+}
+
+func localBrokerIssuesPath() string {
+	return ".bucketgit/broker-state/v1/issues.json"
+}
+
+func localBrokerFindIssue(store *localBrokerIssueStore, id int) (*brokerIssue, error) {
+	if id <= 0 {
+		return nil, errors.New("issue id is required")
+	}
+	for i := range store.Issues {
+		if store.Issues[i].ID == id {
+			return &store.Issues[i], nil
+		}
+	}
+	return nil, errors.New("issue not found")
+}
+
+func localBrokerNextIssueID(issues []brokerIssue) int {
+	next := 1
+	for _, issue := range issues {
+		if issue.ID >= next {
+			next = issue.ID + 1
+		}
+	}
+	return next
+}
+
+func localBrokerNextStoryPosition(issues []brokerIssue, lane string) float64 {
+	count := 0
+	for _, issue := range issues {
+		if issue.Type == "story" && !issue.Archived && normalizeKanbanLane(issue.Lane) == lane {
+			count++
+		}
+	}
+	return float64(count + 1)
+}
+
+func localBrokerStoryOrderFromRequest(order int) int {
+	if order > 0 {
+		return order
+	}
+	return 0
+}
+
+func localBrokerApplyStoryOrder(store *localBrokerIssueStore, issueID int, lane string, afterID *int, order int) {
+	target, err := localBrokerFindIssue(store, issueID)
+	if err != nil {
+		return
+	}
+	target.Lane = lane
+	stories := localBrokerLaneStories(store, lane, issueID)
+	index := len(stories)
+	if order > 0 {
+		index = order - 1
+		if index < 0 {
+			index = 0
+		}
+		if index > len(stories) {
+			index = len(stories)
+		}
+	} else if afterID != nil {
+		index = 0
+		if *afterID > 0 {
+			index = len(stories)
+			for i, story := range stories {
+				if story.ID == *afterID {
+					index = i + 1
+					break
+				}
+			}
+		}
+	}
+	stories = append(stories, nil)
+	copy(stories[index+1:], stories[index:])
+	stories[index] = target
+	for i, story := range stories {
+		story.Lane = lane
+		story.Position = float64(i + 1)
+	}
+}
+
+func localBrokerNormalizeLaneOrder(store *localBrokerIssueStore, lane string, excludeID int) {
+	stories := localBrokerLaneStories(store, lane, excludeID)
+	for i, story := range stories {
+		story.Position = float64(i + 1)
+	}
+}
+
+func localBrokerLaneStories(store *localBrokerIssueStore, lane string, excludeID int) []*brokerIssue {
+	stories := []*brokerIssue{}
+	for i := range store.Issues {
+		issue := &store.Issues[i]
+		if issue.ID == excludeID || issue.Type != "story" || issue.Archived || normalizeKanbanLane(issue.Lane) != lane {
+			continue
+		}
+		stories = append(stories, issue)
+	}
+	sort.SliceStable(stories, func(i, j int) bool {
+		left := stories[i].Position
+		right := stories[j].Position
+		if left != right {
+			if left == 0 {
+				return false
+			}
+			if right == 0 {
+				return true
+			}
+			return left < right
+		}
+		return stories[i].ID < stories[j].ID
+	})
+	return stories
+}
+
+func localBrokerIssueEvent(issue *brokerIssue, user, action, from, to, position string) {
+	now := time.Now().UTC().Format(time.RFC3339)
+	issue.UpdatedAt = now
+	issue.History = append(issue.History, brokerIssueEvent{User: user, Action: action, From: from, To: to, Position: position, At: now})
 }
 
 func (s *localBrokerServer) localRefHash(repo brokerRepo, ref, fallback string) string {

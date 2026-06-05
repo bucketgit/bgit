@@ -429,6 +429,41 @@ func TestBoardCommandEditsAndArchivesStories(t *testing.T) {
 	}
 }
 
+func TestBoardCommandPrioritizesStory(t *testing.T) {
+	var reorderReq brokerIssueRequest
+	target, server, requests := setupBrokerCommandTestRepo(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/issues/reorder" {
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+		if err := json.NewDecoder(r.Body).Decode(&reorderReq); err != nil {
+			t.Fatal(err)
+		}
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	})
+	defer server.Close()
+	oldDir, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(oldDir)
+	if err := os.Chdir(target); err != nil {
+		t.Fatal(err)
+	}
+	var stdout bytes.Buffer
+	if err := boardCommand([]string{"priority", "AP-7", "3", "--lane", "review"}, strings.NewReader(""), &stdout); err != nil {
+		t.Fatal(err)
+	}
+	if reorderReq.ID != 7 || reorderReq.Order != 3 || reorderReq.Lane != "review" {
+		t.Fatalf("reorder req = %#v", reorderReq)
+	}
+	if !strings.Contains(stdout.String(), "set story AP-7 to priority 3 in review") {
+		t.Fatalf("stdout = %q", stdout.String())
+	}
+	if got := strings.Join(*requests, ","); got != "/issues/reorder" {
+		t.Fatalf("requests = %s", got)
+	}
+}
+
 func TestBoardCommandListsArchivedStoriesSeparately(t *testing.T) {
 	var listReq brokerIssueRequest
 	target, server, _ := setupBrokerCommandTestRepo(t, func(w http.ResponseWriter, r *http.Request) {

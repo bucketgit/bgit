@@ -207,6 +207,7 @@ type brokerIssueRequest struct {
 	Assignee        string     `json:"assignee,omitempty"`
 	Comment         string     `json:"comment,omitempty"`
 	AfterID         *int       `json:"after_id,omitempty"`
+	Order           int        `json:"order,omitempty"`
 	Archived        bool       `json:"archived,omitempty"`
 	IncludeArchived bool       `json:"include_archived,omitempty"`
 }

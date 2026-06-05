@@ -630,6 +630,15 @@ func mergeConfig(primary, fallback config) config {
 	if primary.region == "" {
 		primary.region = fallback.region
 	}
+	if primary.storageProvider == "" {
+		primary.storageProvider = fallback.storageProvider
+	}
+	if primary.storageProfile == "" {
+		primary.storageProfile = fallback.storageProfile
+	}
+	if primary.storageRegion == "" {
+		primary.storageRegion = fallback.storageRegion
+	}
 	if primary.branch == "" || primary.branch == defaultBranch {
 		primary.branch = fallback.branch
 	}

@@ -190,6 +190,7 @@ bgit board edit BG-1 "As a maintainer, I want clear setup docs so that new users
 bgit board take BG-1
 bgit board assign BG-1 ada
 bgit board move BG-1 doing
+bgit board priority BG-1 1
 bgit board comment BG-1 "Opened PR #2."
 bgit board archive BG-1
 bgit board list --archived
@@ -430,6 +431,7 @@ bgit board edit BG-1 "As a developer, I want CI logs and status on each run so t
 bgit board take BG-1
 bgit board assign BG-1 ada
 bgit board move BG-1 review
+bgit board priority BG-1 2 --lane review
 bgit board comment BG-1 "PR #4 is ready for review."
 bgit board archive BG-1
 bgit board list --archived

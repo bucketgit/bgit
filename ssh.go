@@ -79,6 +79,10 @@ func sshServeGitService(service, repo, host string, stdin io.Reader, stdout io.W
 	if err != nil {
 		return err
 	}
+	return serveGitServiceWithConfig(ctx, service, cfg, stdin, stdout)
+}
+
+func serveGitServiceWithConfig(ctx context.Context, service string, cfg config, stdin io.Reader, stdout io.Writer) error {
 	if err := authorizeSSHGitService(cfg, service); err != nil {
 		return err
 	}

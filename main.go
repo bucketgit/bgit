@@ -65,6 +65,13 @@ type config struct {
 }
 
 func main() {
+	if filepath.Base(os.Args[0]) == "git-remote-bgit" {
+		if err := remoteHelperCommand(os.Args[1:], os.Stdin, os.Stdout, os.Stderr); err != nil {
+			fmt.Fprintln(os.Stderr, "fatal:", err)
+			os.Exit(1)
+		}
+		return
+	}
 	if err := run(os.Args[1:], os.Stdin, os.Stdout, os.Stderr); err != nil {
 		fmt.Fprintln(os.Stderr, "fatal:", err)
 		os.Exit(1)

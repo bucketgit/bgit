@@ -2069,10 +2069,21 @@ func brokerAcceptBrokerInviteCommand(args []string, stdout io.Writer) error {
 	}
 	var resp brokerOwnerTransferResponse
 	if err := brokerPost(payload.BrokerURL, "/broker/users/invite/accept", brokerRepoAdminRequest{User: payload.User, Token: payload.Token}, &resp); err != nil {
+		if brokerInviteAcceptNeedsSSHIdentity(err) {
+			return errors.New("accepting a broker invite requires an SSH signature; load a key with `ssh-add`, pass `--identity PATH`, or set BGIT_SSH_KEY")
+		}
 		return err
 	}
 	fmt.Fprintf(stdout, "accepted broker invite for %s as %s with key %s\n", resp.User, resp.Role, resp.Fingerprint)
 	return nil
+}
+
+func brokerInviteAcceptNeedsSSHIdentity(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "/broker/users/invite/accept") && strings.Contains(msg, "ssh signature required")
 }
 
 func brokerCancelBrokerInviteCommand(cfg config, args []string, stdout io.Writer) error {

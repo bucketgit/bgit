@@ -1684,7 +1684,7 @@ exports.broker = async (req, res) => {
     if (req.path === '/broker/users/invite/accept' && req.method === 'POST') {
       const users = await loadBrokerUsers();
       const signed = await submittedSignedKey(req);
-      if (!signed) throw Object.assign(new Error('SSH signature required'), {status: 403});
+      if (!signed) throw Object.assign(new Error('broker invite accept SSH signature required'), {status: 403});
       const tokenHash = ownershipTransferTokenHash(body.token);
       const invites = users.data.invites || [];
       const invite = invites.find((item) => item.token_hash === tokenHash && Date.parse(item.expires_at || '') > Date.now());

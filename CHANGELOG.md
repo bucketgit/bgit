@@ -4,6 +4,19 @@ All notable changes to `bgit` are documented in this file.
 
 This project follows semantic versioning.
 
+## 1.3.5
+
+Added
+
+- Added `git-remote-bgit` remote-helper mode so the `bgit` binary can be
+  installed under that name and used by native Git for `bgit://` and
+  `bgit::...` remotes.
+
+Fixed
+
+- `bgit admin accept-broker-invite` now reports a missing SSH identity as an
+  invite acceptance problem instead of mislabeling it as broker version skew.
+
 ## 1.3.4
 
 Fixed

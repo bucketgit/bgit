@@ -127,6 +127,20 @@ git fetch
 git push
 ```
 
+When `bgit` is also installed as `git-remote-bgit`, native Git can use the
+BucketGit remote helper for `bgit://` and `bgit::` remotes:
+
+```bash
+git clone bgit::https://broker.example.com/demo.git
+git remote add origin bgit::demo.git
+git fetch origin
+git push origin main
+```
+
+`bgit::https://broker.example.com/demo.git` carries the broker URL explicitly.
+`bgit::demo.git` and `bgit://demo.git` resolve through the current checkout's
+BucketGit broker configuration.
+
 ## Custom Domains
 
 BucketGit can discover brokers from DNS TXT records, so users can clone from a

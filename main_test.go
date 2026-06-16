@@ -1932,6 +1932,16 @@ func TestBrokerHTTPErrorHintsAtIncompatibleBrokerOnSignatureFailure(t *testing.T
 	}
 }
 
+func TestBrokerInviteAcceptNeedsSSHIdentity(t *testing.T) {
+	err := brokerHTTPError("/broker/users/invite/accept", `{"error":"SSH signature required"}`)
+	if !brokerInviteAcceptNeedsSSHIdentity(err) {
+		t.Fatalf("expected broker invite accept identity hint for %v", err)
+	}
+	if brokerInviteAcceptNeedsSSHIdentity(errors.New(`broker /auth/status: {"error":"SSH signature required"}`)) {
+		t.Fatalf("did not expect broker invite accept identity hint for auth status")
+	}
+}
+
 func TestMergeConfigUsesRepoAuthUnlessExplicit(t *testing.T) {
 	local := config{auth: "adc", gcloudConfiguration: "test-profile"}
 	merged := mergeConfig(config{auth: "gcloud"}, local)

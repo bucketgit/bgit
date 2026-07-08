@@ -2,13 +2,19 @@ package main
 
 import (
 	"bytes"
+	"crypto/ed25519"
+	"crypto/rand"
+	"crypto/x509"
 	"encoding/json"
+	"encoding/pem"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"golang.org/x/crypto/ssh"
 )
 
 func TestWhoamiCommandWritesGlobalCache(t *testing.T) {
@@ -63,6 +69,34 @@ func TestWhoamiCachePathUsesBGitHome(t *testing.T) {
 	}
 	if want := filepath.Join(home, "cache"); !strings.HasPrefix(path, want) {
 		t.Fatalf("cache path = %s, want prefix %s", path, want)
+	}
+}
+
+func TestExplicitBrokerSignersReadsGitSSHPrivateKey(t *testing.T) {
+	t.Setenv("BGIT_SSH_KEY", "")
+	t.Setenv("BGIT_SSH_KEYS", "")
+
+	_, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	privateKeyBytes, err := x509.MarshalPKCS8PrivateKey(privateKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	privateKeyPEM := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: privateKeyBytes})
+	expectedSigner, err := ssh.NewSignerFromKey(privateKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Setenv("GIT_SSH_PRIVATE_KEY", string(privateKeyPEM))
+	signers := explicitBrokerSigners()
+	if len(signers) != 1 {
+		t.Fatalf("signers = %d, want 1", len(signers))
+	}
+	if got, want := ssh.FingerprintSHA256(signers[0].PublicKey()), ssh.FingerprintSHA256(expectedSigner.PublicKey()); got != want {
+		t.Fatalf("signer fingerprint = %s, want %s", got, want)
 	}
 }
 

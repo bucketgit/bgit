@@ -988,11 +988,22 @@ func explicitBrokerSigners() []ssh.Signer {
 			}
 		}
 	}
+	var inlineKeys []string
+	if value := strings.TrimSpace(os.Getenv("GIT_SSH_PRIVATE_KEY")); value != "" {
+		inlineKeys = append(inlineKeys, value)
+	}
 	if value := strings.TrimSpace(brokerIdentityPreference); value != "" && !strings.HasPrefix(value, "SHA256:") {
 		paths = append(paths, value)
 	}
 	seen := map[string]struct{}{}
 	var signers []ssh.Signer
+	for _, key := range inlineKeys {
+		signer, err := ssh.ParsePrivateKey([]byte(key))
+		if err != nil {
+			continue
+		}
+		signers = append(signers, signer)
+	}
 	for _, path := range paths {
 		path = expandHome(path)
 		if _, ok := seen[path]; ok {

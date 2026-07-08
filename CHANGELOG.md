@@ -4,6 +4,14 @@ All notable changes to `bgit` are documented in this file.
 
 This project follows semantic versioning.
 
+## 1.3.6
+
+Added
+
+- `GIT_SSH_PRIVATE_KEY` is now accepted as inline SSH private key material for
+  broker request signing, matching common CI and operator credential injection
+  conventions.
+
 ## 1.3.5
 
 Added

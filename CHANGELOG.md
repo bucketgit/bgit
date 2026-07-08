@@ -4,6 +4,16 @@ All notable changes to `bgit` are documented in this file.
 
 This project follows semantic versioning.
 
+## 1.3.7
+
+Added
+
+- Local broker `s3://` repositories can now discover AWS account identity through
+  the AWS SDK credential chain before falling back to the AWS CLI.
+- Local broker `gs://` repositories using the default profile can now discover
+  the GCP project from ADC, local ADC config, or GKE metadata before falling
+  back to gcloud configuration.
+
 ## 1.3.6
 
 Added

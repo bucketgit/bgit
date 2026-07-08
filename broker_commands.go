@@ -1377,8 +1377,11 @@ func localBrokerImportCloudIdentity(ctx context.Context, scheme, profile string,
 		return accountID, nil
 	case "gs":
 		projectID := gcloudConfigValue(ctx, profile, "project")
+		if projectID == "" && profile == "default" {
+			projectID = gcpDefaultProjectID(ctx)
+		}
 		if projectID == "" {
-			return "", fmt.Errorf("GCP profile %q has no cached project id; configure or refresh it with `bgit setup profile create --provider gcp %s`, or run `gcloud config set project PROJECT --configuration %s`", profile, profile, profile)
+			return "", fmt.Errorf("GCP profile %q has no cached project id; configure or refresh it with `bgit setup profile create --provider gcp %s`, run `gcloud config set project PROJECT --configuration %s`, or provide default ADC project credentials", profile, profile, profile)
 		}
 		global = upsertGlobalGCPProfile(global, globalGCPProfile{
 			Name:      profile,

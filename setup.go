@@ -1057,6 +1057,9 @@ func awsProfileFileValue(path, profile, key string) string {
 }
 
 func awsCallerIdentity(ctx context.Context, profile string) (string, string) {
+	if account, arn := awsCallerIdentitySDK(ctx, profile); account != "" {
+		return account, arn
+	}
 	if _, err := exec.LookPath("aws"); err != nil {
 		return "", ""
 	}

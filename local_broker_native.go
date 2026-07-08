@@ -1207,7 +1207,7 @@ func localBrokerRepoCloudConfig(repo brokerRepo) (config, bool, error) {
 		bucket:              strings.TrimSpace(repo.Bucket),
 		prefix:              "",
 		region:              region,
-		auth:                defaultAuthMode,
+		auth:                defaultStorageAuthMode(),
 		gcloudConfiguration: profile,
 	}, true, nil
 }
@@ -1263,7 +1263,7 @@ func localBrokerCloudConfig(bucketURI string) (config, bool, error) {
 		bucket:              bucket,
 		prefix:              "",
 		region:              region,
-		auth:                defaultAuthMode,
+		auth:                defaultStorageAuthMode(),
 		gcloudConfiguration: profile,
 	}, true, nil
 }

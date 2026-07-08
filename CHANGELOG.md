@@ -10,6 +10,8 @@ Fixed
 
 - `BGIT_AUTH=adc` can now be used for normal clone/fetch paths without being
   rejected as if `--auth adc` had been passed on the command line.
+- Local broker cloud storage config now honors `BGIT_AUTH`, allowing Magos jobs
+  to use ADC for `gs://` clones without requiring the `gcloud` CLI.
 
 ## 1.3.7
 

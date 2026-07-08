@@ -2113,6 +2113,7 @@ func TestReadLocalConfigPreservesBrokerBucket(t *testing.T) {
 }
 
 func TestLocalBrokerCloudConfigParsesAWSAndGCP(t *testing.T) {
+	t.Setenv("BGIT_AUTH", "adc")
 	awsCfg, ok, err := localBrokerCloudConfig("s3://work.eu-west-1.my-local-repo7.git")
 	if err != nil || !ok {
 		t.Fatalf("aws parse ok=%v err=%v", ok, err)
@@ -2120,12 +2121,18 @@ func TestLocalBrokerCloudConfigParsesAWSAndGCP(t *testing.T) {
 	if awsCfg.provider != "s3" || awsCfg.gcloudConfiguration != "work" || awsCfg.region != "eu-west-1" || awsCfg.bucket != "my-local-repo7.git" {
 		t.Fatalf("aws cfg = %#v", awsCfg)
 	}
+	if awsCfg.auth != "adc" {
+		t.Fatalf("aws auth = %q", awsCfg.auth)
+	}
 	gcpCfg, ok, err := localBrokerCloudConfig("gs://default.us-central1.my-local-repo7.git")
 	if err != nil || !ok {
 		t.Fatalf("gcp parse ok=%v err=%v", ok, err)
 	}
 	if gcpCfg.provider != "gcs" || gcpCfg.gcloudConfiguration != "default" || gcpCfg.region != "us-central1" || gcpCfg.bucket != "my-local-repo7.git" {
 		t.Fatalf("gcp cfg = %#v", gcpCfg)
+	}
+	if gcpCfg.auth != "adc" {
+		t.Fatalf("gcp auth = %q", gcpCfg.auth)
 	}
 	generatedCfg, ok, err := localBrokerCloudConfig("s3://default.us-east-1.bgit-my-local-repo7-abc123def456")
 	if err != nil || !ok {

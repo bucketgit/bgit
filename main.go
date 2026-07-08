@@ -23,6 +23,14 @@ import (
 const defaultBranch = "main"
 const defaultAuthMode = "gcloud"
 
+func defaultStorageAuthMode() string {
+	auth := strings.ToLower(strings.TrimSpace(os.Getenv("BGIT_AUTH")))
+	if auth == "gcloud" || auth == "adc" {
+		return auth
+	}
+	return defaultAuthMode
+}
+
 //go:embed CHANGELOG.md
 var embeddedChangelog string
 

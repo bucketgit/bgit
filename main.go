@@ -60,6 +60,7 @@ type config struct {
 	identity                    string
 	direct                      bool
 	authExplicit                bool
+	authFlagExplicit            bool
 	gcloudConfigurationExplicit bool
 	versionRequested            bool
 }
@@ -204,7 +205,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 	if isLocalGitCommand(cmd) || (!explicitBucket && isPreferLocalGitCommand(cmd)) {
 		return nativeLocalCommand(cmd, cmdArgs, stdout)
 	}
-	if cfg.authExplicit {
+	if cfg.authFlagExplicit {
 		return errors.New("--auth is only supported with bgit direct")
 	}
 	if explicitBucket {
@@ -572,6 +573,7 @@ func extractGlobalFlags(args []string, cfg *config) ([]string, error) {
 			}
 			cfg.auth = value
 			cfg.authExplicit = true
+			cfg.authFlagExplicit = true
 		case "--configuration", "--profile":
 			if !hasValue {
 				i++

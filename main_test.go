@@ -101,6 +101,29 @@ func TestParseGlobalFlagsAuthADCAndProfileAlias(t *testing.T) {
 	if len(rest) != 1 || rest[0] != "push" {
 		t.Fatalf("rest = %#v", rest)
 	}
+	if !cfg.authExplicit || !cfg.authFlagExplicit {
+		t.Fatalf("auth explicit flags = authExplicit %v authFlagExplicit %v", cfg.authExplicit, cfg.authFlagExplicit)
+	}
+}
+
+func TestParseGlobalFlagsEnvAuthIsNotFlagAuth(t *testing.T) {
+	t.Setenv("BGIT_AUTH", "adc")
+	cfg, rest, err := parseGlobalFlags([]string{"clone", "gs://demo.git"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.auth != "adc" {
+		t.Fatalf("auth = %q", cfg.auth)
+	}
+	if !cfg.authExplicit {
+		t.Fatal("env auth should remain explicit for config merge precedence")
+	}
+	if cfg.authFlagExplicit {
+		t.Fatal("env auth should not be treated as the --auth CLI flag")
+	}
+	if strings.Join(rest, " ") != "clone gs://demo.git" {
+		t.Fatalf("rest = %#v", rest)
+	}
 }
 
 func TestParseGlobalFlagsAnywhere(t *testing.T) {

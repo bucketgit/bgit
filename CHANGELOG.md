@@ -4,6 +4,13 @@ All notable changes to `bgit` are documented in this file.
 
 This project follows semantic versioning.
 
+## 1.3.8
+
+Fixed
+
+- `BGIT_AUTH=adc` can now be used for normal clone/fetch paths without being
+  rejected as if `--auth adc` had been passed on the command line.
+
 ## 1.3.7
 
 Added

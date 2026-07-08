@@ -171,6 +171,12 @@ func TestLocalBrokerCloudIdentityUsesGlobalConfig(t *testing.T) {
 }
 
 func TestLocalBrokerCloudIdentityImportsExistingAWSProfile(t *testing.T) {
+	oldSDK := awsCallerIdentitySDK
+	awsCallerIdentitySDK = func(ctx context.Context, profile string) (string, string) {
+		return "", ""
+	}
+	defer func() { awsCallerIdentitySDK = oldSDK }()
+
 	home := t.TempDir()
 	setTestHome(t, home)
 	awsDir := filepath.Join(home, ".aws")
@@ -205,6 +211,98 @@ func TestLocalBrokerCloudIdentityImportsExistingAWSProfile(t *testing.T) {
 	}
 	if len(global.AWSProfiles) != 1 || global.AWSProfiles[0].AccountID != "123456789012" {
 		t.Fatalf("global AWS profiles = %#v", global.AWSProfiles)
+	}
+}
+
+func TestLocalBrokerCloudIdentityImportsAWSFromSDK(t *testing.T) {
+	oldSDK := awsCallerIdentitySDK
+	awsCallerIdentitySDK = func(ctx context.Context, profile string) (string, string) {
+		if profile != "default" {
+			t.Fatalf("profile = %q", profile)
+		}
+		return "123456789012", "arn:aws:iam::123456789012:role/magos"
+	}
+	defer func() { awsCallerIdentitySDK = oldSDK }()
+
+	home := t.TempDir()
+	setTestHome(t, home)
+	t.Setenv("PATH", t.TempDir())
+	got, err := localBrokerCloudIdentityFromConfig(context.Background(), "s3", "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "123456789012" {
+		t.Fatalf("identity = %q", got)
+	}
+	path, err := defaultGlobalConfigPath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	global, err := readGlobalConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(global.AWSProfiles) != 1 || global.AWSProfiles[0].ARN != "arn:aws:iam::123456789012:role/magos" {
+		t.Fatalf("global AWS profiles = %#v", global.AWSProfiles)
+	}
+}
+
+func TestLocalBrokerCloudIdentityImportsGCPFromADCForDefaultProfile(t *testing.T) {
+	oldADC := gcpDefaultProjectID
+	gcpDefaultProjectID = func(ctx context.Context) string {
+		return "adc-project"
+	}
+	defer func() { gcpDefaultProjectID = oldADC }()
+
+	home := t.TempDir()
+	setTestHome(t, home)
+	t.Setenv("PATH", t.TempDir())
+	got, err := localBrokerCloudIdentityFromConfig(context.Background(), "gs", "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "adc-project" {
+		t.Fatalf("identity = %q", got)
+	}
+	path, err := defaultGlobalConfigPath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	global, err := readGlobalConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(global.GCPProfiles) != 1 || global.GCPProfiles[0].ProjectID != "adc-project" {
+		t.Fatalf("global GCP profiles = %#v", global.GCPProfiles)
+	}
+}
+
+func TestLocalBrokerCloudIdentityDoesNotUseADCForNamedGCPProfile(t *testing.T) {
+	oldADC := gcpDefaultProjectID
+	gcpDefaultProjectID = func(ctx context.Context) string {
+		t.Fatal("ADC should not be used for a named GCP profile")
+		return ""
+	}
+	defer func() { gcpDefaultProjectID = oldADC }()
+
+	home := t.TempDir()
+	setTestHome(t, home)
+	t.Setenv("PATH", t.TempDir())
+	_, err := localBrokerCloudIdentityFromConfig(context.Background(), "gs", "work")
+	if err == nil || !strings.Contains(err.Error(), "GCP profile \"work\" has no cached project id") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestGCPADCProjectIDFromFileUsesQuotaProject(t *testing.T) {
+	configDir := t.TempDir()
+	t.Setenv("GOOGLE_APPLICATION_CREDENTIALS", "")
+	t.Setenv("CLOUDSDK_CONFIG", configDir)
+	if err := os.WriteFile(filepath.Join(configDir, "application_default_credentials.json"), []byte(`{"quota_project_id":"quota-project"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got := gcpADCProjectIDFromFile(); got != "quota-project" {
+		t.Fatalf("project id = %q", got)
 	}
 }
 

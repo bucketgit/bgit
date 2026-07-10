@@ -41,13 +41,17 @@ func main() {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
-		if !bytes.Equal(current, output.Bytes()) {
+		if !bytes.Equal(normalizeLineEndings(current), normalizeLineEndings(output.Bytes())) {
 			fmt.Fprintf(os.Stderr, "%s is stale; regenerate it with `go run ./tools/api_inventory > %s`\n", *check, *check)
 			os.Exit(1)
 		}
 		return
 	}
 	_, _ = os.Stdout.Write(output.Bytes())
+}
+
+func normalizeLineEndings(data []byte) []byte {
+	return bytes.ReplaceAll(data, []byte("\r\n"), []byte("\n"))
 }
 
 func exportedSymbols(directory string) ([]string, error) {

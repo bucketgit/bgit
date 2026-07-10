@@ -21,7 +21,7 @@ fi
 
 export GOCACHE="${GOCACHE:-$(go env GOCACHE 2>/dev/null || printf '/tmp/bgit-gocache')}"
 if [[ "${BGIT_TEST_USE_EXISTING_BINARY:-}" != "1" ]]; then
-  go build -o bgit .
+  go build -o bgit ./cmd/bgit
 fi
 
 export BGIT="${BGIT:-$ROOT/bgit}"

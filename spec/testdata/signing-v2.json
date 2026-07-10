@@ -1,0 +1,27 @@
+{
+  "version": "2",
+  "vectors": [
+    {
+      "name": "post-repos-mine",
+      "method": "POST",
+      "path": "/repos/mine",
+      "host": "Broker.Example.Com",
+      "timestamp": "1770000000",
+      "nonce": "0123456789abcdef",
+      "body": "{\"repo\":\"demo\"}",
+      "message": "bgit-broker-v2\nPOST\n/repos/mine\nbroker.example.com\n1770000000\n0123456789abcdef\n99caed5a504d67241e3f491cfb6f3088703b3291c70788b1064070947e653755",
+      "signatures": [
+        {
+          "name": "ed25519",
+          "public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHm1Vi6P5lT5QHixEuipi6eQH4U65pW+1+DjkQutBJZk",
+          "signature": "AAAAC3NzaC1lZDI1NTE5AAAAQL1Dd2oLj6Fou6TiU6ydVXaCyXV3Tu2natBXNjeb6jE1uWnB1P2BvXo6Lc9rYo6ZyCkrLgukrhnalwxzYgAq/QE="
+        },
+        {
+          "name": "rsa-sha2-256",
+          "public_key": "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQCfLiTIreqGwT7BSb7TF9t+44b3A+QCHO8htBJFGIe8y6Agzf8ku861f8PI2cWyZfhLWjC2pFg5LO7ib++NCiTH9/t04k4qFsJOCuvnfryhnfvR0MthsgoHZX1++AZ0PfO1Qp9rkUXNgqHUVx/aDGkSvkdWLcgVnvlBnDTTiPly4yjMwZhag9MQFdJD9xdwZbBBfup8vndBBkdM9V8dbjmQQaj5nHRTtCEgr6x8CMAkUWhOc8slZEQmAdWU1r96etHF4rdkYNjxV6GfksqYhydHZzoDIqQBKqfprnX9+/Cjooy4TEAoKxcxYgV6oUZtDyBHVaz3H9LCH5WhzFY318eP",
+          "signature": "AAAADHJzYS1zaGEyLTI1NgAAAQBNoPCVVCHdVqbbORh2X8k8fiO4IO9wDAIY7dKksoTsuLtpaxyOwwQquYN4BsN+qugzon65n+6u47wacQD1LVrYPCtK6W/rEG1MQxQZTQ2aL904SavljKFmg/m6FOl/6t8sF320EdIRGQ2i4jDIz/rQIsgmh6g1Jx5jCrt92dBrXQuKH99VJRyWrnCgGmFSOWLi0+LZ2I4fRXOgaMNMTHTXJKQsK7kRPGpWaQuQGUUq79JscW2tVsyTnre+5PsZownKC7/sISE5oNKOrZOxFCBGOlpsp8qL64lz4sA/Amdgepa8+CwFsY/J30BTcMnWjpa7KCBgCOjqjjvTGpNkvD4i"
+        }
+      ]
+    }
+  ]
+}

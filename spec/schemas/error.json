@@ -1,0 +1,1 @@
+{"$schema":"https://json-schema.org/draft/2020-12/schema","$id":"https://bucketgit.com/spec/error.json","title":"BucketGit broker error","type":"object","properties":{"error":{"type":"string"},"code":{"type":"string"}},"required":["error"],"additionalProperties":false}

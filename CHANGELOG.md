@@ -4,7 +4,22 @@ All notable changes to `bgit` are documented in this file.
 
 This project follows semantic versioning.
 
-## 1.3.9
+## 1.4.0
+
+Added
+
+- Added an importable Go SDK for the BucketGit protocol, filesystem/S3/GCS
+  stores, Git repository engine, remote and in-process brokers, capability
+  storage, and upload-pack/receive-pack transport.
+- Added shared provider contracts, cross-language broker signature fixtures,
+  external-consumer examples, generated API inventory, SDK migration and
+  security documentation, and architecture dependency checks.
+
+Changed
+
+- Segmented the CLI into a minimal executable and internal application,
+  configuration, identity, setup, and web packages without changing existing
+  repository layouts, local-broker state, or broker wire compatibility.
 
 Fixed
 

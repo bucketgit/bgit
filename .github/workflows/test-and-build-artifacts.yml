@@ -11,7 +11,7 @@ on:
       - "go.sum"
       - "CHANGELOG.md"
       - "broker/**"
-      - "www/**"
+      - "internal/web/www/**"
       - "testsuite/**"
       - ".github/workflows/test-and-build-artifacts.yml"
       - ".github/workflows/test.yml"
@@ -26,7 +26,7 @@ on:
       - "go.sum"
       - "CHANGELOG.md"
       - "broker/**"
-      - "www/**"
+      - "internal/web/www/**"
       - "testsuite/**"
       - ".github/workflows/test-and-build-artifacts.yml"
       - ".github/workflows/test.yml"
@@ -74,6 +74,19 @@ jobs:
 
       - name: Unit Tests
         run: go test ./...
+
+      - name: External SDK Consumer
+        working-directory: testsuite/sdk-consumer
+        run: go test ./...
+
+      - name: Vet Public Packages And CLI
+        run: go vet ./...
+
+      - name: Verify Exported API Inventory
+        run: go run ./tools/api_inventory -check API.md
+
+      - name: Broker Protocol Fixtures
+        run: node broker/test_support/signing_fixture_test.js
 
   build:
     name: Build Multiarchitecture Artifacts
@@ -214,7 +227,7 @@ jobs:
             $env:GOARCH = $target.GOARCH
             $env:CGO_ENABLED = "0"
 
-            go build -trimpath -ldflags="-s -w -X main.version=$env:APP_VERSION" -o "dist/$artifact" .
+            go build -trimpath -ldflags="-s -w -X github.com/bucketgit/bgit.version=$env:APP_VERSION" -o "dist/$artifact" ./cmd/bgit
 
             if (!(Test-Path "dist/$artifact")) {
               throw "Missing expected artifact: dist/$artifact"

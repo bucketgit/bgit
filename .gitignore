@@ -32,6 +32,9 @@ go.work.sum
 # .vscode/
 
 bgit
+!cmd/
+!cmd/bgit/
+!cmd/bgit/main.go
 *.test
 *.out
 coverage.txt

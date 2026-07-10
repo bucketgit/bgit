@@ -137,14 +137,21 @@ BucketGit remote helper for `bgit://` and `bgit::` remotes:
 
 ```bash
 git clone bgit::https://broker.example.com/demo.git
-git remote add origin bgit::demo.git
+git clone bgit::gs://demo.git
+git clone bgit::s3://demo.git
+git clone bgit::file://demo.git
+git remote add origin bgit://demo.git
 git fetch origin
 git push origin main
 ```
 
 `bgit::https://broker.example.com/demo.git` carries the broker URL explicitly.
-`bgit::demo.git` and `bgit://demo.git` resolve through the current checkout's
-BucketGit broker configuration.
+`bgit::gs://demo.git`, `bgit::s3://demo.git`, and `bgit::file://demo.git` use
+the same local-broker shorthand as `bgit clone`, making them suitable for a
+fresh checkout or stateless workload. They open existing broker state and do
+not create a missing repository. `bgit://demo.git` is a logical alias resolved
+from the current checkout or an unambiguous repository mapping in `BGIT_HOME`;
+use an explicit storage or broker URL when no such mapping exists.
 
 ## Custom Domains
 

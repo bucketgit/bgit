@@ -4,6 +4,15 @@ All notable changes to `bgit` are documented in this file.
 
 This project follows semantic versioning.
 
+## 1.4.1
+
+Fixed
+
+- Native Git remote-helper sessions now resolve `file://`, `s3://`, and `gs://`
+  local-broker shorthand consistently with `bgit clone`, rehydrate existing
+  bucket-backed broker state without creating repositories, and resolve bare
+  logical aliases only from unambiguous checkout or `BGIT_HOME` state.
+
 ## 1.4.0
 
 Added

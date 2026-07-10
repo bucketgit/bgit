@@ -19,6 +19,7 @@ import (
 	"strings"
 	"time"
 
+	localbroker "github.com/bucketgit/bgit/broker/local"
 	internalconfig "github.com/bucketgit/bgit/internal/config"
 	"github.com/bucketgit/bgit/protocol"
 	"golang.org/x/crypto/ssh"
@@ -2211,38 +2212,14 @@ func logicalRepoFromStorageTarget(target string) (string, error) {
 }
 
 func storageTargetParts(target string) (scheme, profile, region, bucket string, ok bool) {
-	raw := strings.TrimSpace(target)
-	switch {
-	case strings.HasPrefix(raw, "s3://"):
-		scheme = "s3"
-		raw = strings.TrimPrefix(raw, "s3://")
-	case strings.HasPrefix(raw, "gs://"):
-		scheme = "gs"
-		raw = strings.TrimPrefix(raw, "gs://")
-	case strings.HasPrefix(raw, "file://"):
-		scheme = "file"
-		raw = strings.TrimPrefix(raw, "file://")
-	default:
+	parsed, err := localbroker.ParseTarget(target)
+	if err != nil || (parsed.Kind != localbroker.TargetStorageShorthand && parsed.Kind != localbroker.TargetStorageExplicit) {
 		return "", "", "", "", false
 	}
-	if slash := strings.Index(raw, "/"); slash >= 0 {
-		if scheme == "s3" || scheme == "gs" {
-			return scheme, "", "", "", true
-		}
-		raw = raw[:slash]
+	if parsed.Kind == localbroker.TargetStorageExplicit {
+		return parsed.Scheme, "", "", "", true
 	}
-	raw = strings.TrimSuffix(raw, ".git")
-	parts := strings.Split(raw, ".")
-	labels := parts[:0]
-	for _, part := range parts {
-		if strings.TrimSpace(part) != "" {
-			labels = append(labels, strings.TrimSpace(part))
-		}
-	}
-	if len(labels) == 0 {
-		return scheme, "", "", "", true
-	}
-	return scheme, "", "", strings.Join(labels, "."), true
+	return parsed.Scheme, "", "", strings.TrimSuffix(parsed.Logical, ".git"), true
 }
 
 func storageProfileRegionFromOptions(target, selectedProfile, selectedRegion string) (string, string) {

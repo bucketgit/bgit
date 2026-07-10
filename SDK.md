@@ -38,7 +38,8 @@ See [API.md](API.md) for the generated public surface,
 - `broker/capability`: broker-authorized object access through S3 STS, GCS
   signed URLs, or local capabilities, including supported legacy reads.
 - `broker/local`: in-process local broker persistence, scoped repository stores,
-  ref CAS, and issue/task-board services.
+  ref CAS, issue/task-board services, and provider-neutral classification of
+  logical, shorthand, and explicit storage targets.
 - `transport`: pkt-line framing, advertised capabilities, upload-pack,
   receive-pack, and Git remote-helper protocol handling.
 

@@ -1,4 +1,4 @@
-module bgit
+module github.com/bucketgit/bgit
 
 go 1.25.0
 
@@ -15,6 +15,7 @@ require (
 	github.com/aws/smithy-go v1.24.2
 	golang.org/x/crypto v0.52.0
 	golang.org/x/oauth2 v0.34.0
+	golang.org/x/sys v0.45.0
 	golang.org/x/term v0.43.0
 	google.golang.org/api v0.191.0
 	gopkg.in/yaml.v3 v3.0.1
@@ -54,7 +55,6 @@ require (
 	go.opentelemetry.io/otel/trace v1.41.0 // indirect
 	golang.org/x/net v0.55.0 // indirect
 	golang.org/x/sync v0.20.0 // indirect
-	golang.org/x/sys v0.45.0 // indirect
 	golang.org/x/text v0.37.0 // indirect
 	golang.org/x/time v0.6.0 // indirect
 	google.golang.org/genproto v0.0.0-20240730163845-b1a4ccb954bf // indirect

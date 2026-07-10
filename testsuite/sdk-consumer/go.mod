@@ -1,0 +1,9 @@
+module example.com/bgit-sdk-consumer
+
+go 1.25.0
+
+require github.com/bucketgit/bgit v0.0.0
+
+require golang.org/x/sys v0.45.0 // indirect
+
+replace github.com/bucketgit/bgit => ../..

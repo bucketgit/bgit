@@ -42,6 +42,19 @@ jobs:
       - name: Unit Tests
         run: go test ./...
 
+      - name: External SDK Consumer
+        working-directory: testsuite/sdk-consumer
+        run: go test ./...
+
+      - name: Vet Public Packages And CLI
+        run: go vet ./...
+
+      - name: Verify Exported API Inventory
+        run: go run ./tools/api_inventory -check API.md
+
+      - name: Broker Protocol Fixtures
+        run: node broker/test_support/signing_fixture_test.js
+
   local-broker-integration:
     name: Local Broker Integration (${{ matrix.runtime }} / ${{ matrix.os }})
     runs-on: ${{ matrix.os }}

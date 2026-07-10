@@ -8,6 +8,11 @@ coordinates access through a lightweight broker.
 Use it when you want Git repositories in cloud object storage without running a
 Git server.
 
+The Git, storage, broker protocol, and transport implementations are also
+importable Go packages. See [SDK.md](SDK.md) for supported compositions and
+responsibility boundaries.
+The reviewed exported symbol list is maintained in [API.md](API.md).
+
 ## Project
 
 - Homepage: https://bucketgit.com/
@@ -28,7 +33,7 @@ Or build from source:
 ```bash
 git clone https://github.com/bucketgit/bgit.git
 cd bgit
-go build -o bgit .
+go build -o bgit ./cmd/bgit
 ```
 
 Check the installed version:
@@ -580,7 +585,7 @@ Use them for repair, test cleanup, or broker decommissioning.
 Build from source:
 
 ```bash
-go build -o bgit .
+go build -o bgit ./cmd/bgit
 ```
 
 Run unit tests:
@@ -608,7 +613,7 @@ Runtime requirements depend on the command:
 - `gcloud` for GCP setup and profile creation.
 - AWS config/credentials files and optionally the AWS CLI for AWS setup/profile
   creation.
-- Go 1.24 or newer to build from source.
+- Go 1.25 or newer to build from source or import the current SDK packages.
 
 ## Unsupported Commands
 

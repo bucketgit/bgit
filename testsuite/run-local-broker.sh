@@ -14,7 +14,7 @@ esac
 export GOCACHE="${GOCACHE:-$(go env GOCACHE 2>/dev/null || printf '/tmp/bgit-gocache')}"
 export GOMODCACHE="${GOMODCACHE:-$(go env GOMODCACHE 2>/dev/null || printf '/tmp/bgit-gomodcache')}"
 if [[ "${BGIT_TEST_USE_EXISTING_BINARY:-}" != "1" ]]; then
-  go build -o bgit .
+  go build -o bgit ./cmd/bgit
 fi
 
 native_path() {

@@ -4,6 +4,14 @@ All notable changes to `bgit` are documented in this file.
 
 This project follows semantic versioning.
 
+## 1.4.2
+
+Security
+
+- Upgraded `google.golang.org/grpc` to 1.82.1 to address xDS RBAC
+  authorization bypass and panic vulnerabilities, and an HTTP/2 rapid-reset
+  denial-of-service vulnerability.
+
 ## 1.4.1
 
 Fixed
